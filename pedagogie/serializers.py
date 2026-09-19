@@ -4,6 +4,9 @@ from .models import (
     Competence,
     CompetenceNiveau,
     Formation,
+    Groupe,
+    GroupeMembre,
+    InscriptionPromotion,
     Module,
     Niveau,
     Promotion,
@@ -375,3 +378,221 @@ class CompetenceNiveauSerializer(serializers.ModelSerializer):
                 )
 
         return attrs
+
+
+class InscriptionPromotionSerializer(serializers.ModelSerializer):
+    apprenant_nom = serializers.CharField(source="apprenant.nom", read_only=True)
+    apprenant_prenom = serializers.CharField(source="apprenant.prenom", read_only=True)
+    apprenant_email = serializers.CharField(source="apprenant.email", read_only=True)
+
+    class Meta:
+        model = InscriptionPromotion
+        fields = [
+            "id",
+            "promotion",
+            "apprenant",
+            "apprenant_nom",
+            "apprenant_prenom",
+            "apprenant_email",
+            "actif",
+            "date_inscription",
+            "date_desinscription",
+        ]
+        read_only_fields = [
+            "id",
+            "date_inscription",
+            "date_desinscription",
+        ]
+
+    def validate(self, attrs):
+        tenant_id = self.context.get("tenant_id")
+        promotion = attrs.get("promotion") or (
+            self.instance.promotion if self.instance else None
+        )
+        apprenant = attrs.get("apprenant") or (
+            self.instance.apprenant if self.instance else None
+        )
+        actif = attrs.get("actif", True if not self.instance else self.instance.actif)
+
+        # 1. Vérification que la promotion appartient au tenant actif
+        if promotion and tenant_id and str(promotion.formation.tenant_id) != str(tenant_id):
+            raise serializers.ValidationError(
+                {"promotion": "La promotion sélectionnée n'appartient pas à cet organisme."}
+            )
+
+        # 2. Vérification de l'apprenant : utilisateur actif + MembreTenant rôle APPRENANT actif dans ce tenant
+        if apprenant and tenant_id:
+            if not apprenant.actif:
+                raise serializers.ValidationError(
+                    {"apprenant": "L'utilisateur sélectionné est inactif."}
+                )
+            from accounts.models import MembreTenant
+            if not MembreTenant.objects.filter(
+                utilisateur=apprenant,
+                tenant_id=tenant_id,
+                role=MembreTenant.Role.APPRENANT,
+                actif=True,
+            ).exists():
+                raise serializers.ValidationError(
+                    {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."}
+                )
+
+        # 3. Unicité d'une seule promotion active à la fois
+        if apprenant and actif:
+            qs = InscriptionPromotion.objects.filter(
+                apprenant=apprenant,
+                actif=True,
+            )
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                active_promo = qs.first().promotion.nom
+                raise serializers.ValidationError(
+                    {"apprenant": f"L'apprenant a déjà une inscription active dans la promotion '{active_promo}'."}
+                )
+
+        # 4. Unicité du couple (promotion, apprenant) si on est en création
+        if not self.instance and promotion and apprenant:
+            if InscriptionPromotion.objects.filter(promotion=promotion, apprenant=apprenant).exists():
+                raise serializers.ValidationError(
+                    "Une inscription existe déjà pour cet apprenant dans cette promotion."
+                )
+
+        return attrs
+
+
+class GroupeMembreSerializer(serializers.ModelSerializer):
+    apprenant_nom = serializers.CharField(source="apprenant.nom", read_only=True)
+    apprenant_prenom = serializers.CharField(source="apprenant.prenom", read_only=True)
+    apprenant_email = serializers.CharField(source="apprenant.email", read_only=True)
+
+    class Meta:
+        model = GroupeMembre
+        fields = [
+            "id",
+            "groupe",
+            "apprenant",
+            "apprenant_nom",
+            "apprenant_prenom",
+            "apprenant_email",
+            "date_ajout",
+        ]
+        read_only_fields = [
+            "id",
+            "date_ajout",
+        ]
+
+    def validate(self, attrs):
+        tenant_id = self.context.get("tenant_id")
+        groupe = attrs.get("groupe") or (
+            self.instance.groupe if self.instance else None
+        )
+        apprenant = attrs.get("apprenant") or (
+            self.instance.apprenant if self.instance else None
+        )
+
+        # 1. Vérification tenant du groupe
+        if groupe and tenant_id and str(groupe.promotion.formation.tenant_id) != str(tenant_id):
+            raise serializers.ValidationError(
+                {"groupe": "Le groupe sélectionné n'appartient pas à cet organisme."}
+            )
+
+        # 2. Vérification apprenant actif et rôle APPRENANT dans le tenant
+        if apprenant and tenant_id:
+            if not apprenant.actif:
+                raise serializers.ValidationError(
+                    {"apprenant": "L'utilisateur sélectionné est inactif."}
+                )
+            from accounts.models import MembreTenant
+            if not MembreTenant.objects.filter(
+                utilisateur=apprenant,
+                tenant_id=tenant_id,
+                role=MembreTenant.Role.APPRENANT,
+                actif=True,
+            ).exists():
+                raise serializers.ValidationError(
+                    {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."}
+                )
+
+        # 3. Vérification que l'apprenant a une inscription active dans LA PROMOTION DU GROUPE
+        if groupe and apprenant:
+            inscription = InscriptionPromotion.objects.filter(
+                apprenant=apprenant,
+                actif=True,
+            ).first()
+            if not inscription:
+                raise serializers.ValidationError(
+                    {"apprenant": "L'apprenant n'a aucune inscription active dans une promotion."}
+                )
+            if inscription.promotion_id != groupe.promotion_id:
+                raise serializers.ValidationError(
+                    {"apprenant": f"L'apprenant appartient à la promotion '{inscription.promotion.nom}' et ne peut pas être ajouté à un groupe de la promotion '{groupe.promotion.nom}'."}
+                )
+
+            # 4. Unicité dans ce groupe
+            qs = GroupeMembre.objects.filter(groupe=groupe, apprenant=apprenant)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError(
+                    {"apprenant": "Cet apprenant est déjà membre de ce groupe."}
+                )
+
+        return attrs
+
+
+class GroupeSerializer(serializers.ModelSerializer):
+    membres = GroupeMembreSerializer(many=True, read_only=True)
+    nb_membres = serializers.IntegerField(source="membres.count", read_only=True)
+
+    class Meta:
+        model = Groupe
+        fields = [
+            "id",
+            "promotion",
+            "nom",
+            "description",
+            "actif",
+            "membres",
+            "nb_membres",
+            "date_creation",
+            "date_modification",
+        ]
+        read_only_fields = [
+            "id",
+            "date_creation",
+            "date_modification",
+        ]
+
+    def validate(self, attrs):
+        tenant_id = self.context.get("tenant_id")
+        promotion = attrs.get("promotion") or (
+            self.instance.promotion if self.instance else None
+        )
+
+        # Validation parent-enfant : promotion doit appartenir au tenant actif
+        if promotion and tenant_id and str(promotion.formation.tenant_id) != str(tenant_id):
+            raise serializers.ValidationError(
+                {"promotion": "La promotion sélectionnée n'appartient pas à cet organisme."}
+            )
+
+        # Nettoyage du nom
+        nom = attrs.get("nom")
+        if nom is not None:
+            nom = nom.strip()
+            attrs["nom"] = nom
+        elif self.instance:
+            nom = self.instance.nom
+
+        # Unicité insensible à la casse dans la promotion
+        if promotion and nom:
+            qs_nom = Groupe.objects.filter(promotion=promotion, nom__iexact=nom)
+            if self.instance:
+                qs_nom = qs_nom.exclude(pk=self.instance.pk)
+            if qs_nom.exists():
+                raise serializers.ValidationError(
+                    {"nom": "Un groupe avec ce nom existe déjà pour cette promotion."}
+                )
+
+        return attrs
+

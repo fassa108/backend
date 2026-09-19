@@ -9,6 +9,9 @@ from .models import (
     Competence,
     CompetenceNiveau,
     Formation,
+    Groupe,
+    GroupeMembre,
+    InscriptionPromotion,
     Module,
     Niveau,
     Promotion,
@@ -740,4 +743,448 @@ class PedagogieNiveauxPermissionsTests(PedagogieBaseTestCase):
 
         res = self.client.get(f"/api/tenants/{self.tenant_1.id}/competence-niveaux/")
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class InscriptionPromotionTests(PedagogieBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Python")
+        self.promotion_1 = Promotion.objects.create(
+            formation=self.formation,
+            nom="Promo 2026-A",
+            date_debut=date(2026, 9, 1),
+        )
+        self.promotion_2 = Promotion.objects.create(
+            formation=self.formation,
+            nom="Promo 2026-B",
+            date_debut=date(2026, 10, 1),
+        )
+
+        # Deuxième apprenant dans Tenant 1
+        self.apprenant_2 = Utilisateur.objects.create_user(
+            email="apprenant2_org1@test.com",
+            password="password123",
+            nom="Deuxieme",
+            prenom="Apprenant",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_2,
+            tenant=self.tenant_1,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+
+        # Apprenant dans Tenant 2
+        self.apprenant_t2 = Utilisateur.objects.create_user(
+            email="apprenant_org2@test.com",
+            password="password123",
+            nom="Autre",
+            prenom="Tenant",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_t2,
+            tenant=self.tenant_2,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+
+    def test_inscription_apprenant_promotion(self):
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            InscriptionPromotion.objects.filter(
+                promotion=self.promotion_1,
+                apprenant=self.apprenant_tenant_1,
+                actif=True,
+            ).exists()
+        )
+
+    def test_rejet_inscription_deux_promotions_actives_simultanees(self):
+        # Inscrire l'apprenant dans Promo 1
+        InscriptionPromotion.objects.create(
+            promotion=self.promotion_1,
+            apprenant=self.apprenant_tenant_1,
+            actif=True,
+        )
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_2.id}/inscrire-apprenant/"
+
+        # Tentative d'inscription dans Promo 2 -> Doit échouer
+        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("apprenant", res.data)
+
+    def test_rejet_inscription_utilisateur_non_apprenant(self):
+        # Tentative d'inscrire le formateur comme apprenant
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.formateur_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rejet_inscription_apprenant_autre_tenant(self):
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_t2.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_desinscription_apprenant_et_reinscription(self):
+        # Inscription
+        inscription = InscriptionPromotion.objects.create(
+            promotion=self.promotion_1,
+            apprenant=self.apprenant_tenant_1,
+            actif=True,
+        )
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url_desinscrire = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/desinscrire-apprenant/"
+
+        # Désinscription
+        res = self.client.post(url_desinscrire, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        inscription.refresh_from_db()
+        self.assertFalse(inscription.actif)
+        self.assertIsNotNone(inscription.date_desinscription)
+
+        # Réinscription dans une autre promotion (Promo 2) désormais permise
+        url_inscrire_2 = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_2.id}/inscrire-apprenant/"
+        res_2 = self.client.post(url_inscrire_2, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res_2.status_code, status.HTTP_201_CREATED)
+
+
+class GroupeTests(PedagogieBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Dev")
+        self.promotion_1 = Promotion.objects.create(
+            formation=self.formation,
+            nom="Promo 1",
+            date_debut=date(2026, 9, 1),
+        )
+        self.promotion_2 = Promotion.objects.create(
+            formation=self.formation,
+            nom="Promo 2",
+            date_debut=date(2026, 10, 1),
+        )
+
+        # Inscriptions promotions
+        self.inscription_1 = InscriptionPromotion.objects.create(
+            promotion=self.promotion_1,
+            apprenant=self.apprenant_tenant_1,
+            actif=True,
+        )
+
+        # Apprenant 2 dans Promo 1
+        self.apprenant_2 = Utilisateur.objects.create_user(
+            email="apprenant2_test@test.com",
+            password="password123",
+            nom="Deux",
+            prenom="User",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_2,
+            tenant=self.tenant_1,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+        self.inscription_2 = InscriptionPromotion.objects.create(
+            promotion=self.promotion_1,
+            apprenant=self.apprenant_2,
+            actif=True,
+        )
+
+        # Apprenant 3 dans Promo 2
+        self.apprenant_3 = Utilisateur.objects.create_user(
+            email="apprenant3_test@test.com",
+            password="password123",
+            nom="Trois",
+            prenom="User",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_3,
+            tenant=self.tenant_1,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+        self.inscription_3 = InscriptionPromotion.objects.create(
+            promotion=self.promotion_2,
+            apprenant=self.apprenant_3,
+            actif=True,
+        )
+
+        # Apprenant sans promotion
+        self.apprenant_sans_promo = Utilisateur.objects.create_user(
+            email="sans_promo@test.com",
+            password="password123",
+            nom="Sans",
+            prenom="Promo",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_sans_promo,
+            tenant=self.tenant_1,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+
+        # Éléments Tenant 2
+        self.formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="Formation T2")
+        self.promotion_t2 = Promotion.objects.create(
+            formation=self.formation_t2,
+            nom="Promo T2",
+            date_debut=date(2026, 9, 1),
+        )
+        self.apprenant_t2 = Utilisateur.objects.create_user(
+            email="apprenant_t2@test.com",
+            password="password123",
+            nom="T2",
+            prenom="User",
+            actif=True,
+        )
+        MembreTenant.objects.create(
+            utilisateur=self.apprenant_t2,
+            tenant=self.tenant_2,
+            role=MembreTenant.Role.APPRENANT,
+            actif=True,
+        )
+        self.inscription_t2 = InscriptionPromotion.objects.create(
+            promotion=self.promotion_t2,
+            apprenant=self.apprenant_t2,
+            actif=True,
+        )
+
+    def test_crud_groupe(self):
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+
+        # CREATE
+        payload = {
+            "promotion": self.promotion_1.id,
+            "nom": "Groupe Alpha",
+            "description": "Premier groupe projet",
+            "actif": True,
+        }
+        res = self.client.post(url, payload)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        groupe_id = res.data["id"]
+        self.assertEqual(res.data["nom"], "Groupe Alpha")
+        self.assertEqual(res.data["nb_membres"], 0)
+
+        # LIST
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res.data), 1)
+
+        # RETRIEVE
+        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_id}/"
+        res = self.client.get(detail_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["nom"], "Groupe Alpha")
+
+        # PATCH
+        res = self.client.patch(detail_url, {"nom": "Groupe Alpha Renommé"})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["nom"], "Groupe Alpha Renommé")
+
+        # DELETE
+        res = self.client.delete(detail_url)
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Groupe.objects.filter(id=groupe_id).exists())
+
+    def test_unicite_nom_groupe_par_promotion(self):
+        Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Un")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+
+        # Doublon exact
+        res = self.client.post(url, {"promotion": self.promotion_1.id, "nom": "Groupe Un"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Doublon insensible à la casse
+        res = self.client.post(url, {"promotion": self.promotion_1.id, "nom": "  groupe un  "})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Même nom dans une autre promotion -> OK
+        res = self.client.post(url, {"promotion": self.promotion_2.id, "nom": "Groupe Un"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_groupe_vide_autorise(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Sans Membre")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
+        res = self.client.get(detail_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["nb_membres"], 0)
+        self.assertEqual(len(res.data["membres"]), 0)
+
+    def test_appartenance_multiple_groupes_meme_promotion(self):
+        groupe_a = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe A")
+        groupe_b = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe B")
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+
+        # Ajout apprenant 1 dans Groupe A
+        url_a = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_a.id}/ajouter-apprenant/"
+        res_a = self.client.post(url_a, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res_a.status_code, status.HTTP_201_CREATED)
+
+        # Ajout du MÊME apprenant 1 dans Groupe B
+        url_b = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_b.id}/ajouter-apprenant/"
+        res_b = self.client.post(url_b, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res_b.status_code, status.HTTP_201_CREATED)
+
+        # Vérification des deux appartenances
+        self.assertEqual(GroupeMembre.objects.filter(apprenant=self.apprenant_tenant_1).count(), 2)
+
+    def test_rejet_ajout_apprenant_autre_promotion(self):
+        groupe_promo_1 = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Promo 1")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_promo_1.id}/ajouter-apprenant/"
+
+        # apprenant_3 est dans Promo 2 -> tentative de l'ajouter dans un groupe de Promo 1
+        res = self.client.post(url, {"apprenant_id": self.apprenant_3.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("apprenant", res.data)
+
+    def test_rejet_ajout_apprenant_sans_promotion(self):
+        groupe_promo_1 = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Sans")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_promo_1.id}/ajouter-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_sans_promo.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("apprenant", res.data)
+
+    def test_rejet_doublon_apprenant_meme_groupe(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Doublon")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_retirer_apprenant_groupe(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Retrait")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/retirer-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(GroupeMembre.objects.filter(groupe=groupe, apprenant=self.apprenant_tenant_1).exists())
+
+    def test_suppression_groupe_ne_supprime_pas_utilisateur(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe A Supprimer")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
+
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
+        res = self.client.delete(detail_url)
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Le groupe et son association sont supprimés
+        self.assertFalse(Groupe.objects.filter(id=groupe.id).exists())
+        self.assertFalse(GroupeMembre.objects.filter(groupe_id=groupe.id).exists())
+        # L'utilisateur apprenant existe TOUJOURS
+        self.assertTrue(Utilisateur.objects.filter(id=self.apprenant_tenant_1.id).exists())
+
+    def test_rejet_apprenant_autre_tenant(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Tenant 1")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/"
+
+        res = self.client.post(url, {"apprenant_id": self.apprenant_t2.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_isolation_tenant_groupe(self):
+        groupe_t2 = Groupe.objects.create(promotion=self.promotion_t2, nom="Groupe T2")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_t2.id}/"
+
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_methode_put_interdite_sur_groupe(self):
+        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe PUT")
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
+
+        res = self.client.put(url, {"nom": "Tentative"})
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+class GroupePermissionsTests(PedagogieBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Perm")
+        self.promotion = Promotion.objects.create(
+            formation=self.formation,
+            nom="Promo Perm",
+            date_debut=date(2026, 9, 1),
+        )
+        self.groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe Perm")
+
+        # Utilisateur sans tenant
+        self.user_sans_tenant = Utilisateur.objects.create_user(
+            email="sans_tenant_groupe@test.com",
+            password="password123",
+            nom="Inconnu",
+            prenom="User",
+            actif=True,
+        )
+
+    def test_admin_saas_autorise(self):
+        self.client.force_authenticate(user=self.admin_saas)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.post(url, {"promotion": self.promotion.id, "nom": "Groupe SaaS"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_admin_tenant_autorise_sur_son_tenant(self):
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_admin_tenant_refuse_sur_autre_tenant(self):
+        self.client.force_authenticate(user=self.admin_tenant_1)
+        url = f"/api/tenants/{self.tenant_2.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_refuse(self):
+        self.client.force_authenticate(user=self.formateur_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_apprenant_refuse(self):
+        self.client.force_authenticate(user=self.apprenant_tenant_1)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_utilisateur_non_membre_refuse(self):
+        self.client.force_authenticate(user=self.user_sans_tenant)
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_non_authentifie_refuse(self):
+        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
 
