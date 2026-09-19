@@ -35,7 +35,11 @@ urlpatterns = [
         include("accounts.urls"),
     ),
     path(
-            "api/",
-            include("tenants.urls"),
-        ),
+        "api/",
+        include("tenants.urls"),
+    ),
+    path(
+        "api/",
+        include("pedagogie.urls"),
+    ),
 ]
