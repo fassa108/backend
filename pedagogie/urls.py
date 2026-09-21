@@ -5,6 +5,7 @@ from .views import (
     CompetenceNiveauViewSet,
     CompetenceViewSet,
     FormationViewSet,
+    GroupeViewSet,
     ModuleViewSet,
     NiveauViewSet,
     PromotionViewSet,
@@ -17,6 +18,7 @@ router.register("modules", ModuleViewSet, basename="module")
 router.register("competences", CompetenceViewSet, basename="competence")
 router.register("niveaux", NiveauViewSet, basename="niveau")
 router.register("competence-niveaux", CompetenceNiveauViewSet, basename="competence-niveau")
+router.register("groupes", GroupeViewSet, basename="groupe")
 
 urlpatterns = [
     path(

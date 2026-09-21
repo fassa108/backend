@@ -42,4 +42,9 @@ urlpatterns = [
         "api/",
         include("pedagogie.urls"),
     ),
+    
+    path(
+        "api/",
+        include("activites.urls")
+        ),
 ]

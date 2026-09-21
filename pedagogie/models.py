@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import F, Q
@@ -204,3 +205,121 @@ class CompetenceNiveau(models.Model):
 
     def __str__(self):
         return f"{self.competence.nom} - {self.niveau.nom}"
+
+
+class InscriptionPromotion(models.Model):
+    promotion = models.ForeignKey(
+        Promotion,
+        on_delete=models.CASCADE,
+        related_name="inscriptions",
+    )
+    apprenant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="inscriptions_promotions",
+    )
+    actif = models.BooleanField(default=True)
+    date_inscription = models.DateTimeField(auto_now_add=True)
+    date_desinscription = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["apprenant"],
+                condition=Q(actif=True),
+                name="unique_promotion_active_par_apprenant",
+            ),
+            models.UniqueConstraint(
+                fields=["promotion", "apprenant"],
+                name="unique_apprenant_par_promotion",
+            ),
+        ]
+        ordering = ["-date_inscription"]
+
+    def clean(self):
+        super().clean()
+        if self.apprenant_id and self.promotion_id:
+            from accounts.models import MembreTenant
+            tenant = self.promotion.formation.tenant
+            if not MembreTenant.objects.filter(
+                utilisateur_id=self.apprenant_id,
+                tenant=tenant,
+                role=MembreTenant.Role.APPRENANT,
+                actif=True,
+            ).exists():
+                raise ValidationError(
+                    {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."}
+                )
+
+    def __str__(self):
+        return f"{self.apprenant} - {self.promotion.nom}"
+
+
+class Groupe(models.Model):
+    promotion = models.ForeignKey(
+        Promotion,
+        on_delete=models.CASCADE,
+        related_name="groupes",
+    )
+    nom = models.CharField(max_length=150)
+    description = models.TextField(blank=True)
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    apprenants = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        through="GroupeMembre",
+        related_name="groupes_pedagogiques",
+        blank=True,
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["promotion", "nom"],
+                name="unique_groupe_par_promotion",
+            ),
+        ]
+        ordering = ["nom"]
+
+    def __str__(self):
+        return f"{self.promotion.nom} - {self.nom}"
+
+
+class GroupeMembre(models.Model):
+    groupe = models.ForeignKey(
+        Groupe,
+        on_delete=models.CASCADE,
+        related_name="membres",
+    )
+    apprenant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="appartenances_groupes",
+    )
+    date_ajout = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["groupe", "apprenant"],
+                name="unique_apprenant_par_groupe",
+            ),
+        ]
+        ordering = ["-date_ajout"]
+
+    def clean(self):
+        super().clean()
+        if self.groupe_id and self.apprenant_id:
+            if not InscriptionPromotion.objects.filter(
+                promotion_id=self.groupe.promotion_id,
+                apprenant_id=self.apprenant_id,
+                actif=True,
+            ).exists():
+                raise ValidationError(
+                    {"apprenant": "L'apprenant doit avoir une inscription active dans la promotion de ce groupe."}
+                )
+
+    def __str__(self):
+        return f"{self.groupe.nom} - {self.apprenant}"

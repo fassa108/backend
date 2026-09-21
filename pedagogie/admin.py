@@ -4,6 +4,9 @@ from .models import (
     Competence,
     CompetenceNiveau,
     Formation,
+    Groupe,
+    GroupeMembre,
+    InscriptionPromotion,
     Module,
     Niveau,
     Promotion,
@@ -50,4 +53,26 @@ class CompetenceNiveauAdmin(admin.ModelAdmin):
     list_display = ("competence", "niveau", "date_creation")
     list_filter = ("niveau__tenant",)
     search_fields = ("competence__nom", "niveau__nom", "description")
+
+
+@admin.register(InscriptionPromotion)
+class InscriptionPromotionAdmin(admin.ModelAdmin):
+    list_display = ("apprenant", "promotion", "actif", "date_inscription", "date_desinscription")
+    list_filter = ("actif", "promotion__formation__tenant")
+    search_fields = ("apprenant__nom", "apprenant__prenom", "apprenant__email", "promotion__nom")
+
+
+@admin.register(Groupe)
+class GroupeAdmin(admin.ModelAdmin):
+    list_display = ("nom", "promotion", "actif", "date_creation")
+    list_filter = ("actif", "promotion__formation__tenant")
+    search_fields = ("nom", "description", "promotion__nom")
+
+
+@admin.register(GroupeMembre)
+class GroupeMembreAdmin(admin.ModelAdmin):
+    list_display = ("groupe", "apprenant", "date_ajout")
+    list_filter = ("groupe__promotion__formation__tenant",)
+    search_fields = ("groupe__nom", "apprenant__nom", "apprenant__prenom", "apprenant__email")
+
 
