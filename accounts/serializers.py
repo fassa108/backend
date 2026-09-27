@@ -222,11 +222,20 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 
 class MembreTenantSerializer(serializers.ModelSerializer):
+    utilisateur_nom = serializers.CharField(source="utilisateur.nom", read_only=True)
+    utilisateur_prenom = serializers.CharField(source="utilisateur.prenom", read_only=True)
+    utilisateur_email = serializers.EmailField(source="utilisateur.email", read_only=True)
+    utilisateur_actif = serializers.BooleanField(source="utilisateur.actif", read_only=True)
+
     class Meta:
         model = MembreTenant
         fields = [
             "id",
             "utilisateur",
+            "utilisateur_nom",
+            "utilisateur_prenom",
+            "utilisateur_email",
+            "utilisateur_actif",
             "tenant",
             "role",
             "actif",
@@ -235,6 +244,10 @@ class MembreTenantSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id",
             "utilisateur",
+            "utilisateur_nom",
+            "utilisateur_prenom",
+            "utilisateur_email",
+            "utilisateur_actif",
             "tenant",
             "date_ajout",
         ]
