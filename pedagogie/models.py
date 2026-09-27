@@ -323,3 +323,62 @@ class GroupeMembre(models.Model):
 
     def __str__(self):
         return f"{self.groupe.nom} - {self.apprenant}"
+
+
+class FormateurPromotion(models.Model):
+    """
+    Affectation d'un Formateur à une Promotion.
+
+    Un formateur peut être affecté à plusieurs promotions.
+    Une promotion peut avoir plusieurs formateurs.
+    Un formateur ne peut être affecté qu'une seule fois à la même promotion.
+
+    Seul l'Admin organisme peut gérer ces affectations.
+    L'Admin SaaS n'a pas accès à cette opération.
+    """
+
+    formateur = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="promotions_formateur",
+    )
+
+    promotion = models.ForeignKey(
+        Promotion,
+        on_delete=models.CASCADE,
+        related_name="formateurs_affectes",
+    )
+
+    date_ajout = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["formateur", "promotion"],
+                name="unique_formateur_par_promotion",
+            ),
+        ]
+        ordering = ["-date_ajout"]
+
+    def clean(self):
+        super().clean()
+        if self.formateur_id and self.promotion_id:
+            from accounts.models import MembreTenant
+            tenant = self.promotion.formation.tenant
+            if not MembreTenant.objects.filter(
+                utilisateur_id=self.formateur_id,
+                tenant=tenant,
+                role=MembreTenant.Role.FORMATEUR,
+                actif=True,
+            ).exists():
+                raise ValidationError(
+                    {
+                        "formateur": (
+                            "L'utilisateur sélectionné doit être un formateur actif "
+                            "de cet organisme."
+                        )
+                    }
+                )
+
+    def __str__(self):
+        return f"{self.formateur} → {self.promotion}"

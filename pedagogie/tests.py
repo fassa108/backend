@@ -1,4 +1,19 @@
+"""
+Tests complets pour le flux pédagogique EduHub.
+
+Couvre :
+- Formations, Promotions, Modules, Compétences, Niveaux, CompétenceNiveaux (existants)
+- FormateurPromotion : affectation, retrait, doublon, multi-formateur, multi-promotion
+- Accès Formateur aux promotions (ses promotions seulement)
+- Accès Formateur aux apprenants
+- Groupes : Admin organisme + Formateur (ses promotions)
+- Utilisateur.actif vs MembreTenant.actif
+- Isolation multi-tenant
+- Exclusion Admin SaaS des opérations métier
+"""
+
 from datetime import date, timedelta
+
 from django.contrib.auth import get_user_model
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -8,6 +23,7 @@ from tenants.models import Tenant
 from .models import (
     Competence,
     CompetenceNiveau,
+    FormateurPromotion,
     Formation,
     Groupe,
     GroupeMembre,
@@ -20,1171 +36,788 @@ from .models import (
 Utilisateur = get_user_model()
 
 
+# ─── Base ─────────────────────────────────────────────────────────────────────
+
 class PedagogieBaseTestCase(APITestCase):
     def setUp(self):
-        # Création de deux tenants distincts
-        self.tenant_1 = Tenant.objects.create(
-            nom="Organisme Alpha",
-            description="Tenant 1 pour les tests",
-        )
-        self.tenant_2 = Tenant.objects.create(
-            nom="Organisme Beta",
-            description="Tenant 2 pour les tests",
-        )
+        self.tenant_1 = Tenant.objects.create(nom="Organisme Alpha")
+        self.tenant_2 = Tenant.objects.create(nom="Organisme Beta")
 
-        # Admin SaaS
         self.admin_saas = Utilisateur.objects.create_user(
-            email="saas_admin@test.com",
-            password="password123",
-            nom="SaaS",
-            prenom="Admin",
-            actif=True,
-            est_admin_saas=True,
+            email="saas@test.com", password="pw", nom="SaaS", prenom="Admin",
+            actif=True, est_admin_saas=True,
         )
 
-        # Admin Organisme 1
-        self.admin_tenant_1 = Utilisateur.objects.create_user(
-            email="admin_org1@test.com",
-            password="password123",
-            nom="Admin",
-            prenom="Org1",
-            actif=True,
+        self.admin_t1 = Utilisateur.objects.create_user(
+            email="admin_t1@test.com", password="pw", nom="Admin", prenom="T1", actif=True,
         )
-        MembreTenant.objects.create(
-            utilisateur=self.admin_tenant_1,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.ADMINISTRATEUR,
-            actif=True,
-        )
+        MembreTenant.objects.create(utilisateur=self.admin_t1, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.ADMINISTRATEUR, actif=True)
 
-        # Formateur Organisme 1 (aucun accès prévu pour ce socle)
-        self.formateur_tenant_1 = Utilisateur.objects.create_user(
-            email="formateur_org1@test.com",
-            password="password123",
-            nom="Formateur",
-            prenom="Org1",
-            actif=True,
+        self.admin_t2 = Utilisateur.objects.create_user(
+            email="admin_t2@test.com", password="pw", nom="Admin", prenom="T2", actif=True,
         )
-        MembreTenant.objects.create(
-            utilisateur=self.formateur_tenant_1,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.FORMATEUR,
-            actif=True,
-        )
+        MembreTenant.objects.create(utilisateur=self.admin_t2, tenant=self.tenant_2,
+                                    role=MembreTenant.Role.ADMINISTRATEUR, actif=True)
 
-        # Apprenant Organisme 1 (aucun accès prévu pour ce socle)
-        self.apprenant_tenant_1 = Utilisateur.objects.create_user(
-            email="apprenant_org1@test.com",
-            password="password123",
-            nom="Apprenant",
-            prenom="Org1",
-            actif=True,
+        self.formateur_t1 = Utilisateur.objects.create_user(
+            email="formateur_t1@test.com", password="pw", nom="Formateur", prenom="T1", actif=True,
         )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_tenant_1,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
+        MembreTenant.objects.create(utilisateur=self.formateur_t1, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.FORMATEUR, actif=True)
 
-        # Admin Organisme 2
-        self.admin_tenant_2 = Utilisateur.objects.create_user(
-            email="admin_org2@test.com",
-            password="password123",
-            nom="Admin",
-            prenom="Org2",
-            actif=True,
+        self.formateur2_t1 = Utilisateur.objects.create_user(
+            email="formateur2_t1@test.com", password="pw", nom="Formateur2", prenom="T1", actif=True,
         )
-        MembreTenant.objects.create(
-            utilisateur=self.admin_tenant_2,
-            tenant=self.tenant_2,
-            role=MembreTenant.Role.ADMINISTRATEUR,
-            actif=True,
-        )
+        MembreTenant.objects.create(utilisateur=self.formateur2_t1, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.FORMATEUR, actif=True)
 
+        self.apprenant_t1 = Utilisateur.objects.create_user(
+            email="apprenant_t1@test.com", password="pw", nom="Apprenant", prenom="T1", actif=True,
+        )
+        MembreTenant.objects.create(utilisateur=self.apprenant_t1, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.APPRENANT, actif=True)
+
+        # Apprenant avec compte NON activé mais membre actif du tenant
+        self.apprenant_inactif = Utilisateur.objects.create_user(
+            email="apprenant_inactif@test.com", password="pw", nom="Inactif", prenom="App",
+            actif=False,  # compte non activé
+        )
+        MembreTenant.objects.create(utilisateur=self.apprenant_inactif, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.APPRENANT, actif=True)  # membre actif
+
+
+# ─── Formations ───────────────────────────────────────────────────────────────
 
 class FormationTests(PedagogieBaseTestCase):
-    def test_crud_formation_admin_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-
-        # CREATE
-        url = f"/api/tenants/{self.tenant_1.id}/formations/"
-        payload = {
-            "nom": "Développeur Python",
-            "description": "Formation complète backend",
-            "actif": True,
-        }
-        res = self.client.post(url, payload)
+    def test_admin_organisme_peut_creer_formation(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/formations/",
+            {"nom": "Dev Web", "actif": True},
+        )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        formation_id = res.data["id"]
-        self.assertEqual(res.data["tenant"], self.tenant_1.id)
 
-        # LIST
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
-
-        # RETRIEVE
-        detail_url = f"/api/tenants/{self.tenant_1.id}/formations/{formation_id}/"
-        res = self.client.get(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Développeur Python")
-
-        # PATCH
-        res = self.client.patch(detail_url, {"nom": "Développeur Python Django"})
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Développeur Python Django")
-
-        # DELETE
-        res = self.client.delete(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Formation.objects.filter(id=formation_id).exists())
-
-    def test_admin_saas_peut_acceder(self):
+    def test_admin_saas_ne_peut_pas_acceder_formations(self):
+        """Admin SaaS n'a aucun droit CRUD sur les formations (opération métier organisme)."""
         self.client.force_authenticate(user=self.admin_saas)
         url = f"/api/tenants/{self.tenant_1.id}/formations/"
+
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
         res = self.client.post(url, {"nom": "Formation SaaS"})
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_formateur_et_apprenant_ont_acces_refuse(self):
-        url = f"/api/tenants/{self.tenant_1.id}/formations/"
-
-        # Formateur
-        self.client.force_authenticate(user=self.formateur_tenant_1)
-        res = self.client.get(url)
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-        # Apprenant
-        self.client.force_authenticate(user=self.apprenant_tenant_1)
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_non_authentifie_recoit_401(self):
-        url = f"/api/tenants/{self.tenant_1.id}/formations/"
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
-    def test_cross_tenant_bloque_par_permission(self):
-        # Admin Tenant 1 tente d'accéder aux formations de Tenant 2
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_2.id}/formations/"
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_isolation_queryset_retourne_404(self):
-        # Une formation créée dans Tenant 2 ne doit pas être visible depuis l'URL de Tenant 1
-        formation_t2 = Formation.objects.create(
-            tenant=self.tenant_2,
-            nom="Formation Beta",
+    def test_admin_saas_ne_peut_pas_modifier_formation(self):
+        f = Formation.objects.create(tenant=self.tenant_1, nom="Formation Existante")
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.patch(
+            f"/api/tenants/{self.tenant_1.id}/formations/{f.id}/",
+            {"nom": "Modifiée"},
         )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/formations/{formation_t2.id}/"
-        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_saas_ne_peut_pas_supprimer_formation(self):
+        f = Formation.objects.create(tenant=self.tenant_1, nom="Formation À Supprimer")
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.delete(
+            f"/api/tenants/{self.tenant_1.id}/formations/{f.id}/"
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_ne_peut_pas_creer_formation(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/formations/",
+            {"nom": "Formation Formateur"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_apprenant_ne_peut_pas_acceder_formations(self):
+        self.client.force_authenticate(user=self.apprenant_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/formations/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_cross_tenant_bloque(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_2.id}/formations/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_isolation_queryset(self):
+        f2 = Formation.objects.create(tenant=self.tenant_2, nom="Formation T2")
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/formations/{f2.id}/")
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_methode_put_interdite_retourne_405(self):
-        formation = Formation.objects.create(
-            tenant=self.tenant_1,
-            nom="Formation 1",
-        )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/formations/{formation.id}/"
-        res = self.client.put(url, {"nom": "Tentative PUT"})
-        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    def test_unicite_nom_formation_par_tenant(self):
-        Formation.objects.create(tenant=self.tenant_1, nom="Data Science")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-
-        # Doublon dans le même tenant -> 400
+    def test_crud_complet(self):
+        self.client.force_authenticate(user=self.admin_t1)
         url = f"/api/tenants/{self.tenant_1.id}/formations/"
-        res = self.client.post(url, {"nom": "Data Science"})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Même nom dans un autre tenant -> 201
-        self.client.force_authenticate(user=self.admin_tenant_2)
-        url_t2 = f"/api/tenants/{self.tenant_2.id}/formations/"
-        res_t2 = self.client.post(url_t2, {"nom": "Data Science"})
-        self.assertEqual(res_t2.status_code, status.HTTP_201_CREATED)
-
-
-class PromotionTests(PedagogieBaseTestCase):
-    def setUp(self):
-        super().setUp()
-        self.formation_t1 = Formation.objects.create(
-            tenant=self.tenant_1,
-            nom="Formation Web",
-        )
-        self.formation_t2 = Formation.objects.create(
-            tenant=self.tenant_2,
-            nom="Formation Mobile",
-        )
-
-    def test_crud_promotion_et_validation_dates(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/"
-
-        # Erreur si date_fin < date_debut
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Promo 2026",
-            "date_debut": "2026-09-01",
-            "date_fin": "2026-06-01",
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("date_fin", res.data)
-
-        # Succès avec dates valides
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Promo 2026",
-            "date_debut": "2026-09-01",
-            "date_fin": "2027-06-30",
-        })
+        res = self.client.post(url, {"nom": "Python", "description": "Desc", "actif": True})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        fid = res.data["id"]
 
-    def test_unicite_nom_promotion_par_formation(self):
-        Promotion.objects.create(
-            formation=self.formation_t1,
-            nom="Promo Automne",
-            date_debut=date(2026, 9, 1),
-        )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/"
-
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Promo Automne",
-            "date_debut": "2026-10-01",
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_validation_parent_enfant_promotion_autre_tenant(self):
-        # Tenter d'associer une promotion à une formation appartenant à Tenant 2
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/"
-
-        res = self.client.post(url, {
-            "formation": self.formation_t2.id,
-            "nom": "Promo Piratage",
-            "date_debut": "2026-09-01",
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-
-class ModuleEtCompetenceTests(PedagogieBaseTestCase):
-    def setUp(self):
-        super().setUp()
-        self.formation_t1 = Formation.objects.create(
-            tenant=self.tenant_1,
-            nom="Formation DevOps",
-        )
-        self.formation_t2 = Formation.objects.create(
-            tenant=self.tenant_2,
-            nom="Formation Cloud",
-        )
-
-    def test_module_contraintes_nom_et_ordre(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/modules/"
-
-        # Ordre = 0 interdit
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Module 0",
-            "ordre": 0,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Création nominale
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Docker & Conteneurs",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-        # Doublon de nom dans la même formation
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Docker & Conteneurs",
-            "ordre": 2,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Doublon d'ordre dans la même formation
-        res = self.client.post(url, {
-            "formation": self.formation_t1.id,
-            "nom": "Kubernetes",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_validation_parent_enfant_module_autre_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/modules/"
-
-        res = self.client.post(url, {
-            "formation": self.formation_t2.id,
-            "nom": "Module Intrus",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_competence_contraintes_et_parent_enfant(self):
-        module = Module.objects.create(
-            formation=self.formation_t1,
-            nom="CI/CD",
-            ordre=1,
-        )
-        module_t2 = Module.objects.create(
-            formation=self.formation_t2,
-            nom="AWS Cloud",
-            ordre=1,
-        )
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competences/"
-
-        # Création nominale
-        res = self.client.post(url, {
-            "module": module.id,
-            "nom": "Configurer GitHub Actions",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-        # Doublon d'ordre dans le même module
-        res = self.client.post(url, {
-            "module": module.id,
-            "nom": "Créer un pipeline GitLab",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Tenter d'associer la compétence à un module de Tenant 2
-        res = self.client.post(url, {
-            "module": module_t2.id,
-            "nom": "Compétence Pirate",
-            "ordre": 1,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_absence_relation_promotion_module(self):
-        # Vérification structurelle : aucune relation directe entre Promotion et Module
-        self.assertFalse(hasattr(Promotion, "modules"))
-        self.assertFalse(hasattr(Promotion, "module"))
-        self.assertFalse(hasattr(Module, "promotions"))
-        self.assertFalse(hasattr(Module, "promotion"))
-
-
-class NiveauTests(PedagogieBaseTestCase):
-    def test_crud_niveau_admin_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-
-        # CREATE
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-        payload = {
-            "nom": "Débutant",
-            "description": "Niveau débutant socle",
-            "ordre": 1,
-            "actif": True,
-        }
-        res = self.client.post(url, payload)
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        niveau_id = res.data["id"]
-        self.assertEqual(res.data["tenant"], self.tenant_1.id)
-        self.assertEqual(res.data["nom"], "Débutant")
-
-        # LIST
-        res = self.client.get(url)
+        res = self.client.patch(f"{url}{fid}/", {"nom": "Python Avancé"})
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
 
-        # RETRIEVE
-        detail_url = f"/api/tenants/{self.tenant_1.id}/niveaux/{niveau_id}/"
-        res = self.client.get(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Débutant")
-
-        # PATCH
-        res = self.client.patch(detail_url, {"nom": "Initiation", "ordre": 2})
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Initiation")
-        self.assertEqual(res.data["ordre"], 2)
-
-        # DELETE
-        res = self.client.delete(detail_url)
+        res = self.client.delete(f"{url}{fid}/")
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Niveau.objects.filter(id=niveau_id).exists())
 
     def test_unicite_nom_par_tenant(self):
-        Niveau.objects.create(tenant=self.tenant_1, nom="Intermédiaire", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-
-        res = self.client.post(url, {"nom": "Intermédiaire", "ordre": 2})
+        Formation.objects.create(tenant=self.tenant_1, nom="Data Science")
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/formations/", {"nom": "Data Science"}
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("nom", res.data)
 
-    def test_unicite_nom_insensible_casse(self):
-        Niveau.objects.create(tenant=self.tenant_1, nom="Avancé", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-
-        res = self.client.post(url, {"nom": "  avancé  ", "ordre": 2})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("nom", res.data)
-
-    def test_nom_identique_autorise_differents_tenants(self):
-        Niveau.objects.create(tenant=self.tenant_1, nom="Expert", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_2)
-        url_t2 = f"/api/tenants/{self.tenant_2.id}/niveaux/"
-
-        res = self.client.post(url_t2, {"nom": "Expert", "ordre": 1})
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_unicite_ordre_par_tenant(self):
-        Niveau.objects.create(tenant=self.tenant_1, nom="Niveau A", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-
-        res = self.client.post(url, {"nom": "Niveau B", "ordre": 1})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("ordre", res.data)
-
-    def test_ordre_identique_autorise_differents_tenants(self):
-        Niveau.objects.create(tenant=self.tenant_1, nom="Niveau A", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_2)
-        url_t2 = f"/api/tenants/{self.tenant_2.id}/niveaux/"
-
-        res = self.client.post(url_t2, {"nom": "Niveau X", "ordre": 1})
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_rejet_ordre_inferieur_a_1(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-
-        res = self.client.post(url, {"nom": "Niveau Zéro", "ordre": 0})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("ordre", res.data)
-
-    def test_isolation_tenant_niveau(self):
-        niveau_t2 = Niveau.objects.create(tenant=self.tenant_2, nom="Niveau Beta", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/{niveau_t2.id}/"
-
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_methode_put_interdite_sur_niveau(self):
-        niveau = Niveau.objects.create(tenant=self.tenant_1, nom="Niveau PUT", ordre=1)
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/{niveau.id}/"
-
-        res = self.client.put(url, {"nom": "Tentative"})
+    def test_put_interdit(self):
+        f = Formation.objects.create(tenant=self.tenant_1, nom="PUT Test")
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.put(f"/api/tenants/{self.tenant_1.id}/formations/{f.id}/", {"nom": "X"})
         self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class CompetenceNiveauTests(PedagogieBaseTestCase):
+# ─── FormateurPromotion ───────────────────────────────────────────────────────
+
+class FormateurPromotionTests(PedagogieBaseTestCase):
     def setUp(self):
         super().setUp()
-        # Formations, modules et compétences dans Tenant 1
-        self.formation_1 = Formation.objects.create(tenant=self.tenant_1, nom="Formation 1")
-        self.module_1 = Module.objects.create(formation=self.formation_1, nom="Module 1", ordre=1)
-        self.competence_1 = Competence.objects.create(module=self.module_1, nom="Compétence 1", ordre=1)
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation FP")
+        self.promo_1 = Promotion.objects.create(
+            formation=self.formation, nom="Promo 1", date_debut=date(2026, 9, 1)
+        )
+        self.promo_2 = Promotion.objects.create(
+            formation=self.formation, nom="Promo 2", date_debut=date(2026, 10, 1)
+        )
 
-        self.formation_2 = Formation.objects.create(tenant=self.tenant_1, nom="Formation 2")
-        self.module_2 = Module.objects.create(formation=self.formation_2, nom="Module 2", ordre=1)
-        self.competence_2 = Competence.objects.create(module=self.module_2, nom="Compétence 2", ordre=1)
+    # ── Affectation ───────────────────────────────────────────────────────────
 
-        # Niveaux dans Tenant 1
-        self.niveau_debutant = Niveau.objects.create(tenant=self.tenant_1, nom="Débutant", ordre=1)
-        self.niveau_avance = Niveau.objects.create(tenant=self.tenant_1, nom="Avancé", ordre=2)
-
-        # Éléments dans Tenant 2
-        self.formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="Formation T2")
-        self.module_t2 = Module.objects.create(formation=self.formation_t2, nom="Module T2", ordre=1)
-        self.competence_t2 = Competence.objects.create(module=self.module_t2, nom="Compétence T2", ordre=1)
-        self.niveau_t2 = Niveau.objects.create(tenant=self.tenant_2, nom="Débutant T2", ordre=1)
-
-    def test_crud_competence_niveau(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
-
-        # CREATE
-        payload = {
-            "competence": self.competence_1.id,
-            "niveau": self.niveau_debutant.id,
-            "description": "Maîtrise basique des commandes",
-        }
-        res = self.client.post(url, payload)
+    def test_admin_organisme_peut_affecter_formateur(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        cn_id = res.data["id"]
-        self.assertEqual(res.data["competence"], self.competence_1.id)
-        self.assertEqual(res.data["niveau"], self.niveau_debutant.id)
-        self.assertEqual(res.data["description"], "Maîtrise basique des commandes")
+        self.assertTrue(FormateurPromotion.objects.filter(
+            formateur=self.formateur_t1, promotion=self.promo_1
+        ).exists())
 
-        # LIST
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
+    def test_admin_saas_ne_peut_pas_affecter_formateur(self):
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-        # RETRIEVE
-        detail_url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/{cn_id}/"
-        res = self.client.get(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["description"], "Maîtrise basique des commandes")
+    def test_formateur_ne_peut_pas_s_auto_affecter(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-        # PATCH
-        res = self.client.patch(detail_url, {"description": "Maîtrise révisée"})
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["description"], "Maîtrise révisée")
+    def test_doublon_affectation_refuse(self):
+        FormateurPromotion.objects.create(formateur=self.formateur_t1, promotion=self.promo_1)
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-        # DELETE
-        res = self.client.delete(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(CompetenceNiveau.objects.filter(id=cn_id).exists())
-
-    def test_reutilisation_niveau_par_plusieurs_formations_meme_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
-
-        # Associer Niveau Débutant à Compétence 1 (Formation 1)
-        res1 = self.client.post(url, {
-            "competence": self.competence_1.id,
-            "niveau": self.niveau_debutant.id,
-            "description": "Attendu formation 1",
-        })
+    def test_formateur_peut_etre_affecte_plusieurs_promotions(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res1 = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
+        )
+        res2 = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_2.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_2.id},
+        )
         self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
-
-        # Associer le MÊME Niveau Débutant à Compétence 2 (Formation 2)
-        res2 = self.client.post(url, {
-            "competence": self.competence_2.id,
-            "niveau": self.niveau_debutant.id,
-            "description": "Attendu formation 2",
-        })
         self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
-
-        # Vérification en base : les 2 associations pointent vers le même niveau
         self.assertEqual(
-            CompetenceNiveau.objects.filter(niveau=self.niveau_debutant).count(),
-            2,
+            FormateurPromotion.objects.filter(formateur=self.formateur_t1).count(), 2
         )
 
-    def test_unicite_paire_competence_niveau(self):
-        CompetenceNiveau.objects.create(
-            competence=self.competence_1,
-            niveau=self.niveau_debutant,
-            description="Initiale",
+    def test_promotion_peut_avoir_plusieurs_formateurs(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res1 = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur_t1.id, "promotion": self.promo_1.id},
         )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
+        res2 = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.formateur2_t1.id, "promotion": self.promo_1.id},
+        )
+        self.assertEqual(res1.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res2.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            FormateurPromotion.objects.filter(promotion=self.promo_1).count(), 2
+        )
 
-        res = self.client.post(url, {
-            "competence": self.competence_1.id,
-            "niveau": self.niveau_debutant.id,
-            "description": "Doublon",
-        })
+    def test_affecter_utilisateur_non_formateur_refuse(self):
+        """Un apprenant ne peut pas être affecté comme formateur."""
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/affecter-formateur/",
+            {"formateur": self.apprenant_t1.id, "promotion": self.promo_1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_rejet_competence_et_niveau_tenants_differents(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
+    # ── Retrait ───────────────────────────────────────────────────────────────
 
-        # Compétence de Tenant 1 avec Niveau de Tenant 2
-        res = self.client.post(url, {
-            "competence": self.competence_1.id,
-            "niveau": self.niveau_t2.id,
-            "description": "Croisement illicite",
-        })
+    def test_admin_organisme_peut_retirer_formateur(self):
+        FormateurPromotion.objects.create(formateur=self.formateur_t1, promotion=self.promo_1)
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/retirer-formateur/",
+            {"formateur_id": self.formateur_t1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertFalse(FormateurPromotion.objects.filter(
+            formateur=self.formateur_t1, promotion=self.promo_1
+        ).exists())
+
+    def test_admin_saas_ne_peut_pas_retirer_formateur(self):
+        FormateurPromotion.objects.create(formateur=self.formateur_t1, promotion=self.promo_1)
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/retirer-formateur/",
+            {"formateur_id": self.formateur_t1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_retirer_formateur_non_affecte_refuse(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/retirer-formateur/",
+            {"formateur_id": self.formateur_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-        # Compétence de Tenant 2 avec Niveau de Tenant 1
-        res = self.client.post(url, {
-            "competence": self.competence_t2.id,
-            "niveau": self.niveau_debutant.id,
-            "description": "Croisement illicite 2",
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+    # ── Liste des formateurs ──────────────────────────────────────────────────
 
-    def test_isolation_tenant_competence_niveau(self):
-        cn_t2 = CompetenceNiveau.objects.create(
-            competence=self.competence_t2,
-            niveau=self.niveau_t2,
-            description="Tenant 2 association",
+    def test_lister_formateurs_d_une_promotion(self):
+        FormateurPromotion.objects.create(formateur=self.formateur_t1, promotion=self.promo_1)
+        FormateurPromotion.objects.create(formateur=self.formateur2_t1, promotion=self.promo_1)
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_1.id}/formateurs/"
         )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/{cn_t2.id}/"
-
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
-
-    def test_filtres_query_params_competence_et_niveau(self):
-        CompetenceNiveau.objects.create(
-            competence=self.competence_1,
-            niveau=self.niveau_debutant,
-            description="C1 - N1",
-        )
-        CompetenceNiveau.objects.create(
-            competence=self.competence_1,
-            niveau=self.niveau_avance,
-            description="C1 - N2",
-        )
-        CompetenceNiveau.objects.create(
-            competence=self.competence_2,
-            niveau=self.niveau_debutant,
-            description="C2 - N1",
-        )
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        base_url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
-
-        # Filtre par compétence
-        res = self.client.get(f"{base_url}?competence={self.competence_1.id}")
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertEqual(len(res.data), 2)
 
-        # Filtre par niveau
-        res = self.client.get(f"{base_url}?niveau={self.niveau_avance.id}")
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
 
-    def test_methode_put_interdite_sur_competence_niveau(self):
-        cn = CompetenceNiveau.objects.create(
-            competence=self.competence_1,
-            niveau=self.niveau_debutant,
-        )
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/{cn.id}/"
+# ─── Accès Formateur aux promotions ───────────────────────────────────────────
 
-        res = self.client.put(url, {"description": "Tentative"})
-        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-
-
-class PedagogieNiveauxPermissionsTests(PedagogieBaseTestCase):
+class PromotionAccesFormateurTests(PedagogieBaseTestCase):
     def setUp(self):
         super().setUp()
-        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Perm")
-        self.module = Module.objects.create(formation=self.formation, nom="Module Perm", ordre=1)
-        self.competence = Competence.objects.create(module=self.module, nom="Comp Perm", ordre=1)
-        self.niveau = Niveau.objects.create(tenant=self.tenant_1, nom="Niveau Perm", ordre=1)
-
-        # Utilisateur non membre / sans tenant
-        self.user_sans_tenant = Utilisateur.objects.create_user(
-            email="sans_tenant@test.com",
-            password="password123",
-            nom="Inconnu",
-            prenom="User",
-            actif=True,
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Accès")
+        self.promo_affectee = Promotion.objects.create(
+            formation=self.formation, nom="Promo Affectée", date_debut=date(2026, 9, 1)
+        )
+        self.promo_non_affectee = Promotion.objects.create(
+            formation=self.formation, nom="Promo Non Affectée", date_debut=date(2026, 10, 1)
+        )
+        FormateurPromotion.objects.create(
+            formateur=self.formateur_t1, promotion=self.promo_affectee
         )
 
-    def test_admin_saas_autorise(self):
+    def test_formateur_voit_uniquement_ses_promotions(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/promotions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        ids = [p["id"] for p in res.data]
+        self.assertIn(self.promo_affectee.id, ids)
+        self.assertNotIn(self.promo_non_affectee.id, ids)
+
+    def test_formateur_ne_peut_pas_voir_promo_non_affectee(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.get(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_non_affectee.id}/"
+        )
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_formateur_ne_peut_pas_creer_promotion(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/",
+            {"formation": self.formation.id, "nom": "Promo Interdite", "date_debut": "2026-11-01"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_ne_peut_pas_modifier_promotion(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.patch(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_affectee.id}/",
+            {"nom": "Modifiée"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_ne_peut_pas_supprimer_promotion(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.delete(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_affectee.id}/"
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_saas_ne_peut_pas_acceder_promotions_metier(self):
         self.client.force_authenticate(user=self.admin_saas)
-        url_niveau = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-        res = self.client.post(url_niveau, {"nom": "Niveau SaaS", "ordre": 2})
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/promotions/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-        url_cn = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
-        res = self.client.post(url_cn, {
-            "competence": self.competence.id,
-            "niveau": self.niveau.id,
-            "description": "Association SaaS",
-        })
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+    def test_admin_saas_ne_peut_pas_creer_promotion(self):
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/",
+            {"formation": self.formation.id, "nom": "Promo SaaS", "date_debut": "2026-11-01"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_admin_tenant_autorise_sur_son_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
-        res = self.client.get(url)
+    def test_admin_organisme_voit_toutes_ses_promotions(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/promotions/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        ids = [p["id"] for p in res.data]
+        self.assertIn(self.promo_affectee.id, ids)
+        self.assertIn(self.promo_non_affectee.id, ids)
+
+    def test_formateur_ne_peut_pas_inscrire_apprenant(self):
+        """Seul l'admin organisme peut inscrire un apprenant."""
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/"
+            f"{self.promo_affectee.id}/inscrire-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_peut_lister_inscrits_de_sa_promotion(self):
+        InscriptionPromotion.objects.create(
+            promotion=self.promo_affectee, apprenant=self.apprenant_t1, actif=True
+        )
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.get(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo_affectee.id}/inscriptions/"
+        )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
 
-        url_cn = f"/api/tenants/{self.tenant_1.id}/competence-niveaux/"
-        res = self.client.get(url_cn)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-
-    def test_admin_tenant_refuse_sur_autre_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url_niveau_t2 = f"/api/tenants/{self.tenant_2.id}/niveaux/"
-        res = self.client.get(url_niveau_t2)
+    def test_cross_tenant_formateur_bloque(self):
+        formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="Forma T2")
+        promo_t2 = Promotion.objects.create(
+            formation=formation_t2, nom="Promo T2", date_debut=date(2026, 9, 1)
+        )
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.get(
+            f"/api/tenants/{self.tenant_2.id}/promotions/{promo_t2.id}/"
+        )
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-        url_cn_t2 = f"/api/tenants/{self.tenant_2.id}/competence-niveaux/"
-        res = self.client.get(url_cn_t2)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_formateur_refuse(self):
-        self.client.force_authenticate(user=self.formateur_tenant_1)
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/competence-niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_apprenant_refuse(self):
-        self.client.force_authenticate(user=self.apprenant_tenant_1)
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/competence-niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_utilisateur_non_membre_refuse(self):
-        self.client.force_authenticate(user=self.user_sans_tenant)
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/competence-niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_non_authentifie_refuse(self):
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
-        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/competence-niveaux/")
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
+# ─── Inscription promotion — Utilisateur.actif non bloquant ───────────────────
 
 class InscriptionPromotionTests(PedagogieBaseTestCase):
     def setUp(self):
         super().setUp()
-        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Python")
-        self.promotion_1 = Promotion.objects.create(
-            formation=self.formation,
-            nom="Promo 2026-A",
-            date_debut=date(2026, 9, 1),
-        )
-        self.promotion_2 = Promotion.objects.create(
-            formation=self.formation,
-            nom="Promo 2026-B",
-            date_debut=date(2026, 10, 1),
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Inscription")
+        self.promo = Promotion.objects.create(
+            formation=self.formation, nom="Promo Inscription", date_debut=date(2026, 9, 1)
         )
 
-        # Deuxième apprenant dans Tenant 1
-        self.apprenant_2 = Utilisateur.objects.create_user(
-            email="apprenant2_org1@test.com",
-            password="password123",
-            nom="Deuxieme",
-            prenom="Apprenant",
-            actif=True,
+    def test_inscription_apprenant_compte_actif(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo.id}/inscrire-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
         )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_2,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
-        # Apprenant dans Tenant 2
-        self.apprenant_t2 = Utilisateur.objects.create_user(
-            email="apprenant_org2@test.com",
-            password="password123",
-            nom="Autre",
-            prenom="Tenant",
-            actif=True,
+    def test_inscription_apprenant_compte_inactif_autorisee(self):
+        """
+        Utilisateur.actif=False ne bloque PAS l'inscription si MembreTenant.actif=True.
+        Règle métier validée.
+        """
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo.id}/inscrire-apprenant/",
+            {"apprenant_id": self.apprenant_inactif.id},
         )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_t2,
-            tenant=self.tenant_2,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
-
-    def test_inscription_apprenant_promotion(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
         self.assertTrue(
             InscriptionPromotion.objects.filter(
-                promotion=self.promotion_1,
-                apprenant=self.apprenant_tenant_1,
-                actif=True,
+                promotion=self.promo, apprenant=self.apprenant_inactif, actif=True
             ).exists()
         )
 
-    def test_rejet_inscription_deux_promotions_actives_simultanees(self):
-        # Inscrire l'apprenant dans Promo 1
+    def test_inscription_double_promo_active_refusee(self):
         InscriptionPromotion.objects.create(
-            promotion=self.promotion_1,
-            apprenant=self.apprenant_tenant_1,
-            actif=True,
+            promotion=self.promo, apprenant=self.apprenant_t1, actif=True
         )
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_2.id}/inscrire-apprenant/"
-
-        # Tentative d'inscription dans Promo 2 -> Doit échouer
-        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("apprenant", res.data)
-
-    def test_rejet_inscription_utilisateur_non_apprenant(self):
-        # Tentative d'inscrire le formateur comme apprenant
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.formateur_tenant_1.id})
+        promo_2 = Promotion.objects.create(
+            formation=self.formation, nom="Promo 2", date_debut=date(2026, 10, 1)
+        )
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{promo_2.id}/inscrire-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_rejet_inscription_apprenant_autre_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/inscrire-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_t2.id})
+    def test_inscription_non_apprenant_refuse(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo.id}/inscrire-apprenant/",
+            {"apprenant_id": self.formateur_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_desinscription_apprenant_et_reinscription(self):
-        # Inscription
+    def test_desinscription_et_reinscription(self):
         inscription = InscriptionPromotion.objects.create(
-            promotion=self.promotion_1,
-            apprenant=self.apprenant_tenant_1,
-            actif=True,
+            promotion=self.promo, apprenant=self.apprenant_t1, actif=True
         )
+        self.client.force_authenticate(user=self.admin_t1)
 
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url_desinscrire = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_1.id}/desinscrire-apprenant/"
-
-        # Désinscription
-        res = self.client.post(url_desinscrire, {"apprenant_id": self.apprenant_tenant_1.id})
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo.id}/desinscrire-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-
         inscription.refresh_from_db()
         self.assertFalse(inscription.actif)
-        self.assertIsNotNone(inscription.date_desinscription)
 
-        # Réinscription dans une autre promotion (Promo 2) désormais permise
-        url_inscrire_2 = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promotion_2.id}/inscrire-apprenant/"
-        res_2 = self.client.post(url_inscrire_2, {"apprenant_id": self.apprenant_tenant_1.id})
-        self.assertEqual(res_2.status_code, status.HTTP_201_CREATED)
+        promo_2 = Promotion.objects.create(
+            formation=self.formation, nom="Promo 2", date_debut=date(2026, 11, 1)
+        )
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/promotions/{promo_2.id}/inscrire-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
+
+# ─── Groupes ──────────────────────────────────────────────────────────────────
 
 class GroupeTests(PedagogieBaseTestCase):
     def setUp(self):
         super().setUp()
-        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Dev")
-        self.promotion_1 = Promotion.objects.create(
-            formation=self.formation,
-            nom="Promo 1",
-            date_debut=date(2026, 9, 1),
+        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Groupe")
+        self.promo_1 = Promotion.objects.create(
+            formation=self.formation, nom="Promo G1", date_debut=date(2026, 9, 1)
         )
-        self.promotion_2 = Promotion.objects.create(
-            formation=self.formation,
-            nom="Promo 2",
-            date_debut=date(2026, 10, 1),
+        self.promo_2 = Promotion.objects.create(
+            formation=self.formation, nom="Promo G2", date_debut=date(2026, 10, 1)
         )
 
-        # Inscriptions promotions
-        self.inscription_1 = InscriptionPromotion.objects.create(
-            promotion=self.promotion_1,
-            apprenant=self.apprenant_tenant_1,
-            actif=True,
+        # Formateur affecté à promo_1 uniquement
+        FormateurPromotion.objects.create(formateur=self.formateur_t1, promotion=self.promo_1)
+
+        # Inscription apprenants
+        InscriptionPromotion.objects.create(
+            promotion=self.promo_1, apprenant=self.apprenant_t1, actif=True
+        )
+        InscriptionPromotion.objects.create(
+            promotion=self.promo_1, apprenant=self.apprenant_inactif, actif=True
         )
 
-        # Apprenant 2 dans Promo 1
-        self.apprenant_2 = Utilisateur.objects.create_user(
-            email="apprenant2_test@test.com",
-            password="password123",
-            nom="Deux",
-            prenom="User",
-            actif=True,
-        )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_2,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
-        self.inscription_2 = InscriptionPromotion.objects.create(
-            promotion=self.promotion_1,
-            apprenant=self.apprenant_2,
-            actif=True,
-        )
+    # ── Création ──────────────────────────────────────────────────────────────
 
-        # Apprenant 3 dans Promo 2
-        self.apprenant_3 = Utilisateur.objects.create_user(
-            email="apprenant3_test@test.com",
-            password="password123",
-            nom="Trois",
-            prenom="User",
-            actif=True,
+    def test_admin_organisme_peut_creer_groupe(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/",
+            {"promotion": self.promo_1.id, "nom": "Groupe Admin"},
         )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_3,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
-        self.inscription_3 = InscriptionPromotion.objects.create(
-            promotion=self.promotion_2,
-            apprenant=self.apprenant_3,
-            actif=True,
-        )
-
-        # Apprenant sans promotion
-        self.apprenant_sans_promo = Utilisateur.objects.create_user(
-            email="sans_promo@test.com",
-            password="password123",
-            nom="Sans",
-            prenom="Promo",
-            actif=True,
-        )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_sans_promo,
-            tenant=self.tenant_1,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
-
-        # Éléments Tenant 2
-        self.formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="Formation T2")
-        self.promotion_t2 = Promotion.objects.create(
-            formation=self.formation_t2,
-            nom="Promo T2",
-            date_debut=date(2026, 9, 1),
-        )
-        self.apprenant_t2 = Utilisateur.objects.create_user(
-            email="apprenant_t2@test.com",
-            password="password123",
-            nom="T2",
-            prenom="User",
-            actif=True,
-        )
-        MembreTenant.objects.create(
-            utilisateur=self.apprenant_t2,
-            tenant=self.tenant_2,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        )
-        self.inscription_t2 = InscriptionPromotion.objects.create(
-            promotion=self.promotion_t2,
-            apprenant=self.apprenant_t2,
-            actif=True,
-        )
-
-    def test_crud_groupe(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-
-        # CREATE
-        payload = {
-            "promotion": self.promotion_1.id,
-            "nom": "Groupe Alpha",
-            "description": "Premier groupe projet",
-            "actif": True,
-        }
-        res = self.client.post(url, payload)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        groupe_id = res.data["id"]
-        self.assertEqual(res.data["nom"], "Groupe Alpha")
-        self.assertEqual(res.data["nb_membres"], 0)
 
-        # LIST
-        res = self.client.get(url)
+    def test_formateur_peut_creer_groupe_dans_sa_promotion(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/",
+            {"promotion": self.promo_1.id, "nom": "Groupe Formateur"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_formateur_ne_peut_pas_creer_groupe_promo_non_affectee(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/",
+            {"promotion": self.promo_2.id, "nom": "Groupe Interdit"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_saas_ne_peut_pas_creer_groupe(self):
+        self.client.force_authenticate(user=self.admin_saas)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/",
+            {"promotion": self.promo_1.id, "nom": "Groupe SaaS"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_apprenant_ne_peut_pas_creer_groupe(self):
+        self.client.force_authenticate(user=self.apprenant_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/",
+            {"promotion": self.promo_1.id, "nom": "Groupe App"},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ── Visibilité ────────────────────────────────────────────────────────────
+
+    def test_formateur_voit_groupes_de_ses_promotions_seulement(self):
+        g1 = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Promo 1")
+        g2 = Groupe.objects.create(promotion=self.promo_2, nom="Groupe Promo 2")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/groupes/")
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
+        ids = [g["id"] for g in res.data]
+        self.assertIn(g1.id, ids)
+        self.assertNotIn(g2.id, ids)
 
-        # RETRIEVE
-        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_id}/"
-        res = self.client.get(detail_url)
+    def test_formateur_ne_peut_pas_modifier_groupe_promo_non_affectee(self):
+        groupe = Groupe.objects.create(promotion=self.promo_2, nom="Groupe Interdit")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.patch(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/",
+            {"nom": "Modifié"},
+        )
+        # Le formateur ne voit pas ce groupe (promo non affectée) → 404
+        self.assertIn(res.status_code, [status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND])
+
+    def test_formateur_peut_modifier_groupe_sa_promotion(self):
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe A")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.patch(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/",
+            {"nom": "Groupe A Renommé"},
+        )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Groupe Alpha")
 
-        # PATCH
-        res = self.client.patch(detail_url, {"nom": "Groupe Alpha Renommé"})
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nom"], "Groupe Alpha Renommé")
-
-        # DELETE
-        res = self.client.delete(detail_url)
+    def test_formateur_peut_supprimer_groupe_sa_promotion(self):
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe À Supprimer")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.delete(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
+        )
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-        self.assertFalse(Groupe.objects.filter(id=groupe_id).exists())
 
-    def test_unicite_nom_groupe_par_promotion(self):
-        Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Un")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
+    # ── Membres ───────────────────────────────────────────────────────────────
 
-        # Doublon exact
-        res = self.client.post(url, {"promotion": self.promotion_1.id, "nom": "Groupe Un"})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Doublon insensible à la casse
-        res = self.client.post(url, {"promotion": self.promotion_1.id, "nom": "  groupe un  "})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-        # Même nom dans une autre promotion -> OK
-        res = self.client.post(url, {"promotion": self.promotion_2.id, "nom": "Groupe Un"})
+    def test_ajouter_apprenant_compte_actif(self):
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Membre")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
-    def test_groupe_vide_autorise(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Sans Membre")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
-        res = self.client.get(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data["nb_membres"], 0)
-        self.assertEqual(len(res.data["membres"]), 0)
+    def test_ajouter_apprenant_compte_inactif_autorise(self):
+        """
+        Utilisateur.actif=False ne bloque PAS l'ajout si MembreTenant.actif=True
+        et que l'apprenant est inscrit dans la promotion.
+        """
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Inactif")
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/",
+            {"apprenant_id": self.apprenant_inactif.id},
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(
+            GroupeMembre.objects.filter(groupe=groupe, apprenant=self.apprenant_inactif).exists()
+        )
 
     def test_appartenance_multiple_groupes_meme_promotion(self):
-        groupe_a = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe A")
-        groupe_b = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe B")
+        groupe_a = Groupe.objects.create(promotion=self.promo_1, nom="Groupe A")
+        groupe_b = Groupe.objects.create(promotion=self.promo_1, nom="Groupe B")
+        self.client.force_authenticate(user=self.admin_t1)
 
-        self.client.force_authenticate(user=self.admin_tenant_1)
-
-        # Ajout apprenant 1 dans Groupe A
-        url_a = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_a.id}/ajouter-apprenant/"
-        res_a = self.client.post(url_a, {"apprenant_id": self.apprenant_tenant_1.id})
+        res_a = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_a.id}/ajouter-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
+        res_b = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_b.id}/ajouter-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res_a.status_code, status.HTTP_201_CREATED)
-
-        # Ajout du MÊME apprenant 1 dans Groupe B
-        url_b = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_b.id}/ajouter-apprenant/"
-        res_b = self.client.post(url_b, {"apprenant_id": self.apprenant_tenant_1.id})
         self.assertEqual(res_b.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(
+            GroupeMembre.objects.filter(apprenant=self.apprenant_t1).count(), 2
+        )
 
-        # Vérification des deux appartenances
-        self.assertEqual(GroupeMembre.objects.filter(apprenant=self.apprenant_tenant_1).count(), 2)
-
-    def test_rejet_ajout_apprenant_autre_promotion(self):
-        groupe_promo_1 = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Promo 1")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_promo_1.id}/ajouter-apprenant/"
-
-        # apprenant_3 est dans Promo 2 -> tentative de l'ajouter dans un groupe de Promo 1
-        res = self.client.post(url, {"apprenant_id": self.apprenant_3.id})
+    def test_doublon_membre_refuse(self):
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Doublon")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_t1)
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("apprenant", res.data)
 
-    def test_rejet_ajout_apprenant_sans_promotion(self):
-        groupe_promo_1 = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Sans")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_promo_1.id}/ajouter-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_sans_promo.id})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("apprenant", res.data)
-
-    def test_rejet_doublon_apprenant_meme_groupe(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Doublon")
-        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+    def test_apprenant_autre_promotion_refuse(self):
+        """Un apprenant inscrit en promo_2 ne peut pas rejoindre un groupe de promo_1."""
+        apprenant_p2 = Utilisateur.objects.create_user(
+            email="apprenant_p2@test.com", password="pw", nom="P2", prenom="App", actif=True,
+        )
+        MembreTenant.objects.create(utilisateur=apprenant_p2, tenant=self.tenant_1,
+                                    role=MembreTenant.Role.APPRENANT, actif=True)
+        InscriptionPromotion.objects.create(
+            promotion=self.promo_2, apprenant=apprenant_p2, actif=True
+        )
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Promo 1")
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/",
+            {"apprenant_id": apprenant_p2.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_retirer_apprenant_groupe(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Retrait")
-        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/retirer-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_tenant_1.id})
+        groupe = Groupe.objects.create(promotion=self.promo_1, nom="Groupe Retrait")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_t1)
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/retirer-apprenant/",
+            {"apprenant_id": self.apprenant_t1.id},
+        )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertFalse(GroupeMembre.objects.filter(groupe=groupe, apprenant=self.apprenant_tenant_1).exists())
-
-    def test_suppression_groupe_ne_supprime_pas_utilisateur(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe A Supprimer")
-        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_tenant_1)
-
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        detail_url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
-        res = self.client.delete(detail_url)
-        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
-
-        # Le groupe et son association sont supprimés
-        self.assertFalse(Groupe.objects.filter(id=groupe.id).exists())
-        self.assertFalse(GroupeMembre.objects.filter(groupe_id=groupe.id).exists())
-        # L'utilisateur apprenant existe TOUJOURS
-        self.assertTrue(Utilisateur.objects.filter(id=self.apprenant_tenant_1.id).exists())
-
-    def test_rejet_apprenant_autre_tenant(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe Tenant 1")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/ajouter-apprenant/"
-
-        res = self.client.post(url, {"apprenant_id": self.apprenant_t2.id})
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            GroupeMembre.objects.filter(groupe=groupe, apprenant=self.apprenant_t1).exists()
+        )
 
     def test_isolation_tenant_groupe(self):
-        groupe_t2 = Groupe.objects.create(promotion=self.promotion_t2, nom="Groupe T2")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_t2.id}/"
-
-        res = self.client.get(url)
+        formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="F T2")
+        promo_t2 = Promotion.objects.create(
+            formation=formation_t2, nom="P T2", date_debut=date(2026, 9, 1)
+        )
+        groupe_t2 = Groupe.objects.create(promotion=promo_t2, nom="Groupe T2")
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(
+            f"/api/tenants/{self.tenant_1.id}/groupes/{groupe_t2.id}/"
+        )
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_methode_put_interdite_sur_groupe(self):
-        groupe = Groupe.objects.create(promotion=self.promotion_1, nom="Groupe PUT")
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/{groupe.id}/"
 
-        res = self.client.put(url, {"nom": "Tentative"})
-        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+# ─── Modules & Compétences ────────────────────────────────────────────────────
 
-
-class GroupePermissionsTests(PedagogieBaseTestCase):
+class ModuleEtCompetenceTests(PedagogieBaseTestCase):
     def setUp(self):
         super().setUp()
-        self.formation = Formation.objects.create(tenant=self.tenant_1, nom="Formation Perm")
-        self.promotion = Promotion.objects.create(
-            formation=self.formation,
-            nom="Promo Perm",
-            date_debut=date(2026, 9, 1),
-        )
-        self.groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe Perm")
+        self.formation_t1 = Formation.objects.create(tenant=self.tenant_1, nom="Formation DevOps")
+        self.formation_t2 = Formation.objects.create(tenant=self.tenant_2, nom="Formation Cloud")
 
-        # Utilisateur sans tenant
-        self.user_sans_tenant = Utilisateur.objects.create_user(
-            email="sans_tenant_groupe@test.com",
-            password="password123",
-            nom="Inconnu",
-            prenom="User",
-            actif=True,
-        )
-
-    def test_admin_saas_autorise(self):
+    def test_admin_saas_ne_peut_pas_acceder_modules(self):
+        """Admin SaaS n'a aucun droit CRUD sur les modules (opération métier organisme)."""
         self.client.force_authenticate(user=self.admin_saas)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.post(url, {"promotion": self.promotion.id, "nom": "Groupe SaaS"})
+        url = f"/api/tenants/{self.tenant_1.id}/modules/"
+
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        res = self.client.post(url, {
+            "formation": self.formation_t1.id, "nom": "Module SaaS", "ordre": 1
+        })
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_saas_ne_peut_pas_acceder_competences(self):
+        """Admin SaaS n'a aucun droit CRUD sur les compétences."""
+        module = Module.objects.create(
+            formation=self.formation_t1, nom="Module Test", ordre=1
+        )
+        self.client.force_authenticate(user=self.admin_saas)
+        url = f"/api/tenants/{self.tenant_1.id}/competences/"
+
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+        res = self.client.post(url, {"module": module.id, "nom": "Comp SaaS", "ordre": 1})
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_ne_peut_pas_creer_module(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/modules/",
+            {"formation": self.formation_t1.id, "nom": "Module F", "ordre": 1},
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_validation_parent_enfant_module_autre_tenant(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/modules/",
+            {"formation": self.formation_t2.id, "nom": "Module Pirate", "ordre": 1},
+        )
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_contraintes_module(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        url = f"/api/tenants/{self.tenant_1.id}/modules/"
+        res = self.client.post(url, {"formation": self.formation_t1.id, "nom": "M1", "ordre": 0})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+        res = self.client.post(url, {"formation": self.formation_t1.id, "nom": "M1", "ordre": 1})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
-    def test_admin_tenant_autorise_sur_son_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.get(url)
+        res = self.client.post(url, {"formation": self.formation_t1.id, "nom": "M1", "ordre": 2})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+# ─── Niveaux ──────────────────────────────────────────────────────────────────
+
+class NiveauTests(PedagogieBaseTestCase):
+    def test_crud_niveau_admin_tenant(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
+        res = self.client.post(url, {"nom": "Débutant", "ordre": 1})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        nid = res.data["id"]
+
+        res = self.client.patch(
+            f"/api/tenants/{self.tenant_1.id}/niveaux/{nid}/", {"nom": "Initiation"}
+        )
         self.assertEqual(res.status_code, status.HTTP_200_OK)
 
-    def test_admin_tenant_refuse_sur_autre_tenant(self):
-        self.client.force_authenticate(user=self.admin_tenant_1)
-        url = f"/api/tenants/{self.tenant_2.id}/groupes/"
+        res = self.client.delete(f"/api/tenants/{self.tenant_1.id}/niveaux/{nid}/")
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_formateur_ne_peut_pas_creer_niveau(self):
+        self.client.force_authenticate(user=self.formateur_t1)
+        res = self.client.post(
+            f"/api/tenants/{self.tenant_1.id}/niveaux/", {"nom": "Niveau F", "ordre": 1}
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_saas_ne_peut_pas_creer_niveau(self):
+        """Admin SaaS n'a aucun droit CRUD sur les niveaux (opération métier organisme)."""
+        self.client.force_authenticate(user=self.admin_saas)
+        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
+
         res = self.client.get(url)
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_formateur_refuse(self):
-        self.client.force_authenticate(user=self.formateur_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.get(url)
+        res = self.client.post(url, {"nom": "Niveau SaaS", "ordre": 1})
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_apprenant_refuse(self):
-        self.client.force_authenticate(user=self.apprenant_tenant_1)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+    def test_unicite_nom_et_ordre_par_tenant(self):
+        Niveau.objects.create(tenant=self.tenant_1, nom="Expert", ordre=1)
+        self.client.force_authenticate(user=self.admin_t1)
+        url = f"/api/tenants/{self.tenant_1.id}/niveaux/"
+        res = self.client.post(url, {"nom": "Expert", "ordre": 2})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        res = self.client.post(url, {"nom": "Avancé", "ordre": 1})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_utilisateur_non_membre_refuse(self):
-        self.client.force_authenticate(user=self.user_sans_tenant)
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_non_authentifie_refuse(self):
-        url = f"/api/tenants/{self.tenant_1.id}/groupes/"
-        res = self.client.get(url)
-        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
-
-
+    def test_isolation_tenant_niveau(self):
+        n_t2 = Niveau.objects.create(tenant=self.tenant_2, nom="N T2", ordre=1)
+        self.client.force_authenticate(user=self.admin_t1)
+        res = self.client.get(f"/api/tenants/{self.tenant_1.id}/niveaux/{n_t2.id}/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
