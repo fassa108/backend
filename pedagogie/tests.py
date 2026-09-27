@@ -1055,6 +1055,15 @@ class GroupeReglesTests(ReglesPedagogieBaseTestCase):
             status.HTTP_403_FORBIDDEN,
         )
 
+    def test_ajout_refuse_dans_un_groupe_desactive(self):
+        self.groupe.actif = False
+        self.groupe.save()
+        self.client.force_authenticate(self.formateur_t1)
+        res = self.client.post(f"{self.base}/groupes/{self.groupe.id}/ajouter-apprenant/",
+                               {"apprenant_id": self.apprenant_inactif.id})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("désactivé", str(res.data["detail"]))
+
     def test_apprenant_voit_ses_groupes_et_leurs_membres(self):
         Groupe.objects.create(promotion=self.p1, nom="Autre groupe")
         self.client.force_authenticate(self.apprenant_t1)

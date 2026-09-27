@@ -658,6 +658,12 @@ class GroupeViewSet(viewsets.ModelViewSet):
         groupe = self.get_object()
         self._verifier_formateur_du_groupe(groupe.promotion)
 
+        if not groupe.actif:
+            return Response(
+                {"detail": "Ce groupe est désactivé : réactivez-le pour y ajouter des apprenants."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         apprenant_id = request.data.get("apprenant_id")
         if not apprenant_id:
             return Response(
