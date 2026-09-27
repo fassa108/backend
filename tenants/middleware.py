@@ -1,16 +1,46 @@
 from django.http import JsonResponse
+from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework_simplejwt.exceptions import InvalidToken, AuthenticationFailed
 
-from .exceptions import ORGANISME_SUSPENDU_CODE, ORGANISME_SUSPENDU_MESSAGE
+from accounts.models import MembreTenant
+
+from .exceptions import (
+    MEMBRE_SUSPENDU_CODE,
+    MEMBRE_SUSPENDU_MESSAGE,
+    ORGANISME_SUSPENDU_CODE,
+    ORGANISME_SUSPENDU_MESSAGE,
+)
 from .models import Tenant
+
+
+def _refus(message, code):
+    return JsonResponse({"detail": message, "code": code}, status=403)
+
+
+def _utilisateur_jwt(request):
+    """
+    Utilisateur authentifié par le JWT de la requête, ou None.
+
+    Un token absent ou invalide est ignoré ici : DRF renverra le 401.
+    """
+    try:
+        resultat = JWTAuthentication().authenticate(request)
+    except (InvalidToken, AuthenticationFailed):
+        return None
+    return resultat[0] if resultat else None
 
 
 class OrganismeSuspenduMiddleware:
     """
-    Bloque toutes les routes métier d'un organisme suspendu.
+    Bloque toutes les routes métier d'un organisme suspendu,
+    et celles d'un membre dont l'accès à l'organisme est suspendu.
 
     Toutes les routes rattachées à un organisme portent le paramètre
-    d'URL « tenant_id » (pédagogie, activités, membres). Si cet organisme
-    est suspendu, la requête est refusée avant d'atteindre la vue.
+    d'URL « tenant_id » (pédagogie, activités, membres). La requête est
+    refusée avant d'atteindre la vue, avec un code que le frontend utilise
+    pour afficher la page dédiée :
+    - « organisme_suspendu » : Tenant.statut = False ;
+    - « membre_suspendu » : MembreTenant.actif = False pour cet utilisateur.
 
     La fiche de l'organisme (/api/tenants/<pk>/) n'utilise pas
     « tenant_id » : elle reste accessible à l'admin SaaS, et le cas
@@ -30,12 +60,14 @@ class OrganismeSuspenduMiddleware:
             return None
 
         if Tenant.objects.filter(pk=tenant_id, statut=False).exists():
-            return JsonResponse(
-                {
-                    "detail": ORGANISME_SUSPENDU_MESSAGE,
-                    "code": ORGANISME_SUSPENDU_CODE,
-                },
-                status=403,
-            )
+            return _refus(ORGANISME_SUSPENDU_MESSAGE, ORGANISME_SUSPENDU_CODE)
+
+        utilisateur = _utilisateur_jwt(request)
+        if utilisateur and MembreTenant.objects.filter(
+            utilisateur=utilisateur,
+            tenant_id=tenant_id,
+            actif=False,
+        ).exists():
+            return _refus(MEMBRE_SUSPENDU_MESSAGE, MEMBRE_SUSPENDU_CODE)
 
         return None
