@@ -10,6 +10,73 @@ from pedagogie.models import (
     Promotion,
 )
 
+# Extensions autorisées pour les fichiers livrables
+EXTENSIONS_LIVRABLES = ["pdf", "pptx", "docx", "txt"]
+
+# Extensions autorisées pour les ressources
+EXTENSIONS_RESSOURCES = ["pdf", "pptx", "docx", "txt"]
+
+
+class Ressource(models.Model):
+    """
+    Ressource pédagogique indépendante d'un Brief.
+
+    Une ressource appartient à un tenant et est créée par un formateur
+    ou un administrateur. Elle n'est pas rattachée à un Brief.
+
+    Contient soit une URL, soit un fichier — jamais les deux.
+    """
+
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="ressources",
+    )
+
+    formateur = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ressources_creees",
+    )
+
+    titre = models.CharField(max_length=255)
+
+    url = models.URLField(
+        blank=True,
+        null=True,
+    )
+
+    fichier = models.FileField(
+        upload_to="ressources/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(
+                allowed_extensions=EXTENSIONS_RESSOURCES,
+            )
+        ],
+    )
+
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date_creation"]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(url__isnull=False, url__gt="", fichier="")
+                    | Q(url__isnull=True, fichier__gt="")
+                ),
+                name="ressource_exactement_une_source",
+            ),
+        ]
+
+    def __str__(self):
+        return self.titre
+
 
 class Brief(models.Model):
     class Statut(models.TextChoices):
@@ -59,6 +126,12 @@ class Brief(models.Model):
 
 
 class RessourceBrief(models.Model):
+    """
+    DÉPRÉCIÉ — conservé pour la migration des données existantes.
+    Sera supprimé dans une migration ultérieure après migration des données.
+    Utiliser Ressource à la place.
+    """
+
     brief = models.ForeignKey(
         Brief,
         on_delete=models.CASCADE,
@@ -88,8 +161,8 @@ class RessourceBrief(models.Model):
         constraints = [
             models.CheckConstraint(
                 condition=(
-                    Q(url__isnull=False, fichier__isnull=True)
-                    | Q(url__isnull=True, fichier__isnull=False)
+                    Q(url__isnull=False, url__gt="", fichier="")
+                    | Q(url__isnull=True, fichier__gt="")
                 ),
                 name="ressource_brief_exactement_une_source",
             ),
@@ -127,11 +200,13 @@ class Assignation(models.Model):
     class Meta:
         constraints = [
             models.CheckConstraint(
+                # Au moins une cible doit être renseignée :
+                # apprenant seul, groupe seul, ou les deux ensemble.
+                # Seul le cas "ni apprenant ni groupe" est interdit.
                 condition=(
-                    Q(groupe__isnull=False, apprenant__isnull=True)
-                    | Q(groupe__isnull=True, apprenant__isnull=False)
+                    Q(groupe__isnull=False) | Q(apprenant__isnull=False)
                 ),
-                name="assignation_exactement_une_cible",
+                name="assignation_au_moins_une_cible",
             ),
             models.UniqueConstraint(
                 fields=["brief", "groupe"],
@@ -149,3 +224,80 @@ class Assignation(models.Model):
         if self.groupe:
             return f"{self.brief} → Groupe {self.groupe}"
         return f"{self.brief} → Apprenant {self.apprenant}"
+
+
+class Livrable(models.Model):
+    class Statut(models.TextChoices):
+        SOUMIS = "SOUMIS", "Soumis"
+        INVALIDE = "INVALIDE", "Invalide"
+        RETENU = "RETENU", "Retenu"
+
+    assignation = models.ForeignKey(
+        Assignation,
+        on_delete=models.CASCADE,
+        related_name="livrables",
+    )
+    deposant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="livrables_deposes",
+    )
+    titre = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    statut = models.CharField(
+        max_length=20,
+        choices=Statut.choices,
+        default=Statut.SOUMIS,
+    )
+    date_depot = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.titre
+
+
+class FichierLivrable(models.Model):
+    livrable = models.ForeignKey(
+        Livrable,
+        on_delete=models.CASCADE,
+        related_name="fichiers",
+    )
+    nom = models.CharField(max_length=255)
+    fichier = models.FileField(
+        upload_to="livrables/",
+        blank=True,
+        null=True,
+        validators=[
+            FileExtensionValidator(
+                allowed_extensions=EXTENSIONS_LIVRABLES,
+            )
+        ],
+    )
+    url = models.URLField(
+        blank=True,
+        null=True,
+    )
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    (
+                        Q(url__isnull=False)
+                        & ~Q(url="")
+                        & (Q(fichier__isnull=True) | Q(fichier=""))
+                    )
+                    |
+                    (
+                        Q(fichier__isnull=False)
+                        & ~Q(fichier="")
+                        & (Q(url__isnull=True) | Q(url=""))
+                    )
+                ),
+                name="fichier_livrable_exactement_une_source",
+            )
+        ]
+
+    def __str__(self):
+        return self.nom
