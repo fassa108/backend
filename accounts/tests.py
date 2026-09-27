@@ -19,6 +19,7 @@ from django.db import IntegrityError
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from pedagogie.models import FormateurPromotion, Formation, InscriptionPromotion, Promotion
 from tenants.models import Tenant
@@ -71,8 +72,17 @@ class ConnexionTests(AccountsBaseTestCase):
         self.assertIn("access", r.data)
         self.assertEqual(r.data["tenants"], [{
             "id": self.tenant.id, "nom": self.tenant.nom, "code": self.tenant.code,
-            "role": "ADMINISTRATEUR", "statut": True,
+            "role": "ADMINISTRATEUR", "statut": True, "actif": True,
         }])
+
+    def test_connexion_retourne_les_acces_suspendus(self):
+        membre = self.membre(self.formateur)
+        membre.actif = False
+        membre.save()
+        r = self.client.post(self.url, {"email": "formateur@test.com", "password": MOT_DE_PASSE_SOLIDE})
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(r.data["tenants"]), 1)
+        self.assertFalse(r.data["tenants"][0]["actif"])
 
     def test_connexion_organisme_suspendu_autorisee(self):
         self.tenant.statut = False
@@ -295,3 +305,103 @@ class OrganismeSuspenduMembresTests(AccountsBaseTestCase):
         r = self.client.get(self.url_membres)
         self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)
         self.assertEqual(r.json()["code"], "organisme_suspendu")
+
+
+# ─── Membre suspendu ──────────────────────────────────────────────────────────
+
+class MembreSuspenduTests(AccountsBaseTestCase):
+    """
+    Le middleware identifie l'utilisateur par son JWT :
+    ces tests utilisent un vrai token, pas force_authenticate.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.url_formations = f"/api/tenants/{self.tenant.id}/formations/"
+
+    def authentifier(self, utilisateur):
+        token = RefreshToken.for_user(utilisateur).access_token
+        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {token}")
+
+    def suspendre(self, utilisateur, tenant=None):
+        MembreTenant.objects.filter(
+            utilisateur=utilisateur, tenant=tenant or self.tenant,
+        ).update(actif=False)
+
+    def test_membre_suspendu_recoit_code_dedie(self):
+        admin2 = self.creer_membre("admin2@test.com", MembreTenant.Role.ADMINISTRATEUR)
+        self.suspendre(admin2)
+        self.authentifier(admin2)
+        r = self.client.get(self.url_formations)
+        self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(r.json()["code"], "membre_suspendu")
+
+    def test_membre_actif_non_bloque(self):
+        self.authentifier(self.admin)
+        self.assertEqual(self.client.get(self.url_formations).status_code, status.HTTP_200_OK)
+
+    def test_suspension_limitee_a_l_organisme(self):
+        autre = Tenant.objects.create(nom="Organisme Beta")
+        MembreTenant.objects.create(
+            utilisateur=self.formateur, tenant=autre, role=MembreTenant.Role.ADMINISTRATEUR,
+        )
+        self.suspendre(self.formateur)
+        self.authentifier(self.formateur)
+        r = self.client.get(f"/api/tenants/{autre.id}/formations/")
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+
+    def test_token_invalide_laisse_drf_repondre_401(self):
+        self.client.credentials(HTTP_AUTHORIZATION="Bearer invalide")
+        self.assertEqual(self.client.get(self.url_formations).status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_organisme_suspendu_prioritaire(self):
+        self.suspendre(self.formateur)
+        self.tenant.statut = False
+        self.tenant.save()
+        self.authentifier(self.formateur)
+        r = self.client.get(self.url_formations)
+        self.assertEqual(r.json()["code"], "organisme_suspendu")
+
+
+class PromotionsEnCoursTests(AccountsBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_authenticate(self.admin)
+        formation = Formation.objects.create(tenant=self.tenant, nom="Dev Web")
+        self.p1 = Promotion.objects.create(formation=formation, nom="P1", date_debut=date(2026, 1, 1))
+        self.p2 = Promotion.objects.create(formation=formation, nom="P2", date_debut=date(2026, 1, 1))
+        InscriptionPromotion.objects.create(promotion=self.p1, apprenant=self.apprenant)
+        FormateurPromotion.objects.create(formateur=self.formateur, promotion=self.p1)
+        FormateurPromotion.objects.create(formateur=self.formateur, promotion=self.p2)
+
+    def par_email(self, data):
+        return {m["utilisateur_email"]: m["promotions_en_cours"] for m in data}
+
+    def test_liste(self):
+        r = self.client.get(self.url_membres)
+        promos = self.par_email(r.data)
+        self.assertEqual(promos["apprenant@test.com"], [{"id": self.p1.id, "nom": "P1"}])
+        self.assertCountEqual(
+            promos["formateur@test.com"],
+            [{"id": self.p1.id, "nom": "P1"}, {"id": self.p2.id, "nom": "P2"}],
+        )
+        self.assertEqual(promos["admin@test.com"], [])
+
+    def test_liste_nombre_de_requetes_constant(self):
+        for i in range(5):
+            self.creer_membre(f"apprenant{i}@test.com", MembreTenant.Role.APPRENANT)
+        with self.assertNumQueries(5):
+            # statut organisme (middleware) + permission + membres
+            # + inscriptions + affectations : indépendant du nombre de membres
+            self.client.get(self.url_membres)
+
+    def test_inscription_inactive_ignoree(self):
+        InscriptionPromotion.objects.filter(apprenant=self.apprenant).update(actif=False)
+        r = self.client.get(f"{self.url_membres}{self.membre(self.apprenant).id}/")
+        self.assertEqual(r.data["promotions_en_cours"], [])
+
+    def test_suspension_autorisee_malgre_les_promotions(self):
+        r = self.client.patch(f"{self.url_membres}{self.membre(self.formateur).id}/", {"actif": False})
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertFalse(r.data["actif"])
+        self.assertEqual(len(r.data["promotions_en_cours"]), 2)

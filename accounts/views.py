@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.throttling import ScopedRateThrottle
@@ -19,6 +21,7 @@ from .tokens import ActivationTokenService
 from .serializers import ConnexionJWTSerializer
 
 from .models import MembreTenant, Utilisateur
+from pedagogie.models import FormateurPromotion, InscriptionPromotion
 from tenants.models import Tenant
 
 from .permissions import CanManageMembers
@@ -168,6 +171,33 @@ class ResetPasswordView(APIView):
 
 
 
+def _promotions_par_membre(tenant_id):
+    """
+    (utilisateur_id, rôle) → promotions en cours dans l'organisme :
+    inscriptions actives des apprenants, affectations des formateurs.
+    """
+    resultat = defaultdict(list)
+
+    inscriptions = InscriptionPromotion.objects.filter(
+        promotion__formation__tenant_id=tenant_id,
+        actif=True,
+    ).values_list("apprenant_id", "promotion_id", "promotion__nom")
+    for utilisateur_id, promotion_id, nom in inscriptions:
+        resultat[(utilisateur_id, MembreTenant.Role.APPRENANT)].append(
+            {"id": promotion_id, "nom": nom}
+        )
+
+    affectations = FormateurPromotion.objects.filter(
+        promotion__formation__tenant_id=tenant_id,
+    ).values_list("formateur_id", "promotion_id", "promotion__nom")
+    for utilisateur_id, promotion_id, nom in affectations:
+        resultat[(utilisateur_id, MembreTenant.Role.FORMATEUR)].append(
+            {"id": promotion_id, "nom": nom}
+        )
+
+    return resultat
+
+
 class MembreTenantViewSet(viewsets.GenericViewSet):
     permission_classes = [CanManageMembers]
     http_method_names = ["get", "post", "patch"]
@@ -192,7 +222,8 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
         membres = self.get_queryset()
         serializer = MembreTenantSerializer(
             membres,
-            many=True
+            many=True,
+            context={"promotions_par_membre": _promotions_par_membre(tenant_id)},
         )
         return Response(serializer.data)
 
