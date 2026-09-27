@@ -2,12 +2,15 @@ from rest_framework.permissions import BasePermission
 
 from accounts.models import MembreTenant
 
+from .exceptions import OrganismeSuspendu
+from .models import Tenant
+
 
 class IsAdminSaaS(BasePermission):
     message = "Seul un administrateur SaaS peut effectuer cette action."
 
     def has_permission(self, request, view):
-        return (
+        return bool(
             request.user
             and request.user.is_authenticated
             and request.user.est_admin_saas
@@ -23,9 +26,18 @@ class IsAdminOrganisme(BasePermission):
 
         tenant_id = view.kwargs.get("pk")
 
-        return MembreTenant.objects.filter(
+        est_admin = MembreTenant.objects.filter(
             utilisateur=request.user,
             tenant_id=tenant_id,
             role=MembreTenant.Role.ADMINISTRATEUR,
             actif=True,
         ).exists()
+
+        if not est_admin:
+            return False
+
+        # Un organisme suspendu n'est plus gérable par son admin.
+        if Tenant.objects.filter(pk=tenant_id, statut=False).exists():
+            raise OrganismeSuspendu()
+
+        return True

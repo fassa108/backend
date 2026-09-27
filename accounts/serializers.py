@@ -160,12 +160,15 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
         }
 
         # Organismes + rôle de l'utilisateur dans chacun.
+        # « statut » permet au frontend d'afficher la page
+        # « organisme suspendu ».
         data["tenants"] = [
             {
                 "id": membre.tenant.id,
                 "nom": membre.tenant.nom,
                 "code": membre.tenant.code,
                 "role": membre.role,
+                "statut": membre.tenant.statut,
             }
             for membre in membres_tenants
         ]
@@ -177,6 +180,7 @@ class TenantConnexionSerializer(serializers.Serializer):
     nom = serializers.CharField()
     code = serializers.CharField()
     role = serializers.CharField()
+    statut = serializers.BooleanField()
 
 
 class UtilisateurConnexionSerializer(serializers.Serializer):
