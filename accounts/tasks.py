@@ -42,7 +42,7 @@ def envoyer_email_reset_password(email, reset_url):
                         color: #ffffff;
                         font-size: 28px;
                     ">
-                        Synapse
+                        EduHub
                     </h1>
                 </div>
 
@@ -62,7 +62,7 @@ def envoyer_email_reset_password(email, reset_url):
                         line-height: 1.6;
                     ">
                         Vous avez demandé la réinitialisation de votre mot de passe
-                        pour votre compte Synapse.
+                        pour votre compte EduHub.
                     </p>
 
                     <p style="
@@ -134,7 +134,7 @@ def envoyer_email_reset_password(email, reset_url):
                         font-size: 12px;
                         color: #888888;
                     ">
-                        Cet email a été envoyé automatiquement par Synapse.
+                        Cet email a été envoyé automatiquement par EduHub.
                     </p>
                 </div>
 

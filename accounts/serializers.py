@@ -1,6 +1,7 @@
-from django.contrib.auth import authenticate
 from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+
+from pedagogie.models import FormateurPromotion, InscriptionPromotion
 
 from .models import Utilisateur, MembreTenant
 
@@ -31,27 +32,6 @@ class UtilisateurSerializer(serializers.ModelSerializer):
         )
 
 
-class InvitationSerializer(serializers.Serializer):
-    """
-    Données nécessaires pour inviter un utilisateur.
-
-    Le mot de passe n'est pas demandé ici :
-    l'utilisateur le définira lors de l'activation de son compte.
-    """
-
-    nom = serializers.CharField(max_length=100)
-    prenom = serializers.CharField(max_length=100)
-    email = serializers.EmailField()
-    tenant_id = serializers.IntegerField()
-    role = serializers.ChoiceField(
-        choices=(
-            ("ADMINISTRATEUR", "Administrateur"),
-            ("FORMATEUR", "Formateur"),
-            ("APPRENANT", "Apprenant"),
-        )
-    )
-
-
 class ActivationSerializer(serializers.Serializer):
     """
     Données envoyées lorsqu'un utilisateur active son compte.
@@ -59,9 +39,10 @@ class ActivationSerializer(serializers.Serializer):
 
     token = serializers.CharField()
 
+    # Les règles de sécurité (AUTH_PASSWORD_VALIDATORS) sont
+    # appliquées dans AccountService, une fois l'utilisateur connu.
     password = serializers.CharField(
-        write_only=True,
-        min_length=8
+        write_only=True
     )
 
     password_confirm = serializers.CharField(
@@ -77,40 +58,6 @@ class ActivationSerializer(serializers.Serializer):
         return attrs
 
 
-class ConnexionSerializer(serializers.Serializer):
-    """
-    Authentification d'un utilisateur avec son email et son mot de passe.
-    """
-
-    email = serializers.EmailField()
-    password = serializers.CharField(
-        write_only=True
-    )
-
-    def validate(self, attrs):
-        email = attrs["email"]
-        password = attrs["password"]
-
-        utilisateur = authenticate(
-            email=email,
-            password=password
-        )
-
-        if utilisateur is None:
-            raise serializers.ValidationError(
-                "Email ou mot de passe incorrect."
-            )
-
-        if not utilisateur.actif:
-            raise serializers.ValidationError(
-                "Ce compte n'est pas encore activé."
-            )
-
-        attrs["utilisateur"] = utilisateur
-
-        return attrs
-
-
 class ConnexionJWTSerializer(TokenObtainPairSerializer):
     """
     Serializer personnalisé pour la connexion JWT.
@@ -119,6 +66,12 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
     """
 
     username_field = "email"
+
+    # Même message que le compte soit inexistant, inactif
+    # ou le mot de passe faux : on ne révèle pas quels comptes existent.
+    default_error_messages = {
+        "no_active_account": "Email ou mot de passe incorrect."
+    }
 
     @classmethod
     def get_token(cls, user):
@@ -131,13 +84,9 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
         return token
 
     def validate(self, attrs):
+        # Les comptes inactifs sont refusés par super().validate()
+        # avec le message « no_active_account ».
         data = super().validate(attrs)
-
-        # Vérification du compte utilisateur.
-        if not self.user.actif:
-            raise serializers.ValidationError(
-                "Ce compte n'est pas actif."
-            )
 
         # Récupération des organismes auxquels
         # l'utilisateur a actuellement accès.
@@ -160,12 +109,15 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
         }
 
         # Organismes + rôle de l'utilisateur dans chacun.
+        # « statut » permet au frontend d'afficher la page
+        # « organisme suspendu ».
         data["tenants"] = [
             {
                 "id": membre.tenant.id,
                 "nom": membre.tenant.nom,
                 "code": membre.tenant.code,
                 "role": membre.role,
+                "statut": membre.tenant.statut,
             }
             for membre in membres_tenants
         ]
@@ -177,6 +129,7 @@ class TenantConnexionSerializer(serializers.Serializer):
     nom = serializers.CharField()
     code = serializers.CharField()
     role = serializers.CharField()
+    statut = serializers.BooleanField()
 
 
 class UtilisateurConnexionSerializer(serializers.Serializer):
@@ -201,9 +154,10 @@ class DemandeResetPasswordSerializer(serializers.Serializer):
 class ResetPasswordSerializer(serializers.Serializer):
     uid = serializers.CharField()
     token = serializers.CharField()
+    # Les règles de sécurité (AUTH_PASSWORD_VALIDATORS) sont
+    # appliquées dans AccountService, une fois l'utilisateur connu.
     password = serializers.CharField(
-        write_only=True,
-        min_length=8
+        write_only=True
     )
     password_confirm = serializers.CharField(
         write_only=True
@@ -252,6 +206,64 @@ class MembreTenantSerializer(serializers.ModelSerializer):
             "date_ajout",
         ]
 
+    def validate(self, attrs):
+        membre = self.instance
+        if membre is None:
+            return attrs
+
+        nouveau_role = attrs.get("role", membre.role)
+        nouvel_actif = attrs.get("actif", membre.actif)
+
+        # L'organisme doit toujours garder au moins un admin actif.
+        perd_admin = (
+            membre.role == MembreTenant.Role.ADMINISTRATEUR
+            and membre.actif
+            and (
+                nouveau_role != MembreTenant.Role.ADMINISTRATEUR
+                or not nouvel_actif
+            )
+        )
+        if perd_admin and not MembreTenant.objects.filter(
+            tenant_id=membre.tenant_id,
+            role=MembreTenant.Role.ADMINISTRATEUR,
+            actif=True,
+        ).exclude(pk=membre.pk).exists():
+            raise serializers.ValidationError(
+                "L'organisme doit garder au moins un administrateur actif."
+            )
+
+        if nouveau_role != membre.role:
+            if (
+                membre.role == MembreTenant.Role.APPRENANT
+                and InscriptionPromotion.objects.filter(
+                    apprenant_id=membre.utilisateur_id,
+                    promotion__formation__tenant_id=membre.tenant_id,
+                    actif=True,
+                ).exists()
+            ):
+                raise serializers.ValidationError({
+                    "role": (
+                        "Cet apprenant a une inscription active : "
+                        "désinscrivez-le avant de changer son rôle."
+                    )
+                })
+
+            if (
+                membre.role == MembreTenant.Role.FORMATEUR
+                and FormateurPromotion.objects.filter(
+                    formateur_id=membre.utilisateur_id,
+                    promotion__formation__tenant_id=membre.tenant_id,
+                ).exists()
+            ):
+                raise serializers.ValidationError({
+                    "role": (
+                        "Ce formateur est affecté à des promotions : "
+                        "retirez ses affectations avant de changer son rôle."
+                    )
+                })
+
+        return attrs
+
 
 
 class AjouterMembreSerializer(serializers.Serializer):
@@ -277,8 +289,16 @@ class AjouterMembreSerializer(serializers.Serializer):
         email = attrs["email"]
 
         utilisateur_existant = Utilisateur.objects.filter(
-            email=email
+            email__iexact=email
         ).first()
+
+        if utilisateur_existant and MembreTenant.objects.filter(
+            utilisateur=utilisateur_existant,
+            tenant_id=self.context["tenant_id"],
+        ).exists():
+            raise serializers.ValidationError({
+                "email": "Cet utilisateur appartient déjà à cet organisme."
+            })
 
         # Si le compte n'existe pas, nom et prénom sont obligatoires
         if not utilisateur_existant:

@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from django.db import models
 
@@ -29,11 +30,17 @@ class Tenant(models.Model):
 
     def save(self, *args, **kwargs):
         if not self.code:
+            # Translittération : « École Été » → « ECOLE ETE ».
+            nom_ascii = (
+                unicodedata.normalize("NFKD", self.nom)
+                .encode("ascii", "ignore")
+                .decode("ascii")
+            )
             base = re.sub(
                 r"[^A-Z0-9]+",
                 "-",
-                self.nom.upper()
-            ).strip("-")
+                nom_ascii.upper()
+            ).strip("-") or "ORGANISME"
 
             code = base[:40]
             compteur = 1

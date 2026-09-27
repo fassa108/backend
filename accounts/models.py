@@ -1,5 +1,6 @@
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
 from django.db import models
+from django.db.models.functions import Lower
 
 import uuid
 from django.utils import timezone
@@ -24,9 +25,9 @@ class UtilisateurManager(BaseUserManager):
         if not email:
             raise ValueError("L'adresse email est obligatoire.")
 
-        # Normalise l'email afin d'éviter certaines incohérences
-        # lors de son enregistrement.
-        email = self.normalize_email(email)
+        # L'email est stocké entièrement en minuscules :
+        # « Awa@x.com » et « awa@x.com » désignent le même compte.
+        email = self.normalize_email(email).strip().lower()
 
         # Création de l'instance utilisateur.
         user = self.model(
@@ -43,6 +44,12 @@ class UtilisateurManager(BaseUserManager):
         user.save(using=self._db)
 
         return user
+
+    def get_by_natural_key(self, email):
+        """
+        Recherche insensible à la casse, utilisée à la connexion.
+        """
+        return self.get(email__iexact=email)
 
     def create_superuser(self, email, password=None, **extra_fields):
         """
@@ -117,6 +124,15 @@ class Utilisateur(AbstractBaseUser):
     # Champs obligatoires lors de la création d'un
     # superutilisateur avec createsuperuser.
     REQUIRED_FIELDS = ["nom", "prenom"]
+
+    class Meta:
+        constraints = [
+            # Unicité de l'email indépendamment de la casse.
+            models.UniqueConstraint(
+                Lower("email"),
+                name="unique_email_insensible_casse",
+            ),
+        ]
 
     def __str__(self):
         """
