@@ -138,13 +138,18 @@ class Competence(models.Model):
 
 
 class Niveau(models.Model):
+    """
+    Échelle de maîtrise de l'organisme (ex. : 1. Imiter, 2. Adapter).
+    Un niveau n'est qu'un nom et un ordre : ce que l'apprenant sait faire
+    à ce niveau se décrit par compétence, dans CompetenceNiveau.
+    """
+
     tenant = models.ForeignKey(
         Tenant,
         on_delete=models.CASCADE,
         related_name="niveaux",
     )
     nom = models.CharField(max_length=150)
-    description = models.TextField(blank=True)
     ordre = models.PositiveIntegerField(default=1)
     actif = models.BooleanField(default=True)
     date_creation = models.DateTimeField(auto_now_add=True)
