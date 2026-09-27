@@ -4,6 +4,7 @@ from .models import (
     Competence,
     CompetenceNiveau,
     Formation,
+    FormateurPromotion,
     Groupe,
     GroupeMembre,
     InscriptionPromotion,
@@ -110,6 +111,82 @@ class PromotionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"date_fin": "La date de fin doit être postérieure ou égale à la date de début."}
             )
+
+        return attrs
+
+
+class FormateurPromotionSerializer(serializers.ModelSerializer):
+    formateur_nom = serializers.CharField(source="formateur.nom", read_only=True)
+    formateur_prenom = serializers.CharField(source="formateur.prenom", read_only=True)
+    formateur_email = serializers.CharField(source="formateur.email", read_only=True)
+
+    class Meta:
+        model = FormateurPromotion
+        fields = [
+            "id",
+            "formateur",
+            "formateur_nom",
+            "formateur_prenom",
+            "formateur_email",
+            "promotion",
+            "date_ajout",
+        ]
+        read_only_fields = [
+            "id",
+            "formateur_nom",
+            "formateur_prenom",
+            "formateur_email",
+            "date_ajout",
+        ]
+
+    def validate(self, attrs):
+        from accounts.models import MembreTenant
+
+        tenant_id = self.context.get("tenant_id")
+        formateur = attrs.get("formateur") or (
+            self.instance.formateur if self.instance else None
+        )
+        promotion = attrs.get("promotion") or (
+            self.instance.promotion if self.instance else None
+        )
+
+        if formateur and tenant_id:
+            # Le formateur doit être membre actif du tenant avec le rôle FORMATEUR
+            if not MembreTenant.objects.filter(
+                utilisateur=formateur,
+                tenant_id=tenant_id,
+                role=MembreTenant.Role.FORMATEUR,
+                actif=True,
+            ).exists():
+                raise serializers.ValidationError(
+                    {
+                        "formateur": (
+                            "L'utilisateur sélectionné doit être un formateur actif "
+                            "de cet organisme."
+                        )
+                    }
+                )
+
+        if promotion and tenant_id:
+            # La promotion doit appartenir au tenant
+            if str(promotion.formation.tenant_id) != str(tenant_id):
+                raise serializers.ValidationError(
+                    {
+                        "promotion": (
+                            "La promotion sélectionnée n'appartient pas à cet organisme."
+                        )
+                    }
+                )
+
+        if formateur and promotion and self.instance is None:
+            # Anti-doublon
+            if FormateurPromotion.objects.filter(
+                formateur=formateur,
+                promotion=promotion,
+            ).exists():
+                raise serializers.ValidationError(
+                    "Ce formateur est déjà affecté à cette promotion."
+                )
 
         return attrs
 
@@ -422,10 +499,6 @@ class InscriptionPromotionSerializer(serializers.ModelSerializer):
 
         # 2. Vérification de l'apprenant : utilisateur actif + MembreTenant rôle APPRENANT actif dans ce tenant
         if apprenant and tenant_id:
-            if not apprenant.actif:
-                raise serializers.ValidationError(
-                    {"apprenant": "L'utilisateur sélectionné est inactif."}
-                )
             from accounts.models import MembreTenant
             if not MembreTenant.objects.filter(
                 utilisateur=apprenant,
@@ -499,10 +572,6 @@ class GroupeMembreSerializer(serializers.ModelSerializer):
 
         # 2. Vérification apprenant actif et rôle APPRENANT dans le tenant
         if apprenant and tenant_id:
-            if not apprenant.actif:
-                raise serializers.ValidationError(
-                    {"apprenant": "L'utilisateur sélectionné est inactif."}
-                )
             from accounts.models import MembreTenant
             if not MembreTenant.objects.filter(
                 utilisateur=apprenant,

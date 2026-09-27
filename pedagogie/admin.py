@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Competence,
     CompetenceNiveau,
+    FormateurPromotion,
     Formation,
     Groupe,
     GroupeMembre,
@@ -76,3 +77,10 @@ class GroupeMembreAdmin(admin.ModelAdmin):
     search_fields = ("groupe__nom", "apprenant__nom", "apprenant__prenom", "apprenant__email")
 
 
+
+
+@admin.register(FormateurPromotion)
+class FormateurPromotionAdmin(admin.ModelAdmin):
+    list_display = ("formateur", "promotion", "date_ajout")
+    list_filter = ("promotion__formation__tenant",)
+    search_fields = ("formateur__nom", "formateur__prenom", "formateur__email", "promotion__nom")
