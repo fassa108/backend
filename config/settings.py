@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 from datetime import timedelta
 import os
 from pathlib import Path
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -119,6 +120,13 @@ AUTH_PASSWORD_VALIDATORS = [
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
 ]
+
+
+# Tests : hachage rapide (PBKDF2 ralentit fortement la suite).
+if "test" in sys.argv:
+    PASSWORD_HASHERS = [
+        "django.contrib.auth.hashers.MD5PasswordHasher",
+    ]
 
 
 # Internationalization

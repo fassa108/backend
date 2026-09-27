@@ -1,0 +1,42 @@
+# Environnements virtuels
+venv/
+.venv/
+env/
+
+# Variables d'environnement
+.env
+
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+
+# Django
+*.sqlite3
+media/
+staticfiles/
+
+# Éditeurs / IDE
+.vscode/
+.idea/
+*.swp
+
+# Système
+.DS_Store
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Tests / CI
+.pytest_cache/
+.coverage
+htmlcov/
