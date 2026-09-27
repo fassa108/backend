@@ -387,7 +387,6 @@ class NiveauSerializer(serializers.ModelSerializer):
             "id",
             "tenant",
             "nom",
-            "description",
             "ordre",
             "actif",
             "date_creation",
