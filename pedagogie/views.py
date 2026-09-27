@@ -1,8 +1,9 @@
 from django.contrib.auth import get_user_model
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
-from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.models import MembreTenant
@@ -22,9 +23,10 @@ from .models import (
 from .permissions import (
     IsAdminOrganisme,
     IsAdminOrganismeOrFormateur,
-    IsFormateurDePromotion,
-    IsTenantAdminOrSaaSAdminOrAssignedLearner,
+    IsFormateurOrganisme,
+    IsMembreOrganisme,
     _est_admin_organisme,
+    _est_formateur_actif,
     _est_formateur_de_promotion,
 )
 from .serializers import (
@@ -39,8 +41,11 @@ from .serializers import (
     NiveauSerializer,
     PromotionSerializer,
 )
+from .services import InscriptionService
 
 Utilisateur = get_user_model()
+
+ACTIONS_LECTURE = ("list", "retrieve")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -53,91 +58,183 @@ def _promotions_du_formateur(user, tenant_id):
     ).values_list("promotion_id", flat=True)
 
 
-# ─── Formations ───────────────────────────────────────────────────────────────
-
-class FormationViewSet(viewsets.ModelViewSet):
+def _promotions_de_l_apprenant(user, tenant_id):
     """
-    Admin organisme : CRUD complet sur les formations de son tenant.
-    Admin SaaS : aucun accès (opération métier organisme).
-    Formateur / Apprenant : aucun accès.
+    IDs des promotions de l'apprenant : inscription active, ou fermée par
+    la clôture de la promotion (consultable en lecture seule).
+    """
+    return InscriptionPromotion.objects.filter(
+        Q(actif=True) | Q(fermee_par_cloture=True),
+        apprenant=user,
+        tenant_id=tenant_id,
+    ).values_list("promotion_id", flat=True)
+
+
+def _promotions_visibles(user, tenant_id):
+    """
+    None pour l'admin organisme (tout le tenant), sinon la liste des IDs
+    de promotions visibles : affectations (formateur) ou inscriptions
+    (apprenant).
+    """
+    if _est_admin_organisme(user, tenant_id):
+        return None
+    if _est_formateur_actif(user, tenant_id):
+        return list(_promotions_du_formateur(user, tenant_id))
+    return list(_promotions_de_l_apprenant(user, tenant_id))
+
+
+def _formations_visibles(user, tenant_id):
+    """None pour l'admin organisme, sinon les IDs des formations visibles."""
+    promotions = _promotions_visibles(user, tenant_id)
+    if promotions is None:
+        return None
+    return Promotion.objects.filter(pk__in=promotions).values_list(
+        "formation_id", flat=True
+    )
+
+
+def _param_entier(request, nom):
+    """Paramètre d'URL entier facultatif ; 400 s'il n'est pas un entier."""
+    valeur = request.query_params.get(nom)
+    if valeur is None or valeur == "":
+        return None
+    try:
+        return int(valeur)
+    except ValueError:
+        raise ValidationError({nom: "Doit être un identifiant numérique."})
+
+
+def _verifier_promotion_ouverte(promotion):
+    if not promotion.actif:
+        raise PermissionDenied(
+            "Cette promotion est clôturée : elle est consultable en lecture seule."
+        )
+
+
+def _refuser_suppression_si(condition, message):
+    if condition:
+        raise PermissionDenied(f"{message} Désactivez-le à la place.")
+
+
+# ─── Référentiel (formations, modules, compétences, niveaux) ──────────────────
+
+class ReferentielViewSet(viewsets.ModelViewSet):
+    """
+    Base des vues du référentiel d'une formation.
+
+    - Admin organisme : CRUD complet sur son tenant.
+    - Formateur : lecture des formations de ses promotions.
+    - Apprenant : lecture de la formation de sa promotion.
+    - Admin SaaS : aucun accès.
     """
 
-    serializer_class = FormationSerializer
-    permission_classes = [IsAdminOrganisme]
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
-    def get_queryset(self):
-        tenant_id = self.kwargs.get("tenant_id")
-        return Formation.objects.filter(tenant_id=tenant_id).order_by("nom")
+    def get_permissions(self):
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        return [IsAdminOrganisme()]
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context["tenant_id"] = self.kwargs.get("tenant_id")
         return context
+
+    def formations_visibles(self):
+        return _formations_visibles(self.request.user, self.kwargs.get("tenant_id"))
+
+
+# ─── Formations ───────────────────────────────────────────────────────────────
+
+class FormationViewSet(ReferentielViewSet):
+    serializer_class = FormationSerializer
+
+    def get_queryset(self):
+        tenant_id = self.kwargs.get("tenant_id")
+        qs = Formation.objects.filter(tenant_id=tenant_id).order_by("nom")
+
+        visibles = self.formations_visibles()
+        if visibles is not None:
+            qs = qs.filter(pk__in=visibles)
+        return qs
 
     def perform_create(self, serializer):
         tenant_id = self.kwargs.get("tenant_id")
         tenant = get_object_or_404(Tenant, pk=tenant_id)
         serializer.save(tenant=tenant)
 
+    def perform_destroy(self, instance):
+        _refuser_suppression_si(
+            instance.promotions.exists() or instance.modules.exists(),
+            "Cette formation a des promotions ou des modules.",
+        )
+        instance.delete()
+
 
 # ─── Promotions ───────────────────────────────────────────────────────────────
 
 class PromotionViewSet(viewsets.ModelViewSet):
     """
-    Admin organisme : CRUD complet sur ses promotions.
-    Formateur : lecture seule sur ses promotions affectées.
-    Admin SaaS : aucun accès (opération métier organisme).
-    Apprenant : aucun accès.
+    Admin organisme : CRUD, inscriptions, affectations, clôture / réouverture.
+    Formateur : lecture de ses promotions, de leurs inscrits et formateurs.
+    Apprenant : lecture de sa promotion.
+    Admin SaaS : aucun accès.
+
+    Une promotion clôturée (actif = False) est en lecture seule.
     """
 
     serializer_class = PromotionSerializer
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve", "inscriptions",
-                           "inscrire_apprenant", "desinscrire_apprenant"]:
-            # Lecture : Admin organisme + Formateur (filtrage dans le QS)
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action in ("inscriptions", "formateurs"):
             return [IsAdminOrganismeOrFormateur()]
-        # Écriture : Admin organisme uniquement
+        # Écriture, inscriptions, affectations, clôture : Admin organisme
         return [IsAdminOrganisme()]
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
-        user = self.request.user
 
-        base_qs = Promotion.objects.filter(
+        qs = Promotion.objects.filter(
             formation__tenant_id=tenant_id
         ).select_related("formation").order_by("-date_debut")
 
-        # Filtre optionnel par formation
-        formation_id = self.request.query_params.get("formation")
-        if formation_id:
-            base_qs = base_qs.filter(formation_id=formation_id)
+        formation_id = _param_entier(self.request, "formation")
+        if formation_id is not None:
+            qs = qs.filter(formation_id=formation_id)
 
-        # Admin organisme : toutes les promotions du tenant
-        if _est_admin_organisme(user, tenant_id):
-            return base_qs
-
-        # Formateur : uniquement ses promotions affectées
-        ids = _promotions_du_formateur(user, tenant_id)
-        return base_qs.filter(pk__in=ids)
+        visibles = _promotions_visibles(self.request.user, tenant_id)
+        if visibles is not None:
+            qs = qs.filter(pk__in=visibles)
+        return qs
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context["tenant_id"] = self.kwargs.get("tenant_id")
         return context
 
+    def perform_update(self, serializer):
+        _verifier_promotion_ouverte(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        _refuser_suppression_si(
+            instance.inscriptions.exists()
+            or instance.groupes.exists()
+            or instance.briefs.exists(),
+            "Cette promotion a des inscriptions, des groupes ou des briefs.",
+        )
+        instance.delete()
+
+    # ── Inscriptions ──────────────────────────────────────────────────────────
+
     @action(detail=True, methods=["post"], url_path="inscrire-apprenant")
     def inscrire_apprenant(self, request, tenant_id=None, pk=None):
-        # Seul l'Admin organisme peut inscrire
-        if not _est_admin_organisme(request.user, tenant_id):
-            return Response(
-                {"detail": "Seul l'administrateur de l'organisme peut inscrire un apprenant."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         promotion = self.get_object()
+        _verifier_promotion_ouverte(promotion)
+
         apprenant_id = request.data.get("apprenant_id")
         if not apprenant_id:
             return Response(
@@ -160,9 +257,10 @@ class PromotionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Unicité d'une seule promotion active à la fois
+        # Une seule inscription active par organisme
         active_inscription = InscriptionPromotion.objects.filter(
             apprenant=apprenant,
+            tenant=tenant,
             actif=True,
         ).select_related("promotion").first()
 
@@ -172,16 +270,15 @@ class PromotionViewSet(viewsets.ModelViewSet):
                     {"apprenant": "L'apprenant est déjà inscrit dans cette promotion."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            else:
-                return Response(
-                    {
-                        "apprenant": (
-                            f"L'apprenant a déjà une inscription active dans la promotion "
-                            f"'{active_inscription.promotion.nom}'."
-                        )
-                    },
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            return Response(
+                {
+                    "apprenant": (
+                        f"L'apprenant a déjà une inscription active dans la promotion "
+                        f"'{active_inscription.promotion.nom}'."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Réactivation si inscription inactive existante, sinon création
         existing = InscriptionPromotion.objects.filter(
@@ -191,6 +288,7 @@ class PromotionViewSet(viewsets.ModelViewSet):
 
         if existing:
             existing.actif = True
+            existing.fermee_par_cloture = False
             existing.date_desinscription = None
             existing.save()
             inscription = existing
@@ -208,13 +306,9 @@ class PromotionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="desinscrire-apprenant")
     def desinscrire_apprenant(self, request, tenant_id=None, pk=None):
-        if not _est_admin_organisme(request.user, tenant_id):
-            return Response(
-                {"detail": "Seul l'administrateur de l'organisme peut désinscrire un apprenant."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         promotion = self.get_object()
+        _verifier_promotion_ouverte(promotion)
+
         apprenant_id = request.data.get("apprenant_id")
         if not apprenant_id:
             return Response(
@@ -234,9 +328,7 @@ class PromotionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        inscription.actif = False
-        inscription.date_desinscription = timezone.now()
-        inscription.save()
+        InscriptionService.desinscrire(inscription)
 
         return Response(
             {"detail": "Apprenant désinscrit avec succès."},
@@ -253,6 +345,50 @@ class PromotionViewSet(viewsets.ModelViewSet):
         serializer = InscriptionPromotionSerializer(qs, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
+    # ── Clôture ───────────────────────────────────────────────────────────────
+
+    @action(detail=True, methods=["post"], url_path="cloturer")
+    def cloturer(self, request, tenant_id=None, pk=None):
+        """Clôture la promotion et ferme ses inscriptions actives."""
+        promotion = self.get_object()
+        if not promotion.actif:
+            return Response(
+                {"detail": "Cette promotion est déjà clôturée."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        nb = InscriptionService.cloturer(promotion)
+        return Response(
+            {
+                "detail": "Promotion clôturée.",
+                "inscriptions_fermees": nb,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="rouvrir")
+    def rouvrir(self, request, tenant_id=None, pk=None):
+        """Rouvre la promotion et réactive les inscriptions fermées par la clôture."""
+        promotion = self.get_object()
+        if promotion.actif:
+            return Response(
+                {"detail": "Cette promotion n'est pas clôturée."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reactivees, non_reactives = InscriptionService.rouvrir(promotion)
+        return Response(
+            {
+                "detail": "Promotion rouverte.",
+                "inscriptions_reactivees": reactivees,
+                # Apprenants inscrits entre-temps dans une autre promotion
+                "non_reactives": non_reactives,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    # ── Formateurs ────────────────────────────────────────────────────────────
+
     @action(
         detail=True,
         methods=["post"],
@@ -260,27 +396,16 @@ class PromotionViewSet(viewsets.ModelViewSet):
     )
     def affecter_formateur(self, request, tenant_id=None, pk=None):
         """Affecter un formateur à une promotion. Admin organisme uniquement."""
-        if not _est_admin_organisme(request.user, tenant_id):
-            return Response(
-                {"detail": "Seul l'administrateur de l'organisme peut affecter un formateur."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         promotion = self.get_object()
-        serializer = FormateurPromotionSerializer(
-            data=request.data,
-            context={"tenant_id": int(tenant_id), "request": request},
-        )
+        _verifier_promotion_ouverte(promotion)
 
         # Injecter la promotion depuis l'URL si non fournie dans le body
-        if "promotion" not in request.data:
-            data = request.data.copy()
-            data["promotion"] = promotion.id
-            serializer = FormateurPromotionSerializer(
-                data=data,
-                context={"tenant_id": int(tenant_id), "request": request},
-            )
-
+        data = request.data.copy()
+        data.setdefault("promotion", promotion.id)
+        serializer = FormateurPromotionSerializer(
+            data=data,
+            context={"tenant_id": int(tenant_id), "request": request},
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
@@ -291,14 +416,13 @@ class PromotionViewSet(viewsets.ModelViewSet):
         url_path="retirer-formateur",
     )
     def retirer_formateur(self, request, tenant_id=None, pk=None):
-        """Retirer un formateur d'une promotion. Admin organisme uniquement."""
-        if not _est_admin_organisme(request.user, tenant_id):
-            return Response(
-                {"detail": "Seul l'administrateur de l'organisme peut retirer un formateur."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
+        """
+        Retirer un formateur d'une promotion. Admin organisme uniquement.
+        Les briefs appartiennent à la promotion : ils restent en place.
+        """
         promotion = self.get_object()
+        _verifier_promotion_ouverte(promotion)
+
         formateur_id = request.data.get("formateur_id")
         if not formateur_id:
             return Response(
@@ -340,10 +464,8 @@ class PromotionViewSet(viewsets.ModelViewSet):
 
 # ─── Modules ──────────────────────────────────────────────────────────────────
 
-class ModuleViewSet(viewsets.ModelViewSet):
+class ModuleViewSet(ReferentielViewSet):
     serializer_class = ModuleSerializer
-    permission_classes = [IsAdminOrganisme]
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
@@ -351,23 +473,27 @@ class ModuleViewSet(viewsets.ModelViewSet):
             formation__tenant_id=tenant_id
         ).select_related("formation").order_by("ordre", "nom")
 
-        formation_id = self.request.query_params.get("formation")
-        if formation_id:
+        formation_id = _param_entier(self.request, "formation")
+        if formation_id is not None:
             qs = qs.filter(formation_id=formation_id)
+
+        visibles = self.formations_visibles()
+        if visibles is not None:
+            qs = qs.filter(formation_id__in=visibles)
         return qs
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["tenant_id"] = self.kwargs.get("tenant_id")
-        return context
+    def perform_destroy(self, instance):
+        _refuser_suppression_si(
+            instance.competences.exists(),
+            "Ce module a des compétences.",
+        )
+        instance.delete()
 
 
 # ─── Compétences ──────────────────────────────────────────────────────────────
 
-class CompetenceViewSet(viewsets.ModelViewSet):
+class CompetenceViewSet(ReferentielViewSet):
     serializer_class = CompetenceSerializer
-    permission_classes = [IsAdminOrganisme]
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
@@ -375,45 +501,51 @@ class CompetenceViewSet(viewsets.ModelViewSet):
             module__formation__tenant_id=tenant_id
         ).select_related("module", "module__formation").order_by("ordre", "nom")
 
-        module_id = self.request.query_params.get("module")
-        if module_id:
+        module_id = _param_entier(self.request, "module")
+        if module_id is not None:
             qs = qs.filter(module_id=module_id)
+
+        visibles = self.formations_visibles()
+        if visibles is not None:
+            qs = qs.filter(module__formation_id__in=visibles)
         return qs
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["tenant_id"] = self.kwargs.get("tenant_id")
-        return context
+    def perform_destroy(self, instance):
+        _refuser_suppression_si(
+            instance.niveaux.exists() or instance.briefs.exists(),
+            "Cette compétence est décrite par niveau ou utilisée dans des briefs.",
+        )
+        instance.delete()
 
 
 # ─── Niveaux ──────────────────────────────────────────────────────────────────
 
-class NiveauViewSet(viewsets.ModelViewSet):
+class NiveauViewSet(ReferentielViewSet):
+    """Les niveaux sont définis pour tout l'organisme : visibles par tous ses membres."""
+
     serializer_class = NiveauSerializer
-    permission_classes = [IsAdminOrganisme]
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
         return Niveau.objects.filter(tenant_id=tenant_id).order_by("ordre", "nom")
-
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["tenant_id"] = self.kwargs.get("tenant_id")
-        return context
 
     def perform_create(self, serializer):
         tenant_id = self.kwargs.get("tenant_id")
         tenant = get_object_or_404(Tenant, pk=tenant_id)
         serializer.save(tenant=tenant)
 
+    def perform_destroy(self, instance):
+        _refuser_suppression_si(
+            instance.competences.exists(),
+            "Ce niveau est utilisé pour décrire des compétences.",
+        )
+        instance.delete()
+
 
 # ─── Compétence-Niveaux ───────────────────────────────────────────────────────
 
-class CompetenceNiveauViewSet(viewsets.ModelViewSet):
+class CompetenceNiveauViewSet(ReferentielViewSet):
     serializer_class = CompetenceNiveauSerializer
-    permission_classes = [IsAdminOrganisme]
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
@@ -426,50 +558,45 @@ class CompetenceNiveauViewSet(viewsets.ModelViewSet):
             "niveau",
         ).order_by("niveau__ordre", "competence__ordre")
 
-        competence_id = self.request.query_params.get("competence")
-        if competence_id:
+        competence_id = _param_entier(self.request, "competence")
+        if competence_id is not None:
             qs = qs.filter(competence_id=competence_id)
-        niveau_id = self.request.query_params.get("niveau")
-        if niveau_id:
+        niveau_id = _param_entier(self.request, "niveau")
+        if niveau_id is not None:
             qs = qs.filter(niveau_id=niveau_id)
-        return qs
 
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["tenant_id"] = self.kwargs.get("tenant_id")
-        return context
+        visibles = self.formations_visibles()
+        if visibles is not None:
+            qs = qs.filter(competence__module__formation_id__in=visibles)
+        return qs
 
 
 # ─── Groupes ──────────────────────────────────────────────────────────────────
 
 class GroupeViewSet(viewsets.ModelViewSet):
     """
-    Admin organisme : CRUD complet sur tous les groupes du tenant.
     Formateur : CRUD sur les groupes de ses promotions affectées.
+    Admin organisme : lecture de tous les groupes du tenant.
+    Apprenant : lecture de ses groupes (et de leurs membres).
     Admin SaaS : aucun accès.
-    Apprenant : aucun accès.
+
+    Un groupe ne change pas de promotion. Les groupes d'une promotion
+    clôturée sont en lecture seule.
     """
 
     serializer_class = GroupeSerializer
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        return [IsAdminOrganismeOrFormateur()]
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        return [IsFormateurOrganisme()]
 
-    def _verifier_acces_groupe(self, groupe):
-        """
-        Vérifie que le formateur a accès au groupe (via sa promotion affectée).
-        Retourne True si accès autorisé, False sinon.
-        Un admin organisme a toujours accès.
-        """
-        user = self.request.user
-        tenant_id = self.kwargs.get("tenant_id")
-
-        if _est_admin_organisme(user, tenant_id):
-            return True
-
-        # Formateur : doit être affecté à la promotion du groupe
-        return _est_formateur_de_promotion(user, groupe.promotion_id)
+    def _verifier_formateur_du_groupe(self, promotion):
+        """Écriture : formateur affecté à la promotion, promotion ouverte."""
+        if not _est_formateur_de_promotion(self.request.user, promotion.id):
+            raise PermissionDenied("Vous n'êtes pas affecté à la promotion de ce groupe.")
+        _verifier_promotion_ouverte(promotion)
 
     def get_queryset(self):
         tenant_id = self.kwargs.get("tenant_id")
@@ -485,8 +612,8 @@ class GroupeViewSet(viewsets.ModelViewSet):
             "membres__apprenant",
         ).order_by("nom")
 
-        promotion_id = self.request.query_params.get("promotion")
-        if promotion_id:
+        promotion_id = _param_entier(self.request, "promotion")
+        if promotion_id is not None:
             base_qs = base_qs.filter(promotion_id=promotion_id)
 
         # Admin organisme : tous les groupes du tenant
@@ -494,67 +621,42 @@ class GroupeViewSet(viewsets.ModelViewSet):
             return base_qs
 
         # Formateur : groupes de ses promotions affectées
-        ids = _promotions_du_formateur(user, tenant_id)
-        return base_qs.filter(promotion_id__in=ids)
+        if _est_formateur_actif(user, tenant_id):
+            ids = _promotions_du_formateur(user, tenant_id)
+            return base_qs.filter(promotion_id__in=ids)
+
+        # Apprenant : groupes dont il est membre actif, dans ses promotions
+        return base_qs.filter(
+            promotion_id__in=list(_promotions_de_l_apprenant(user, tenant_id)),
+            membres__apprenant=user,
+            membres__actif=True,
+        ).distinct()
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context["tenant_id"] = self.kwargs.get("tenant_id")
         return context
 
-    def retrieve(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if not self._verifier_acces_groupe(instance):
-            return Response(
-                {"detail": "Vous n'êtes pas affecté à la promotion de ce groupe."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        return super().retrieve(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if not self._verifier_acces_groupe(instance):
-            return Response(
-                {"detail": "Vous n'êtes pas affecté à la promotion de ce groupe."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        return super().update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if not self._verifier_acces_groupe(instance):
-            return Response(
-                {"detail": "Vous n'êtes pas affecté à la promotion de ce groupe."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-        return super().destroy(request, *args, **kwargs)
-
     def perform_create(self, serializer):
-        """
-        Vérifie que le formateur est bien affecté à la promotion du groupe créé.
-        """
-        user = self.request.user
-        tenant_id = self.kwargs.get("tenant_id")
-        promotion = serializer.validated_data.get("promotion")
-
-        if not _est_admin_organisme(user, tenant_id):
-            if not _est_formateur_de_promotion(user, promotion.id):
-                from rest_framework.exceptions import PermissionDenied
-                raise PermissionDenied(
-                    "Vous n'êtes pas affecté à cette promotion."
-                )
-
+        self._verifier_formateur_du_groupe(serializer.validated_data["promotion"])
         serializer.save()
+
+    def perform_update(self, serializer):
+        self._verifier_formateur_du_groupe(serializer.instance.promotion)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._verifier_formateur_du_groupe(instance.promotion)
+        _refuser_suppression_si(
+            instance.membres.exists() or instance.assignations.exists(),
+            "Ce groupe a des membres ou des briefs assignés.",
+        )
+        instance.delete()
 
     @action(detail=True, methods=["post"], url_path="ajouter-apprenant")
     def ajouter_apprenant(self, request, tenant_id=None, pk=None):
         groupe = self.get_object()
-
-        if not self._verifier_acces_groupe(groupe):
-            return Response(
-                {"detail": "Vous n'êtes pas affecté à la promotion de ce groupe."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._verifier_formateur_du_groupe(groupe.promotion)
 
         apprenant_id = request.data.get("apprenant_id")
         if not apprenant_id:
@@ -580,49 +682,44 @@ class GroupeViewSet(viewsets.ModelViewSet):
             )
 
         # Inscription active dans LA PROMOTION DU GROUPE
-        inscription = InscriptionPromotion.objects.filter(
+        if not InscriptionPromotion.objects.filter(
             apprenant=apprenant,
+            promotion=groupe.promotion,
             actif=True,
-        ).select_related("promotion").first()
-
-        if not inscription:
-            return Response(
-                {"apprenant": "L'apprenant n'a aucune inscription active dans une promotion."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if inscription.promotion_id != groupe.promotion_id:
+        ).exists():
             return Response(
                 {
                     "apprenant": (
-                        f"L'apprenant appartient à la promotion '{inscription.promotion.nom}' "
-                        f"et ne peut pas être ajouté à un groupe de la promotion "
+                        f"L'apprenant n'a pas d'inscription active dans la promotion "
                         f"'{groupe.promotion.nom}'."
                     )
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Déjà membre du groupe
-        if GroupeMembre.objects.filter(groupe=groupe, apprenant=apprenant).exists():
+        membre = GroupeMembre.objects.filter(groupe=groupe, apprenant=apprenant).first()
+        if membre and membre.actif:
             return Response(
                 {"apprenant": "Cet apprenant est déjà membre de ce groupe."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        membre = GroupeMembre.objects.create(groupe=groupe, apprenant=apprenant)
+        if membre:
+            # Appartenance conservée après une désinscription : réactivée
+            membre.actif = True
+            membre.save(update_fields=["actif"])
+            status_code = status.HTTP_200_OK
+        else:
+            membre = GroupeMembre.objects.create(groupe=groupe, apprenant=apprenant)
+            status_code = status.HTTP_201_CREATED
+
         serializer = GroupeMembreSerializer(membre)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.data, status=status_code)
 
     @action(detail=True, methods=["post"], url_path="retirer-apprenant")
     def retirer_apprenant(self, request, tenant_id=None, pk=None):
         groupe = self.get_object()
-
-        if not self._verifier_acces_groupe(groupe):
-            return Response(
-                {"detail": "Vous n'êtes pas affecté à la promotion de ce groupe."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        self._verifier_formateur_du_groupe(groupe.promotion)
 
         apprenant_id = request.data.get("apprenant_id")
         if not apprenant_id:
@@ -631,14 +728,24 @@ class GroupeViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        membre = GroupeMembre.objects.filter(groupe=groupe, apprenant_id=apprenant_id).first()
+        membre = GroupeMembre.objects.filter(
+            groupe=groupe,
+            apprenant_id=apprenant_id,
+            actif=True,
+        ).first()
         if not membre:
             return Response(
                 {"apprenant": "Cet apprenant n'est pas membre de ce groupe."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        membre.delete()
+        # Livrables déposés dans la promotion : appartenance gardée, inactive
+        if InscriptionService.a_depose_dans_promotion(apprenant_id, groupe.promotion_id):
+            membre.actif = False
+            membre.save(update_fields=["actif"])
+        else:
+            membre.delete()
+
         return Response(
             {"detail": "Apprenant retiré du groupe avec succès."},
             status=status.HTTP_200_OK,
