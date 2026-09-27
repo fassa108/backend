@@ -218,16 +218,27 @@ class InscriptionPromotion(models.Model):
         on_delete=models.CASCADE,
         related_name="inscriptions_promotions",
     )
+    # Organisme de la promotion, recopié à l'enregistrement : permet à la
+    # base de garantir une seule inscription active par organisme.
+    tenant = models.ForeignKey(
+        Tenant,
+        on_delete=models.CASCADE,
+        related_name="inscriptions",
+        editable=False,
+    )
     actif = models.BooleanField(default=True)
+    # True si l'inscription a été fermée par la clôture de la promotion :
+    # elle sera réactivée si la promotion est rouverte.
+    fermee_par_cloture = models.BooleanField(default=False)
     date_inscription = models.DateTimeField(auto_now_add=True)
     date_desinscription = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=["apprenant"],
+                fields=["apprenant", "tenant"],
                 condition=Q(actif=True),
-                name="unique_promotion_active_par_apprenant",
+                name="unique_promotion_active_par_apprenant_et_tenant",
             ),
             models.UniqueConstraint(
                 fields=["promotion", "apprenant"],
@@ -250,6 +261,11 @@ class InscriptionPromotion(models.Model):
                 raise ValidationError(
                     {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."}
                 )
+
+    def save(self, *args, **kwargs):
+        if self.promotion_id and not self.tenant_id:
+            self.tenant_id = self.promotion.formation.tenant_id
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.apprenant} - {self.promotion.nom}"
@@ -298,6 +314,9 @@ class GroupeMembre(models.Model):
         on_delete=models.CASCADE,
         related_name="appartenances_groupes",
     )
+    # False : l'apprenant a été désinscrit de la promotion après avoir
+    # déposé des livrables ; l'appartenance est gardée pour l'historique.
+    actif = models.BooleanField(default=True)
     date_ajout = models.DateTimeField(auto_now_add=True)
 
     class Meta:

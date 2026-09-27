@@ -23,6 +23,16 @@ def _est_formateur_actif(user, tenant_id):
     ).exists()
 
 
+def _est_apprenant_actif(user, tenant_id):
+    """Vérifie que l'utilisateur est Apprenant actif du tenant."""
+    return MembreTenant.objects.filter(
+        utilisateur=user,
+        tenant_id=tenant_id,
+        role=MembreTenant.Role.APPRENANT,
+        actif=True,
+    ).exists()
+
+
 def _est_formateur_de_promotion(user, promotion_id):
     """Vérifie que le formateur est affecté à la promotion donnée."""
     from .models import FormateurPromotion
@@ -79,6 +89,56 @@ class IsAdminOrganismeOrFormateur(BasePermission):
             _est_admin_organisme(request.user, tenant_id)
             or _est_formateur_actif(request.user, tenant_id)
         )
+
+
+class IsMembreOrganisme(BasePermission):
+    """
+    Tout membre actif du tenant : Admin organisme, Formateur ou Apprenant.
+    Utilisé pour la lecture ; chaque vue filtre ensuite ce que le rôle
+    peut voir. L'Admin SaaS est exclu.
+    """
+
+    message = "Accès réservé aux membres de cet organisme."
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        if request.user.est_admin_saas:
+            return False
+
+        tenant_id = view.kwargs.get("tenant_id")
+        if not tenant_id:
+            return False
+
+        return MembreTenant.objects.filter(
+            utilisateur=request.user,
+            tenant_id=tenant_id,
+            actif=True,
+        ).exists()
+
+
+class IsFormateurOrganisme(BasePermission):
+    """
+    Formateur actif du tenant.
+    L'affectation à la promotion concernée est vérifiée dans la vue.
+    L'Admin SaaS et l'Admin organisme sont exclus.
+    """
+
+    message = "Action réservée aux formateurs de cet organisme."
+
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+
+        if request.user.est_admin_saas:
+            return False
+
+        tenant_id = view.kwargs.get("tenant_id")
+        if not tenant_id:
+            return False
+
+        return _est_formateur_actif(request.user, tenant_id)
 
 
 class IsFormateurDePromotion(BasePermission):

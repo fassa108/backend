@@ -49,6 +49,13 @@ class FormationSerializer(serializers.ModelSerializer):
 
 
 class PromotionSerializer(serializers.ModelSerializer):
+    # Formateurs à affecter dès la création (facultatif).
+    formateurs = serializers.ListField(
+        child=serializers.IntegerField(),
+        write_only=True,
+        required=False,
+    )
+
     class Meta:
         model = Promotion
         fields = [
@@ -59,14 +66,52 @@ class PromotionSerializer(serializers.ModelSerializer):
             "date_debut",
             "date_fin",
             "actif",
+            "formateurs",
             "date_creation",
             "date_modification",
         ]
+        # « actif » (promotion ouverte / clôturée) ne change que via les
+        # actions cloturer / rouvrir, qui gèrent aussi les inscriptions.
         read_only_fields = [
             "id",
+            "actif",
             "date_creation",
             "date_modification",
         ]
+
+    def validate_formateurs(self, value):
+        from accounts.models import MembreTenant
+
+        if self.instance is not None:
+            raise serializers.ValidationError(
+                "Les formateurs se gèrent depuis la fiche de la promotion."
+            )
+
+        ids = list(dict.fromkeys(value))
+        valides = set(
+            MembreTenant.objects.filter(
+                utilisateur_id__in=ids,
+                tenant_id=self.context.get("tenant_id"),
+                role=MembreTenant.Role.FORMATEUR,
+                actif=True,
+            ).values_list("utilisateur_id", flat=True)
+        )
+        invalides = [i for i in ids if i not in valides]
+        if invalides:
+            raise serializers.ValidationError(
+                "Ces utilisateurs ne sont pas des formateurs actifs de cet organisme : "
+                + ", ".join(str(i) for i in invalides)
+            )
+        return ids
+
+    def create(self, validated_data):
+        formateurs = validated_data.pop("formateurs", [])
+        promotion = super().create(validated_data)
+        FormateurPromotion.objects.bulk_create([
+            FormateurPromotion(formateur_id=formateur_id, promotion=promotion)
+            for formateur_id in formateurs
+        ])
+        return promotion
 
     def validate(self, attrs):
         tenant_id = self.context.get("tenant_id")
@@ -472,11 +517,13 @@ class InscriptionPromotionSerializer(serializers.ModelSerializer):
             "apprenant_prenom",
             "apprenant_email",
             "actif",
+            "fermee_par_cloture",
             "date_inscription",
             "date_desinscription",
         ]
         read_only_fields = [
             "id",
+            "fermee_par_cloture",
             "date_inscription",
             "date_desinscription",
         ]
@@ -510,10 +557,11 @@ class InscriptionPromotionSerializer(serializers.ModelSerializer):
                     {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."}
                 )
 
-        # 3. Unicité d'une seule promotion active à la fois
-        if apprenant and actif:
+        # 3. Une seule inscription active par organisme
+        if apprenant and actif and promotion:
             qs = InscriptionPromotion.objects.filter(
                 apprenant=apprenant,
+                tenant_id=promotion.formation.tenant_id,
                 actif=True,
             )
             if self.instance:
@@ -548,10 +596,12 @@ class GroupeMembreSerializer(serializers.ModelSerializer):
             "apprenant_nom",
             "apprenant_prenom",
             "apprenant_email",
+            "actif",
             "date_ajout",
         ]
         read_only_fields = [
             "id",
+            "actif",
             "date_ajout",
         ]
 
@@ -585,17 +635,13 @@ class GroupeMembreSerializer(serializers.ModelSerializer):
 
         # 3. Vérification que l'apprenant a une inscription active dans LA PROMOTION DU GROUPE
         if groupe and apprenant:
-            inscription = InscriptionPromotion.objects.filter(
+            if not InscriptionPromotion.objects.filter(
                 apprenant=apprenant,
+                promotion_id=groupe.promotion_id,
                 actif=True,
-            ).first()
-            if not inscription:
+            ).exists():
                 raise serializers.ValidationError(
-                    {"apprenant": "L'apprenant n'a aucune inscription active dans une promotion."}
-                )
-            if inscription.promotion_id != groupe.promotion_id:
-                raise serializers.ValidationError(
-                    {"apprenant": f"L'apprenant appartient à la promotion '{inscription.promotion.nom}' et ne peut pas être ajouté à un groupe de la promotion '{groupe.promotion.nom}'."}
+                    {"apprenant": f"L'apprenant n'a pas d'inscription active dans la promotion '{groupe.promotion.nom}'."}
                 )
 
             # 4. Unicité dans ce groupe
@@ -612,7 +658,7 @@ class GroupeMembreSerializer(serializers.ModelSerializer):
 
 class GroupeSerializer(serializers.ModelSerializer):
     membres = GroupeMembreSerializer(many=True, read_only=True)
-    nb_membres = serializers.IntegerField(source="membres.count", read_only=True)
+    nb_membres = serializers.SerializerMethodField()
 
     class Meta:
         model = Groupe
@@ -633,8 +679,23 @@ class GroupeSerializer(serializers.ModelSerializer):
             "date_modification",
         ]
 
+    def get_nb_membres(self, groupe):
+        # Membres actifs (les membres inactifs sont gardés pour l'historique).
+        return sum(1 for m in groupe.membres.all() if m.actif)
+
     def validate(self, attrs):
         tenant_id = self.context.get("tenant_id")
+
+        # Un groupe ne change pas de promotion.
+        if (
+            self.instance
+            and "promotion" in attrs
+            and attrs["promotion"].pk != self.instance.promotion_id
+        ):
+            raise serializers.ValidationError(
+                {"promotion": "Un groupe ne peut pas changer de promotion."}
+            )
+
         promotion = attrs.get("promotion") or (
             self.instance.promotion if self.instance else None
         )
