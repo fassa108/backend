@@ -5,6 +5,9 @@ from rest_framework.exceptions import APIException
 ORGANISME_SUSPENDU_CODE = "organisme_suspendu"
 ORGANISME_SUSPENDU_MESSAGE = "Cet organisme est suspendu."
 
+MEMBRE_SUSPENDU_CODE = "membre_suspendu"
+MEMBRE_SUSPENDU_MESSAGE = "Votre accès à cet organisme a été suspendu."
+
 
 class OrganismeSuspendu(APIException):
     """

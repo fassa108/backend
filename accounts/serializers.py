@@ -88,14 +88,12 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
         # avec le message « no_active_account ».
         data = super().validate(attrs)
 
-        # Récupération des organismes auxquels
-        # l'utilisateur a actuellement accès.
+        # Organismes de l'utilisateur, y compris ceux où son accès
+        # est suspendu (« actif » = False) : le frontend affiche alors
+        # la page « accès suspendu » au lieu de « aucun organisme ».
         membres_tenants = (
             MembreTenant.objects
-            .filter(
-                utilisateur=self.user,
-                actif=True
-            )
+            .filter(utilisateur=self.user)
             .select_related("tenant")
         )
 
@@ -118,6 +116,7 @@ class ConnexionJWTSerializer(TokenObtainPairSerializer):
                 "code": membre.tenant.code,
                 "role": membre.role,
                 "statut": membre.tenant.statut,
+                "actif": membre.actif,
             }
             for membre in membres_tenants
         ]
@@ -130,6 +129,7 @@ class TenantConnexionSerializer(serializers.Serializer):
     code = serializers.CharField()
     role = serializers.CharField()
     statut = serializers.BooleanField()
+    actif = serializers.BooleanField()
 
 
 class UtilisateurConnexionSerializer(serializers.Serializer):
@@ -180,6 +180,7 @@ class MembreTenantSerializer(serializers.ModelSerializer):
     utilisateur_prenom = serializers.CharField(source="utilisateur.prenom", read_only=True)
     utilisateur_email = serializers.EmailField(source="utilisateur.email", read_only=True)
     utilisateur_actif = serializers.BooleanField(source="utilisateur.actif", read_only=True)
+    promotions_en_cours = serializers.SerializerMethodField()
 
     class Meta:
         model = MembreTenant
@@ -194,6 +195,7 @@ class MembreTenantSerializer(serializers.ModelSerializer):
             "role",
             "actif",
             "date_ajout",
+            "promotions_en_cours",
         ]
         read_only_fields = [
             "id",
@@ -204,6 +206,40 @@ class MembreTenantSerializer(serializers.ModelSerializer):
             "utilisateur_actif",
             "tenant",
             "date_ajout",
+            "promotions_en_cours",
+        ]
+
+    def get_promotions_en_cours(self, membre):
+        """
+        Promotions dans lesquelles le membre intervient dans cet organisme :
+        inscriptions actives (apprenant) ou affectations (formateur).
+        Sert à avertir l'admin avant une suspension.
+
+        Pour une liste, la vue fournit ces données déjà calculées dans
+        le contexte (« promotions_par_membre ») : une requête par liste
+        au lieu d'une requête par membre.
+        """
+        precalcul = self.context.get("promotions_par_membre")
+        if precalcul is not None:
+            return precalcul.get((membre.utilisateur_id, membre.role), [])
+
+        if membre.role == MembreTenant.Role.APPRENANT:
+            liens = InscriptionPromotion.objects.filter(
+                apprenant_id=membre.utilisateur_id,
+                promotion__formation__tenant_id=membre.tenant_id,
+                actif=True,
+            )
+        elif membre.role == MembreTenant.Role.FORMATEUR:
+            liens = FormateurPromotion.objects.filter(
+                formateur_id=membre.utilisateur_id,
+                promotion__formation__tenant_id=membre.tenant_id,
+            )
+        else:
+            return []
+
+        return [
+            {"id": promotion_id, "nom": nom}
+            for promotion_id, nom in liens.values_list("promotion_id", "promotion__nom")
         ]
 
     def validate(self, attrs):
