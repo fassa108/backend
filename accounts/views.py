@@ -69,7 +69,7 @@ class ActivationView(APIView):
 )
 class ConnexionView(TokenObtainPairView):
     """
-    Endpoint de connexion de Synapse.
+    Endpoint de connexion de Eduhub.
 
     Retourne un access token, un refresh token,
     les informations de l'utilisateur connecté
@@ -98,7 +98,7 @@ class LogoutView(APIView):
             token.blacklist()
         except TokenError:
             return Response(
-                {"detail": "Refresh token invalide ou déjà révoqué."},
+                {"detail": "Refresh token invalide ou révoqué."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

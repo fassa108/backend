@@ -11,7 +11,10 @@ from django.utils.encoding import force_str
 from django.conf import settings
 
 from .models import AccountActivationToken, MembreTenant, Utilisateur
-from .tasks import envoyer_email_reset_password
+from .tasks import (
+    envoyer_email_reset_password,
+    envoyer_email_activation,
+)
 
 class AccountService:
 
@@ -65,6 +68,18 @@ class AccountService:
         token = AccountActivationToken.objects.create(
             utilisateur=utilisateur,
             date_expiration=timezone.now() + timedelta(hours=2),
+        )
+
+        activation_url = (
+            f"{settings.FRONTEND_URL}/activate-account/"
+            f"{utilisateur.id}/{token.token}"
+        )
+
+        transaction.on_commit(
+            lambda: envoyer_email_activation.delay(
+                utilisateur.email,
+                activation_url,
+            )
         )
 
         return utilisateur, token
