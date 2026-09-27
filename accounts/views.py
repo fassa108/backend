@@ -1,5 +1,6 @@
 from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -29,6 +30,8 @@ class ActivationView(APIView):
     """
 
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "activation"
 
     def post(self, request):
         serializer = ActivationSerializer(data=request.data)
@@ -77,6 +80,8 @@ class ConnexionView(TokenObtainPairView):
     """
 
     serializer_class = ConnexionJWTSerializer
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "connexion"
 
 
 
@@ -111,6 +116,8 @@ class LogoutView(APIView):
 @extend_schema(request=DemandeResetPasswordSerializer)
 class DemandeResetPasswordView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset"
 
     def post(self, request):
         serializer = DemandeResetPasswordSerializer(data=request.data)
@@ -135,6 +142,8 @@ class DemandeResetPasswordView(APIView):
 @extend_schema(request=ResetPasswordSerializer)
 class ResetPasswordView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "password_reset_confirm"
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
@@ -198,7 +207,8 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
 
     def create(self, request, tenant_id):
         serializer = AjouterMembreSerializer(
-            data=request.data
+            data=request.data,
+            context={"tenant_id": tenant_id},
         )
         serializer.is_valid(raise_exception=True)
 
@@ -210,7 +220,7 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
         data = serializer.validated_data
 
         utilisateur = Utilisateur.objects.filter(
-            email=data["email"]
+            email__iexact=data["email"]
         ).first()
 
         if utilisateur:

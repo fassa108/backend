@@ -1,6 +1,9 @@
 from datetime import timedelta
 
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from rest_framework.exceptions import ValidationError
 from django.utils import timezone
 
 
@@ -15,6 +18,18 @@ from .tasks import (
     envoyer_email_reset_password,
     envoyer_email_activation,
 )
+
+
+def _valider_mot_de_passe(password, utilisateur):
+    """
+    Applique les règles de AUTH_PASSWORD_VALIDATORS
+    (longueur, mots de passe courants, similarité avec l'utilisateur…).
+    """
+    try:
+        validate_password(password, user=utilisateur)
+    except DjangoValidationError as error:
+        raise ValidationError({"password": error.messages})
+
 
 class AccountService:
 
@@ -99,6 +114,8 @@ class AccountService:
 
         utilisateur = activation_token.utilisateur
 
+        _valider_mot_de_passe(password, utilisateur)
+
         # Le mot de passe est stocké sous forme de hash,
         # jamais en clair dans la base de données.
         utilisateur.set_password(password)
@@ -127,7 +144,7 @@ class AccountService:
     @staticmethod
     def demander_reset_password(*, email):
         try:
-            utilisateur = Utilisateur.objects.get(email=email)
+            utilisateur = Utilisateur.objects.get(email__iexact=email)
         except Utilisateur.DoesNotExist:
             return
 
@@ -155,6 +172,8 @@ class AccountService:
 
         if not default_token_generator.check_token(utilisateur, token):
             raise ValueError("Lien de réinitialisation invalide ou expiré.")
+
+        _valider_mot_de_passe(password, utilisateur)
 
         utilisateur.set_password(password)
         utilisateur.save(update_fields=["password"])

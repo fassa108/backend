@@ -123,6 +123,10 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 
+# Le lien de réinitialisation expire au bout de 2 heures,
+# comme annoncé dans l'email.
+PASSWORD_RESET_TIMEOUT = 2 * 60 * 60
+
 # Tests : hachage rapide (PBKDF2 ralentit fortement la suite).
 if "test" in sys.argv:
     PASSWORD_HASHERS = [
@@ -171,6 +175,14 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated",
     ),
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+    # Limitation de débit des endpoints publics sensibles
+    # (vues avec ScopedRateThrottle).
+    "DEFAULT_THROTTLE_RATES": {
+        "connexion": "10/minute",
+        "activation": "10/hour",
+        "password_reset": "5/hour",
+        "password_reset_confirm": "10/hour",
+    },
 }
 
 SPECTACULAR_SETTINGS = {
