@@ -433,6 +433,26 @@ class RessourceTests(ActivitesBaseTestCase):
         self.client.force_authenticate(user=self.apprenant)
         self.assertEqual(self.ids(self.client.get(self.url("ressource"))), [jointe.id])
 
+    def test_telechargement_reserve_a_ceux_qui_voient_la_ressource(self):
+        self.client.post(self.url("ressource"), {"titre": "Support", "fichier": fichier_test("support.pdf")})
+        ressource = Ressource.objects.get(titre="Support")
+        url = f"{self.url('ressource', ressource.id)}telecharger/"
+
+        res = self.client.get(url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(b"".join(res.streaming_content), CONTENU_VALIDE["pdf"])
+        self.assertIn("attachment", res["Content-Disposition"])
+
+        # Apprenant : seulement si la ressource est jointe à l'un de ses briefs
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.creer_brief().ressources.add(ressource)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+
+    def test_telechargement_d_un_lien_404(self):
+        res = self.client.get(f"{self.url('ressource', self.ressource.id)}telecharger/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
     def test_apprenant_ne_cree_pas(self):
         self.client.force_authenticate(user=self.apprenant)
         res = self.client.post(self.url("ressource"), {"titre": "X", "url": "https://docs.test"})

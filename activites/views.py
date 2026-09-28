@@ -1,7 +1,11 @@
+import os
+
 from django.db.models import Q
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.decorators import action
+from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.response import Response
 
 from accounts.models import MembreTenant
@@ -109,9 +113,28 @@ class RessourceViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ACTIONS_LECTURE:
+        if self.action in ACTIONS_LECTURE + ("telecharger",):
             return [IsMembreOrganisme()]
         return [CanManageRessource()]
+
+    @action(detail=True, methods=["get"], url_path="telecharger")
+    def telecharger(self, request, tenant_id=None, pk=None):
+        """
+        Téléchargement du fichier d'une ressource, réservé à ceux qui peuvent
+        la voir (audit S6 : les fichiers ne sont pas servis publiquement).
+        """
+        ressource = self.get_object()
+        if not ressource.fichier:
+            raise NotFound("Cette ressource est un lien, pas un fichier.")
+        try:
+            fichier = ressource.fichier.open("rb")
+        except FileNotFoundError:
+            raise NotFound("Le fichier de cette ressource est introuvable.")
+        return FileResponse(
+            fichier,
+            as_attachment=True,
+            filename=os.path.basename(ressource.fichier.name),
+        )
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
