@@ -3,6 +3,7 @@ from rest_framework import serializers
 from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion
 
+from .validators import valider_fichier
 from .models import (
     Assignation,
     Brief,
@@ -63,8 +64,12 @@ class RessourceSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"titre": "Le titre ne peut pas être vide."})
             attrs["titre"] = titre
 
-        if fichier and hasattr(fichier, "size") and fichier.size > 5 * 1024 * 1024:
-            raise serializers.ValidationError({"fichier": "Le fichier ne doit pas dépasser 5 Mo."})
+        # Nouveau fichier envoyé : taille (10 Mo) et contenu réel
+        if "fichier" in attrs and attrs["fichier"]:
+            try:
+                valider_fichier(attrs["fichier"])
+            except serializers.ValidationError as erreur:
+                raise serializers.ValidationError({"fichier": erreur.detail})
 
         return attrs
 
@@ -440,7 +445,11 @@ class FichierLivrableSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"nom": "Le nom ne peut pas être vide."})
             attrs["nom"] = nom
 
-        if fichier and hasattr(fichier, "size") and fichier.size > 5 * 1024 * 1024:
-            raise serializers.ValidationError({"fichier": "Le fichier ne doit pas dépasser 5 Mo."})
+        # Nouveau fichier envoyé : taille (10 Mo) et contenu réel
+        if "fichier" in attrs and attrs["fichier"]:
+            try:
+                valider_fichier(attrs["fichier"])
+            except serializers.ValidationError as erreur:
+                raise serializers.ValidationError({"fichier": erreur.detail})
 
         return attrs

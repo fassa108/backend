@@ -16,8 +16,10 @@ Couvre :
 - Multi-tenant : isolation
 """
 
+import io
 import shutil
 import tempfile
+import zipfile
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -47,6 +49,28 @@ from .models import Assignation, Brief, FichierLivrable, Livrable, Ressource
 User = get_user_model()
 
 MEDIA_TEST = tempfile.mkdtemp()
+
+
+def _zip(fichiers):
+    tampon = io.BytesIO()
+    with zipfile.ZipFile(tampon, "w") as archive:
+        for nom in fichiers:
+            archive.writestr(nom, "<xml/>")
+    return tampon.getvalue()
+
+
+# Contenus réels minimaux par format
+CONTENU_VALIDE = {
+    "pdf": b"%PDF-1.4\n% test\n",
+    "docx": _zip(["[Content_Types].xml", "word/document.xml"]),
+    "pptx": _zip(["[Content_Types].xml", "ppt/presentation.xml"]),
+    "txt": "Notes de cours accentuées".encode("utf-8"),
+}
+
+
+def fichier_test(nom, contenu=None):
+    ext = nom.rsplit(".", 1)[-1]
+    return SimpleUploadedFile(nom, CONTENU_VALIDE.get(ext, b"contenu") if contenu is None else contenu)
 
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
@@ -341,12 +365,23 @@ class RessourceTests(ActivitesBaseTestCase):
         self.assertEqual(res.data["formateur"], self.formateur.id)
 
     def test_formateur_cree_avec_fichier(self):
-        fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
-        res = self.client.post(self.url("ressource"), {"titre": "Fichier", "fichier": fichier})
+        res = self.client.post(self.url("ressource"), {"titre": "Fichier", "fichier": fichier_test("doc.pdf")})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
+    def test_faux_pdf_refuse(self):
+        res = self.client.post(self.url("ressource"),
+                               {"titre": "Faux", "fichier": fichier_test("virus.pdf", b"MZ\x90\x00binaire")})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ne correspond pas", str(res.data["fichier"]))
+
+    def test_ressource_de_plus_de_10_mo_refusee(self):
+        gros = CONTENU_VALIDE["pdf"] + b"x" * (10 * 1024 * 1024)
+        res = self.client.post(self.url("ressource"), {"titre": "Gros", "fichier": fichier_test("gros.pdf", gros)})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("10 Mo", str(res.data["fichier"]))
+
     def test_url_et_fichier_simultanes_refuses(self):
-        fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
+        fichier = fichier_test("doc.pdf")
         res = self.client.post(self.url("ressource"),
                                {"titre": "X", "url": "https://docs.test", "fichier": fichier})
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
@@ -586,10 +621,9 @@ class FichierLivrableTests(ActivitesBaseTestCase):
         self.livrable = self.deposer(assignation)
         self.client.force_authenticate(user=self.apprenant)
 
-    def envoyer(self, nom, contenu=b"contenu", content_type="application/octet-stream"):
-        fichier = SimpleUploadedFile(nom, contenu, content_type=content_type)
+    def envoyer(self, nom, contenu=None):
         return self.client.post(self.url("fichier-livrable"),
-                                {"livrable": self.livrable.id, "nom": nom, "fichier": fichier})
+                                {"livrable": self.livrable.id, "nom": nom, "fichier": fichier_test(nom, contenu)})
 
     def test_types_acceptes(self):
         for nom in ("doc.pdf", "slides.pptx", "rapport.docx", "notes.txt"):
@@ -605,15 +639,31 @@ class FichierLivrableTests(ActivitesBaseTestCase):
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
     def test_url_et_fichier_refuses(self):
-        fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
+        fichier = fichier_test("doc.pdf")
         res = self.client.post(self.url("fichier-livrable"), {
             "livrable": self.livrable.id, "nom": "X", "fichier": fichier, "url": "https://x.test",
         })
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_taille_maximale(self):
-        self.assertEqual(self.envoyer("gros.pdf", b"x" * (5 * 1024 * 1024 + 1)).status_code,
+    def test_taille_maximale_10_mo(self):
+        base = CONTENU_VALIDE["pdf"]
+        self.assertEqual(self.envoyer("moyen.pdf", base + b"x" * (6 * 1024 * 1024)).status_code,
+                         status.HTTP_201_CREATED)
+        self.assertEqual(self.envoyer("gros.pdf", base + b"x" * (10 * 1024 * 1024)).status_code,
                          status.HTTP_400_BAD_REQUEST)
+
+    def test_contenu_ne_correspondant_pas_a_l_extension(self):
+        cas = {
+            "faux.pdf": b"MZ\x90\x00 executable",           # binaire renommé en pdf
+            "faux.docx": _zip(["autre/fichier.txt"]),         # zip qui n'est pas un document Word
+            "slides.docx": CONTENU_VALIDE["pptx"],            # PowerPoint renommé en docx
+            "faux.pptx": b"pas une archive",
+            "binaire.txt": b"texte\x00\x01\x02 binaire",
+        }
+        for nom, contenu in cas.items():
+            res = self.envoyer(nom, contenu)
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST, nom)
+            self.assertIn("ne correspond pas", str(res.data["fichier"]), nom)
 
     def test_autre_apprenant_ne_voit_pas_les_fichiers(self):
         FichierLivrable.objects.create(livrable=self.livrable, nom="Lien", url="https://x.test")
