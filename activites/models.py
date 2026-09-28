@@ -115,8 +115,16 @@ class Brief(models.Model):
         related_name="briefs_crees",
     )
     titre = models.CharField(max_length=255)
+    # Résumé court en texte simple (listes, cartes)
     description = models.TextField()
-    consignes = models.TextField()
+
+    # Sections en texte riche (HTML nettoyé, voir texte_riche.py).
+    # Obligatoires : modalites_evaluation et livrables_attendus.
+    contexte = models.TextField(blank=True)
+    modalites_pedagogiques = models.TextField(blank=True)
+    modalites_evaluation = models.TextField(blank=True)
+    criteres_performance = models.TextField(blank=True)
+    livrables_attendus = models.TextField(blank=True)
 
     date_debut = models.DateTimeField()
     date_limite = models.DateTimeField()

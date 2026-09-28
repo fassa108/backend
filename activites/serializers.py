@@ -3,6 +3,7 @@ from rest_framework import serializers
 from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion
 
+from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
 from .models import (
     Assignation,
@@ -81,6 +82,21 @@ class RessourceSerializer(serializers.ModelSerializer):
 
 # ─── Brief ────────────────────────────────────────────────────────────────────
 
+# Sections du brief en texte riche ; celles de SECTIONS_OBLIGATOIRES ne
+# peuvent pas être vides.
+SECTIONS_TEXTE_RICHE = (
+    "contexte",
+    "modalites_pedagogiques",
+    "modalites_evaluation",
+    "criteres_performance",
+    "livrables_attendus",
+)
+SECTIONS_OBLIGATOIRES = {
+    "modalites_evaluation": "Les modalités d'évaluation sont obligatoires.",
+    "livrables_attendus": "Les livrables attendus sont obligatoires.",
+}
+
+
 class BriefSerializer(serializers.ModelSerializer):
     competence_niveaux = serializers.PrimaryKeyRelatedField(
         many=True,
@@ -105,7 +121,11 @@ class BriefSerializer(serializers.ModelSerializer):
             "module",
             "titre",
             "description",
-            "consignes",
+            "contexte",
+            "modalites_pedagogiques",
+            "modalites_evaluation",
+            "criteres_performance",
+            "livrables_attendus",
             "date_debut",
             "date_limite",
             "statut",
@@ -213,6 +233,24 @@ class BriefSerializer(serializers.ModelSerializer):
             if not titre:
                 raise serializers.ValidationError({"titre": "Le titre ne peut pas être vide."})
             attrs["titre"] = titre
+
+        if "description" in attrs:
+            attrs["description"] = attrs["description"].strip()
+            if not attrs["description"]:
+                raise serializers.ValidationError({"description": "La description est obligatoire."})
+
+        # Texte riche : HTML nettoyé côté serveur, sections obligatoires non vides
+        for champ in SECTIONS_TEXTE_RICHE:
+            if champ in attrs:
+                attrs[champ] = nettoyer_html(attrs[champ])
+
+        erreurs = {}
+        for champ, message in SECTIONS_OBLIGATOIRES.items():
+            valeur = attrs.get(champ, getattr(instance, champ, ""))
+            if est_vide(valeur):
+                erreurs[champ] = message
+        if erreurs:
+            raise serializers.ValidationError(erreurs)
 
         return attrs
 

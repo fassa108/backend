@@ -145,7 +145,8 @@ class ActivitesBaseTestCase(APITestCase):
             module=self.module,
             titre="Créer une API REST",
             description="Description",
-            consignes="Consignes",
+            modalites_evaluation="<p>Revue de code</p>",
+            livrables_attendus="<p>Lien du dépôt</p>",
             date_debut="2026-09-01T08:00:00Z",
             date_limite="2026-09-30T18:00:00Z",
             statut=statut,
@@ -173,7 +174,9 @@ class ActivitesBaseTestCase(APITestCase):
             "module": self.module.id,
             "titre": "Brief API",
             "description": "Description",
-            "consignes": "Consignes",
+            "contexte": "<p>Une boulangerie veut un site.</p>",
+            "modalites_evaluation": "<p>Revue de code</p>",
+            "livrables_attendus": "<ul><li>Lien du dépôt</li></ul>",
             "date_debut": "2026-09-01T08:00:00Z",
             "date_limite": "2026-09-30T18:00:00Z",
             "competence_niveaux": [self.cn.id],
@@ -200,6 +203,48 @@ class BriefCreationTests(ActivitesBaseTestCase):
         self.assertEqual(list(brief.ressources.all()), [ressource])
         self.assertEqual(res.data["statut"], Brief.Statut.BROUILLON)
         self.assertTrue(res.data["modifiable"])
+
+    def test_description_obligatoire(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(description="  "), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("description", res.data)
+
+    def test_sections_obligatoires(self):
+        # Un éditeur vide envoie « <p></p> » : il compte comme vide
+        payload = self.payload_brief(modalites_evaluation="<p></p>", livrables_attendus="<p>&nbsp;</p>")
+        res = self.client.post(self.url("brief"), payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        for champ in ("modalites_evaluation", "livrables_attendus"):
+            self.assertIn(champ, res.data)
+
+    def test_sections_facultatives_vides_acceptees(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(
+            contexte="", modalites_pedagogiques="<p></p>", criteres_performance=""), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_texte_riche_nettoye(self):
+        html = (
+            '<h2>Contexte</h2><p><strong>Gras</strong> <em>italique</em> <u>souligné</u></p>'
+            '<ul><li>puce</li></ul><ol><li>un</li></ol>'
+            '<p onclick="alert(1)" style="color:red">texte</p>'
+            '<script>alert("xss")</script><iframe src="https://x.test"></iframe>'
+            '<a href="javascript:alert(1)">piège</a> <a href="https://doc.test">doc</a>'
+            '<img src=x onerror=alert(1)>'
+        )
+        res = self.client.post(self.url("brief"), self.payload_brief(contexte=html), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        contexte = res.data["contexte"]
+        for autorise in ("<h2>", "<strong>", "<em>", "<u>", "<ul>", "<ol>", "<li>", 'href="https://doc.test"'):
+            self.assertIn(autorise, contexte)
+        for interdit in ("<script", "onclick", "style=", "<iframe", "javascript:", "<img", "onerror"):
+            self.assertNotIn(interdit, contexte)
+        self.assertIn('rel="noopener noreferrer nofollow"', contexte)
+
+    def test_sections_obligatoires_en_modification(self):
+        brief = self.creer_brief(statut=Brief.Statut.BROUILLON)
+        res = self.client.patch(self.url("brief", brief.id), {"livrables_attendus": "<p></p>"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("livrables_attendus", res.data)
 
     def test_module_obligatoire(self):
         payload = self.payload_brief()
