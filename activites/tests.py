@@ -368,6 +368,20 @@ class RessourceTests(ActivitesBaseTestCase):
         res = self.client.post(self.url("ressource"), {"titre": "Fichier", "fichier": fichier_test("doc.pdf")})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
+    def test_remplacer_un_lien_par_un_fichier_et_inversement(self):
+        url = self.url("ressource", self.ressource.id)
+        res = self.client.patch(url, {"fichier": fichier_test("doc.pdf"), "url": ""})
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.ressource.refresh_from_db()
+        self.assertIsNone(self.ressource.url)
+        self.assertTrue(self.ressource.fichier)
+
+        res = self.client.patch(url, {"url": "https://nouveau.test", "fichier": None}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.ressource.refresh_from_db()
+        self.assertEqual(self.ressource.url, "https://nouveau.test")
+        self.assertFalse(self.ressource.fichier)
+
     def test_faux_pdf_refuse(self):
         res = self.client.post(self.url("ressource"),
                                {"titre": "Faux", "fichier": fichier_test("virus.pdf", b"MZ\x90\x00binaire")})

@@ -49,6 +49,11 @@ class RessourceSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
+        # Lien vide = pas de lien (la contrainte en base exige NULL quand
+        # la ressource est un fichier, ex. passage d'un lien à un fichier).
+        if "url" in attrs and not attrs["url"]:
+            attrs["url"] = None
+
         url = attrs.get("url", getattr(self.instance, "url", None))
         fichier = attrs.get("fichier", getattr(self.instance, "fichier", None))
 
