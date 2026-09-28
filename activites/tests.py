@@ -503,6 +503,29 @@ class AssignationTests(ActivitesBaseTestCase):
         res = self.assigner(apprenant=self.apprenant_b.id, groupe=self.groupe.id)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
+    def test_membre_d_un_groupe_assigne_non_assignable_individuellement(self):
+        self.assigner(groupe=self.groupe.id)
+        res = self.assigner(apprenant=self.apprenant.id)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Groupe A", str(res.data["apprenant"]))
+        # Un apprenant hors du groupe reste assignable
+        self.assertEqual(self.assigner(apprenant=self.apprenant_b.id).status_code, status.HTTP_201_CREATED)
+
+    def test_groupe_avec_un_membre_deja_assigne_refuse(self):
+        self.assigner(apprenant=self.apprenant.id)
+        res = self.assigner(groupe=self.groupe.id)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("déjà assignés individuellement", str(res.data["groupe"]))
+
+    def test_assignation_mixte_avec_un_membre_du_groupe_refusee(self):
+        res = self.assigner(apprenant=self.apprenant.id, groupe=self.groupe.id)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_membre_inactif_du_groupe_assignable_individuellement(self):
+        self.assigner(groupe=self.groupe.id)
+        GroupeMembre.objects.filter(apprenant=self.apprenant).update(actif=False)
+        self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_201_CREATED)
+
     def test_sans_cible_refusee(self):
         self.assertEqual(self.assigner().status_code, status.HTTP_400_BAD_REQUEST)
 

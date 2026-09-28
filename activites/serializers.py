@@ -304,6 +304,41 @@ class AssignationSerializer(serializers.ModelSerializer):
                     "apprenant": "Cet apprenant n'est pas inscrit activement à la promotion du brief."
                 })
 
+        # Un apprenant n'est assigné qu'une fois à un brief : pas d'assignation
+        # individuelle s'il fait partie d'un groupe assigné, et inversement.
+        if apprenant:
+            groupes_assignes = Assignation.objects.filter(
+                brief=brief,
+                groupe__membres__apprenant=apprenant,
+                groupe__membres__actif=True,
+            ).values_list("groupe__nom", flat=True)
+            if groupe and groupe.membres.filter(apprenant=apprenant, actif=True).exists():
+                groupes_assignes = [groupe.nom, *groupes_assignes]
+            if groupes_assignes:
+                raise serializers.ValidationError({
+                    "apprenant": (
+                        "Cet apprenant fait déjà partie du groupe "
+                        f"« {groupes_assignes[0]} » assigné à ce brief."
+                    )
+                })
+
+        if groupe:
+            deja_assignes = Assignation.objects.filter(
+                brief=brief,
+                apprenant__appartenances_groupes__groupe=groupe,
+                apprenant__appartenances_groupes__actif=True,
+            ).select_related("apprenant")
+            if deja_assignes.exists():
+                noms = ", ".join(
+                    f"{a.apprenant.prenom} {a.apprenant.nom}" for a in deja_assignes
+                )
+                raise serializers.ValidationError({
+                    "groupe": (
+                        "Des membres de ce groupe sont déjà assignés individuellement "
+                        f"à ce brief : {noms}. Retirez d'abord leur assignation."
+                    )
+                })
+
         # Anti-doublon
         if groupe and Assignation.objects.filter(brief=brief, groupe=groupe).exists():
             raise serializers.ValidationError({
