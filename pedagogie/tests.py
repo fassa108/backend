@@ -866,7 +866,7 @@ class ReglesPedagogieBaseTestCase(PedagogieBaseTestCase):
             date_debut=now, date_limite=now + timedelta(days=1),
         )
         assignation = Assignation.objects.create(brief=brief, apprenant=apprenant)
-        return Livrable.objects.create(assignation=assignation, deposant=apprenant, titre="L")
+        return Livrable.objects.create(assignation=assignation, deposant=apprenant, numero=1)
 
     def ids(self, res):
         return sorted(x["id"] for x in res.data)
