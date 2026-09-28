@@ -80,6 +80,36 @@ class Ressource(models.Model):
         return self.titre
 
 
+class CategorieBrief(models.Model):
+    """
+    Catégorie d'activité propre à chaque organisme (ex. : Brief projet, TP,
+    Atelier, Veille). Sert uniquement à classer : les règles du brief sont
+    les mêmes quelle que soit la catégorie.
+    """
+
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="categories_briefs",
+    )
+    nom = models.CharField(max_length=100)
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "nom"],
+                name="unique_categorie_brief_par_tenant",
+            ),
+        ]
+        ordering = ["nom"]
+
+    def __str__(self):
+        return self.nom
+
+
 class Brief(models.Model):
     """
     Activité proposée à une promotion.
@@ -113,6 +143,15 @@ class Brief(models.Model):
         null=True,
         blank=True,
         related_name="briefs_crees",
+    )
+    # Catégorie facultative (classement). RESTRICT : une catégorie utilisée
+    # ne se supprime pas seule (on la désactive).
+    categorie = models.ForeignKey(
+        CategorieBrief,
+        on_delete=models.RESTRICT,
+        null=True,
+        blank=True,
+        related_name="briefs",
     )
     titre = models.CharField(max_length=255)
     # Résumé court en texte simple (listes, cartes)

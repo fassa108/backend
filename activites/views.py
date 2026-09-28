@@ -20,6 +20,7 @@ from tenants.models import Tenant
 from .models import (
     Assignation,
     Brief,
+    CategorieBrief,
     FichierLivrable,
     Livrable,
     Ressource,
@@ -34,6 +35,7 @@ from .permissions import (
 from .serializers import (
     AssignationSerializer,
     BriefSerializer,
+    CategorieBriefSerializer,
     FichierLivrableSerializer,
     LivrableSerializer,
     LivrableStatutSerializer,
@@ -178,6 +180,42 @@ class RessourceViewSet(viewsets.ModelViewSet):
         instance.delete()
 
 
+# ─── Catégories de brief ─────────────────────────────────────────────────────
+
+class CategorieBriefViewSet(viewsets.ModelViewSet):
+    """
+    Catégories propres à l'organisme (classement des briefs).
+    Lecture : tout membre actif. Gestion : Admin organisme.
+    Une catégorie utilisée ne se supprime pas : on la désactive.
+    """
+
+    serializer_class = CategorieBriefSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        return [IsAdminOrganisme()]
+
+    def get_queryset(self):
+        return CategorieBrief.objects.filter(tenant_id=self.kwargs["tenant_id"])
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["tenant_id"] = self.kwargs["tenant_id"]
+        return context
+
+    def perform_create(self, serializer):
+        serializer.save(tenant=get_object_or_404(Tenant, pk=self.kwargs["tenant_id"]))
+
+    def perform_destroy(self, instance):
+        if instance.briefs.exists():
+            raise PermissionDenied(
+                "Cette catégorie est utilisée par des briefs. Désactivez-la à la place."
+            )
+        instance.delete()
+
+
 # ─── Briefs ───────────────────────────────────────────────────────────────────
 
 class BriefViewSet(viewsets.ModelViewSet):
@@ -207,7 +245,7 @@ class BriefViewSet(viewsets.ModelViewSet):
 
         qs = (
             Brief.objects.filter(promotion__formation__tenant_id=tenant_id)
-            .select_related("promotion", "promotion__formation", "module", "cree_par")
+            .select_related("promotion", "promotion__formation", "module", "cree_par", "categorie")
             .prefetch_related("competence_niveaux", "ressources")
             .order_by("-date_creation")
         )
@@ -218,6 +256,9 @@ class BriefViewSet(viewsets.ModelViewSet):
         statut = self.request.query_params.get("statut")
         if statut:
             qs = qs.filter(statut=statut)
+        categorie_id = _param_entier(self.request, "categorie")
+        if categorie_id is not None:
+            qs = qs.filter(categorie_id=categorie_id)
 
         role = _role(user, tenant_id)
         if role == MembreTenant.Role.ADMINISTRATEUR:

@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     Assignation,
     Brief,
+    CategorieBrief,
     FichierLivrable,
     Livrable,
     Ressource,
@@ -14,6 +15,12 @@ class RessourceAdmin(admin.ModelAdmin):
     list_display = ("titre", "tenant", "formateur", "date_creation")
     list_filter = ("tenant",)
     search_fields = ("titre", "formateur__nom", "formateur__email")
+
+
+@admin.register(CategorieBrief)
+class CategorieBriefAdmin(admin.ModelAdmin):
+    list_display = ("nom", "tenant", "actif")
+    list_filter = ("tenant", "actif")
 
 
 @admin.register(Brief)

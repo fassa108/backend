@@ -44,7 +44,7 @@ from pedagogie.models import (
 from pedagogie.services import InscriptionService
 from tenants.models import Tenant
 
-from .models import Assignation, Brief, FichierLivrable, Livrable, Ressource
+from .models import Assignation, Brief, CategorieBrief, FichierLivrable, Livrable, Ressource
 
 User = get_user_model()
 
@@ -393,6 +393,72 @@ class BriefVisibiliteTests(ActivitesBaseTestCase):
         self.client.force_authenticate(user=admin_b)
         res = self.client.get(self.url("brief"))
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ─── Catégories de brief ─────────────────────────────────────────────────────
+
+class CategorieBriefTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tp = CategorieBrief.objects.create(tenant=self.tenant, nom="TP")
+
+    def test_admin_gere_les_categories(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(self.url("categorie-brief"), {"nom": "Veille"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.client.patch(self.url("categorie-brief", self.tp.id), {"nom": "Travaux pratiques"}).status_code,
+                         status.HTTP_200_OK)
+
+    def test_nom_unique_insensible_a_la_casse(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(self.url("categorie-brief"), {"nom": "tp"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_formateur_et_apprenant_lisent_seulement(self):
+        for utilisateur in (self.formateur, self.apprenant):
+            self.client.force_authenticate(user=utilisateur)
+            self.assertEqual(self.ids(self.client.get(self.url("categorie-brief"))), [self.tp.id])
+            self.assertEqual(self.client.post(self.url("categorie-brief"), {"nom": "X"}).status_code,
+                             status.HTTP_403_FORBIDDEN)
+
+    def test_isolation_tenant(self):
+        CategorieBrief.objects.create(tenant=self.tenant_2, nom="Autre")
+        self.assertEqual(self.ids(self.client.get(self.url("categorie-brief"))), [self.tp.id])
+
+    def test_brief_avec_categorie(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(categorie=self.tp.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["categorie"], self.tp.id)
+        self.assertEqual([b["id"] for b in self.client.get(self.url("brief") + f"?categorie={self.tp.id}").data],
+                         [res.data["id"]])
+
+    def test_brief_sans_categorie(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(res.data["categorie"])
+
+    def test_categorie_d_un_autre_organisme_refusee(self):
+        autre = CategorieBrief.objects.create(tenant=self.tenant_2, nom="Autre")
+        res = self.client.post(self.url("brief"), self.payload_brief(categorie=autre.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_categorie_desactivee_refusee_pour_un_nouveau_brief(self):
+        self.tp.actif = False
+        self.tp.save()
+        res = self.client.post(self.url("brief"), self.payload_brief(categorie=self.tp.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_categorie_utilisee_non_supprimable(self):
+        self.creer_brief(categorie=self.tp)
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(self.url("categorie-brief", self.tp.id))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertIn("Désactivez", str(res.data["detail"]))
+
+    def test_categorie_libre_supprimable(self):
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(self.client.delete(self.url("categorie-brief", self.tp.id)).status_code,
+                         status.HTTP_204_NO_CONTENT)
 
 
 # ─── Ressources ───────────────────────────────────────────────────────────────

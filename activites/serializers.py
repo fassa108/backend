@@ -8,6 +8,7 @@ from .validators import valider_fichier
 from .models import (
     Assignation,
     Brief,
+    CategorieBrief,
     FichierLivrable,
     Livrable,
     Ressource,
@@ -80,6 +81,26 @@ class RessourceSerializer(serializers.ModelSerializer):
         return attrs
 
 
+# ─── Catégories de brief ─────────────────────────────────────────────────────
+
+class CategorieBriefSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CategorieBrief
+        fields = ["id", "nom", "actif", "date_creation", "date_modification"]
+        read_only_fields = ["id", "date_creation", "date_modification"]
+
+    def validate_nom(self, value):
+        nom = value.strip()
+        if not nom:
+            raise serializers.ValidationError("Le nom est obligatoire.")
+        qs = CategorieBrief.objects.filter(tenant_id=self.context["tenant_id"], nom__iexact=nom)
+        if self.instance:
+            qs = qs.exclude(pk=self.instance.pk)
+        if qs.exists():
+            raise serializers.ValidationError("Une catégorie avec ce nom existe déjà.")
+        return nom
+
+
 # ─── Brief ────────────────────────────────────────────────────────────────────
 
 # Sections du brief en texte riche ; celles de SECTIONS_OBLIGATOIRES ne
@@ -119,6 +140,7 @@ class BriefSerializer(serializers.ModelSerializer):
             "id",
             "promotion",
             "module",
+            "categorie",
             "titre",
             "description",
             "contexte",
@@ -189,6 +211,16 @@ class BriefSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "promotion": "Cette promotion est clôturée : elle est en lecture seule."
             })
+
+        # Catégorie facultative : de l'organisme, active (sauf si déjà en place)
+        if "categorie" in attrs and attrs["categorie"] is not None:
+            categorie = attrs["categorie"]
+            if str(categorie.tenant_id) != str(tenant_id):
+                raise serializers.ValidationError({
+                    "categorie": "Cette catégorie n'appartient pas à cet organisme."
+                })
+            if not categorie.actif and getattr(instance, "categorie_id", None) != categorie.id:
+                raise serializers.ValidationError({"categorie": "Cette catégorie est désactivée."})
 
         # Module principal : obligatoire, dans la formation de la promotion
         module = attrs.get("module", getattr(instance, "module", None))
