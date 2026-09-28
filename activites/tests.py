@@ -637,6 +637,38 @@ class AssignationTests(ActivitesBaseTestCase):
         GroupeMembre.objects.filter(apprenant=self.apprenant).update(actif=False)
         self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_201_CREATED)
 
+    def test_deux_groupes_avec_un_membre_commun(self):
+        groupe_b = Groupe.objects.create(promotion=self.promotion, nom="Groupe B")
+        GroupeMembre.objects.create(groupe=groupe_b, apprenant=self.apprenant)
+        self.assigner(groupe=self.groupe.id)
+        res = self.assigner(groupe=groupe_b.id)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("via un autre groupe", str(res.data["groupe"]))
+
+    def multiple(self, **cibles):
+        return self.client.post(f"{self.url('assignation')}multiple/", {"brief": self.brief.id, **cibles}, format="json")
+
+    def test_assignation_multiple(self):
+        groupe_b = Groupe.objects.create(promotion=self.promotion, nom="Groupe B")
+        res = self.multiple(groupes=[self.groupe.id, groupe_b.id], apprenants=[self.apprenant_b.id])
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(len(res.data), 3)
+        self.assertEqual(Assignation.objects.filter(brief=self.brief).count(), 3)
+
+    def test_assignation_multiple_tout_ou_rien(self):
+        # L'apprenant est aussi dans le groupe choisi : rien n'est créé
+        res = self.multiple(groupes=[self.groupe.id], apprenants=[self.apprenant_b.id, self.apprenant.id])
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual([(e["type"], e["id"]) for e in res.data["erreurs"]], [("apprenant", self.apprenant.id)])
+        self.assertFalse(Assignation.objects.filter(brief=self.brief).exists())
+
+    def test_assignation_multiple_vide_refusee(self):
+        self.assertEqual(self.multiple().status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_assignation_multiple_reservee_au_formateur(self):
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(self.multiple(apprenants=[self.apprenant.id]).status_code, status.HTTP_403_FORBIDDEN)
+
     def test_sans_cible_refusee(self):
         self.assertEqual(self.assigner().status_code, status.HTTP_400_BAD_REQUEST)
 

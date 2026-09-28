@@ -1,5 +1,6 @@
 import os
 
+from django.db import transaction
 from django.db.models import Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
@@ -307,9 +308,62 @@ class AssignationViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ACTIONS_LECTURE:
             return [IsMembreOrganisme()]
-        if self.action in ("create", "destroy"):
+        if self.action in ("create", "destroy", "multiple"):
             return [IsFormateurOrganisme()]
         return _refus_par_defaut(self)
+
+    @action(detail=False, methods=["post"], url_path="multiple")
+    def multiple(self, request, tenant_id=None):
+        """
+        Assignation de plusieurs cibles en une fois, « tout ou rien » :
+        { "brief": id, "groupes": [ids], "apprenants": [ids] }.
+        Chaque cible passe par les mêmes contrôles qu'une assignation seule
+        (dans l'ordre : groupes puis apprenants, ce qui détecte un apprenant
+        choisi en même temps que son groupe). Une seule erreur annule tout.
+        """
+        brief = request.data.get("brief")
+        cibles = [("groupe", i) for i in request.data.get("groupes", [])] + [
+            ("apprenant", i) for i in request.data.get("apprenants", [])
+        ]
+        if not cibles:
+            return Response(
+                {"detail": "Choisissez au moins un apprenant ou un groupe."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        erreurs, creees = [], []
+
+        class _Annulation(Exception):
+            pass
+
+        try:
+            with transaction.atomic():
+                for champ, identifiant in cibles:
+                    serializer = AssignationSerializer(
+                        data={"brief": brief, champ: identifiant},
+                        context=self.get_serializer_context(),
+                    )
+                    if serializer.is_valid():
+                        creees.append(serializer.save())
+                    else:
+                        message = next(iter(serializer.errors.values()))
+                        erreurs.append({
+                            "type": champ,
+                            "id": identifiant,
+                            "message": message[0] if isinstance(message, list) else message,
+                        })
+                if erreurs:
+                    raise _Annulation()
+        except _Annulation:
+            return Response(
+                {"detail": "Aucune assignation n'a été créée.", "erreurs": erreurs},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response(
+            AssignationSerializer(creees, many=True).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]

@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from accounts.models import MembreTenant
-from pedagogie.models import CompetenceNiveau, FormateurPromotion
+from pedagogie.models import CompetenceNiveau, FormateurPromotion, GroupeMembre
 
 from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
@@ -393,6 +393,23 @@ class AssignationSerializer(serializers.ModelSerializer):
                 })
 
         if groupe:
+            # Membres déjà couverts par un autre groupe assigné au brief
+            communs = GroupeMembre.objects.filter(
+                groupe__assignations__brief=brief,
+                actif=True,
+                apprenant__in=groupe.membres.filter(actif=True).values("apprenant"),
+            ).exclude(groupe=groupe).select_related("apprenant", "groupe")
+            if communs.exists():
+                noms = ", ".join(
+                    f"{m.apprenant.prenom} {m.apprenant.nom} ({m.groupe.nom})" for m in communs
+                )
+                raise serializers.ValidationError({
+                    "groupe": (
+                        "Des membres de ce groupe sont déjà assignés via un autre groupe : "
+                        f"{noms}."
+                    )
+                })
+
             deja_assignes = Assignation.objects.filter(
                 brief=brief,
                 apprenant__appartenances_groupes__groupe=groupe,
