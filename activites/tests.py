@@ -743,6 +743,11 @@ class ReferentielUtiliseParUnBriefTests(ActivitesBaseTestCase):
         res = self.client.delete(f"{self.base}/modules/{vide.id}/")
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_suppression_en_cascade_d_un_organisme_avec_des_briefs(self):
+        # Le module est protégé seul, pas quand toute la formation disparaît
+        self.tenant.delete()
+        self.assertFalse(Brief.objects.exists())
+
     def test_niveau_de_competence_vise_non_retirable(self):
         res = self.client.delete(f"{self.base}/competence-niveaux/{self.cn.id}/")
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)

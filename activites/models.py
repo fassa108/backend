@@ -99,10 +99,12 @@ class Brief(models.Model):
         on_delete=models.CASCADE,
         related_name="briefs",
     )
-    # Module principal du brief (obligatoire)
+    # Module principal du brief (obligatoire). RESTRICT : un module utilisé
+    # ne peut pas être supprimé seul, mais la suppression en cascade de toute
+    # la formation (qui supprime aussi ses briefs) reste possible.
     module = models.ForeignKey(
         Module,
-        on_delete=models.PROTECT,
+        on_delete=models.RESTRICT,
         related_name="briefs",
     )
     cree_par = models.ForeignKey(
