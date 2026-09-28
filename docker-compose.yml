@@ -69,6 +69,41 @@ services:
     depends_on:
       - db
       - redis
+      - gotenberg
+
+    # « apercus » : seul chemin vers Gotenberg
+    networks:
+      - default
+      - apercus
+
+
+  # Conversion des fichiers Office (docx, pptx) en PDF pour leur aperçu.
+  # Isolé : réseau interne sans accès à internet, joignable seulement par
+  # Celery ; aucun port publié ; pas d'accès à la base ni aux secrets.
+  # Seule la route LibreOffice est active (pas de Chromium, de webhook ni de
+  # téléchargement d'URL).
+  gotenberg:
+    image: gotenberg/gotenberg:8
+
+    command:
+      - gotenberg
+      - --chromium-disable-routes=true
+      - --webhook-disable=true
+      - --api-disable-download-from=true
+      - --api-timeout=120s
+      - --libreoffice-max-queue-size=20
+      - --libreoffice-restart-after=10
+
+    networks:
+      - apercus
+
+    restart: unless-stopped
+
+
+networks:
+  default:
+  apercus:
+    internal: true
 
 
 volumes:

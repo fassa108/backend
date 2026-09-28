@@ -1,11 +1,17 @@
+from django.db import transaction
+from django.db.models import Max
+from django.utils import timezone
 from rest_framework import serializers
 
 from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion, GroupeMembre
 
+from .apercus import demander_apercu
 from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
 from .models import (
+    EXTENSIONS_LIVRABLES,
+    MAX_ELEMENTS_PAR_DEPOT,
     Assignation,
     Brief,
     CategorieBrief,
@@ -30,6 +36,12 @@ def brief_a_des_livrables(brief):
 # ─── Ressource indépendante ───────────────────────────────────────────────────
 
 class RessourceSerializer(serializers.ModelSerializer):
+    # Le fichier s'envoie mais son chemin sur le disque n'est jamais renvoyé :
+    # il se consulte ou se télécharge via les routes « consulter » et
+    # « telecharger ». On expose seulement son type et son extension.
+    type = serializers.SerializerMethodField()
+    extension = serializers.SerializerMethodField()
+
     class Meta:
         model = Ressource
         fields = [
@@ -37,8 +49,10 @@ class RessourceSerializer(serializers.ModelSerializer):
             "tenant",
             "formateur",
             "titre",
+            "type",
             "url",
             "fichier",
+            "extension",
             "date_creation",
             "date_modification",
         ]
@@ -49,6 +63,15 @@ class RessourceSerializer(serializers.ModelSerializer):
             "date_creation",
             "date_modification",
         ]
+        extra_kwargs = {"fichier": {"write_only": True}}
+
+    def get_type(self, ressource):
+        return "lien" if ressource.url else "fichier"
+
+    def get_extension(self, ressource):
+        if not ressource.fichier:
+            return ""
+        return ressource.fichier.name.rsplit(".", 1)[-1].lower()
 
     def validate(self, attrs):
         # Lien vide = pas de lien (la contrainte en base exige NULL quand
@@ -439,47 +462,92 @@ class AssignationSerializer(serializers.ModelSerializer):
         return attrs
 
 
-# ─── Livrable ─────────────────────────────────────────────────────────────────
+# ─── Livrables (dépôts) ───────────────────────────────────────────────────────
+
+class FichierLivrableSerializer(serializers.ModelSerializer):
+    """
+    Élément d'un dépôt, en lecture. Le chemin du fichier sur le disque n'est
+    jamais exposé : un fichier se consulte ou se télécharge via les routes
+    « consulter » et « telecharger », qui vérifient les droits.
+    """
+
+    type = serializers.SerializerMethodField()
+    extension = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = FichierLivrable
+        fields = ["id", "livrable", "nom", "type", "extension", "url", "date_creation"]
+        read_only_fields = fields
+
+    def get_type(self, element):
+        return "lien" if element.url else "fichier"
+
 
 class LivrableSerializer(serializers.ModelSerializer):
+    """Un dépôt, en lecture (avec ses éléments et le retard calculé)."""
+
+    brief = serializers.IntegerField(source="assignation.brief_id", read_only=True)
+    deposant_nom = serializers.SerializerMethodField()
+    # Qui est visé par l'assignation (apprenant ou groupe)
+    cible = serializers.SerializerMethodField()
+    en_retard = serializers.BooleanField(read_only=True)
+    fichiers = FichierLivrableSerializer(many=True, read_only=True)
+
     class Meta:
         model = Livrable
         fields = [
             "id",
             "assignation",
+            "brief",
+            "cible",
+            "numero",
             "deposant",
-            "titre",
-            "description",
-            "statut",
+            "deposant_nom",
+            "commentaire",
             "date_depot",
-            "date_modification",
+            "en_retard",
+            "fichiers",
         ]
-        read_only_fields = [
-            "id",
-            "deposant",
-            "statut",
-            "date_depot",
-            "date_modification",
-        ]
+        read_only_fields = fields
+
+    def get_deposant_nom(self, livrable):
+        return f"{livrable.deposant.prenom} {livrable.deposant.nom}"
+
+    def get_cible(self, livrable):
+        a = livrable.assignation
+        if a.groupe_id:
+            return {"type": "groupe", "id": a.groupe_id, "nom": a.groupe.nom}
+        return {
+            "type": "apprenant",
+            "id": a.apprenant_id,
+            "nom": f"{a.apprenant.prenom} {a.apprenant.nom}",
+        }
+
+
+class DepotSerializer(serializers.Serializer):
+    """
+    Création d'un dépôt en une fois (multipart) :
+    assignation, commentaire (facultatif), fichiers[] et liens[].
+    Au moins un élément, au plus MAX_ELEMENTS_PAR_DEPOT.
+    """
+
+    assignation = serializers.PrimaryKeyRelatedField(
+        queryset=Assignation.objects.select_related("brief__promotion", "groupe", "apprenant"),
+    )
+    commentaire = serializers.CharField(required=False, allow_blank=True, default="")
+    fichiers = serializers.ListField(child=serializers.FileField(), required=False, default=list)
+    liens = serializers.ListField(child=serializers.URLField(), required=False, default=list)
 
     def validate(self, attrs):
         tenant_id = self.context["tenant_id"]
-        request = self.context["request"]
+        utilisateur = self.context["request"].user
+        assignation = attrs["assignation"]
+        brief = assignation.brief
 
-        assignation = attrs.get("assignation", getattr(self.instance, "assignation", None))
-
-        if assignation is None:
-            raise serializers.ValidationError({"assignation": "L'assignation est obligatoire."})
-
-        if str(assignation.brief.promotion.formation.tenant_id) != str(tenant_id):
+        if str(brief.promotion.formation.tenant_id) != str(tenant_id):
             raise serializers.ValidationError({
                 "assignation": "Cette assignation n'appartient pas à cet organisme."
             })
-
-        utilisateur = request.user
-
-        if not utilisateur.is_active:
-            raise serializers.ValidationError({"assignation": "Votre compte est inactif."})
 
         # L'apprenant visé, ou un membre actif du groupe visé (une assignation
         # peut cibler les deux à la fois).
@@ -489,94 +557,74 @@ class LivrableSerializer(serializers.ModelSerializer):
         )
         if not est_cible:
             raise serializers.ValidationError({
-                "assignation": "Vous ne pouvez pas déposer un livrable pour cette assignation."
+                "assignation": "Vous ne pouvez pas déposer pour cette assignation."
             })
 
-        if not assignation.brief.promotion.inscriptions.filter(
-            apprenant=utilisateur,
-            actif=True,
-        ).exists():
+        if not brief.promotion.inscriptions.filter(apprenant=utilisateur, actif=True).exists():
             raise serializers.ValidationError({
                 "assignation": "Vous n'êtes plus inscrit activement à cette promotion."
             })
 
-        if "titre" in attrs:
-            titre = attrs["titre"].strip()
-            if not titre:
-                raise serializers.ValidationError({"titre": "Le titre ne peut pas être vide."})
-            attrs["titre"] = titre
+        if not brief.promotion.actif:
+            raise serializers.ValidationError({
+                "assignation": "La promotion est clôturée : les dépôts sont fermés."
+            })
 
-        if self.instance is not None and not self.context.get("statut_update", False):
+        if brief.statut != Brief.Statut.PUBLIE:
+            raise serializers.ValidationError({
+                "assignation": "Ce brief n'est pas ouvert aux dépôts."
+            })
+
+        if timezone.now() < brief.date_debut:
+            debut = timezone.localtime(brief.date_debut).strftime("%d/%m/%Y à %H:%M")
+            raise serializers.ValidationError({
+                "assignation": f"Les dépôts ouvrent le {debut}."
+            })
+        # Après la date limite : accepté, le retard est calculé (en_retard).
+
+        fichiers, liens = attrs["fichiers"], attrs["liens"]
+        total = len(fichiers) + len(liens)
+        if total == 0:
+            raise serializers.ValidationError("Ajoutez au moins un fichier ou un lien.")
+        if total > MAX_ELEMENTS_PAR_DEPOT:
             raise serializers.ValidationError(
-                "Un livrable ne peut être modifié que par la mise à jour de son statut."
+                f"Un dépôt contient au plus {MAX_ELEMENTS_PAR_DEPOT} fichiers et liens."
             )
 
-        return attrs
-
-
-class LivrableStatutSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Livrable
-        fields = ["statut"]
-
-
-# ─── FichierLivrable ──────────────────────────────────────────────────────────
-
-class FichierLivrableSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = FichierLivrable
-        fields = [
-            "id",
-            "livrable",
-            "nom",
-            "fichier",
-            "url",
-            "date_creation",
-        ]
-        read_only_fields = [
-            "id",
-            "date_creation",
-        ]
-
-    def validate(self, attrs):
-        tenant_id = self.context["tenant_id"]
-        request = self.context["request"]
-
-        livrable = attrs.get("livrable", getattr(self.instance, "livrable", None))
-
-        if livrable is None:
-            raise serializers.ValidationError({"livrable": "Le livrable est obligatoire."})
-
-        if str(livrable.assignation.brief.promotion.formation.tenant_id) != str(tenant_id):
-            raise serializers.ValidationError({
-                "livrable": "Ce livrable n'appartient pas à cet organisme."
-            })
-
-        if livrable.deposant_id != request.user.id:
-            raise serializers.ValidationError({
-                "livrable": "Vous ne pouvez pas ajouter un fichier à ce livrable."
-            })
-
-        fichier = attrs.get("fichier", getattr(self.instance, "fichier", None))
-        url = attrs.get("url", getattr(self.instance, "url", None))
-
-        if bool(fichier) == bool(url):
-            raise serializers.ValidationError({
-                "fichier": "Renseignez soit un fichier, soit une URL.",
-                "url": "Renseignez soit une URL, soit un fichier.",
-            })
-
-        if "nom" in attrs:
-            nom = attrs["nom"].strip()
-            if not nom:
-                raise serializers.ValidationError({"nom": "Le nom ne peut pas être vide."})
-            attrs["nom"] = nom
-
-        # Nouveau fichier envoyé : taille (10 Mo) et contenu réel
-        if "fichier" in attrs and attrs["fichier"]:
+        erreurs_fichiers = []
+        for fichier in fichiers:
+            ext = fichier.name.rsplit(".", 1)[-1].lower() if "." in fichier.name else ""
             try:
-                valider_fichier(attrs["fichier"])
+                if ext not in EXTENSIONS_LIVRABLES:
+                    raise serializers.ValidationError(
+                        "Format non accepté (pdf, docx, pptx ou txt)."
+                    )
+                valider_fichier(fichier)
             except serializers.ValidationError as erreur:
-                raise serializers.ValidationError({"fichier": erreur.detail})
+                erreurs_fichiers.append(f"{fichier.name} : {erreur.detail[0]}")
+        if erreurs_fichiers:
+            raise serializers.ValidationError({"fichiers": erreurs_fichiers})
 
+        attrs["commentaire"] = attrs["commentaire"].strip()
         return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        assignation = validated_data["assignation"]
+        # Verrou sur l'assignation : deux dépôts simultanés n'obtiennent pas
+        # le même numéro.
+        Assignation.objects.select_for_update().get(pk=assignation.pk)
+        dernier = assignation.livrables.aggregate(m=Max("numero"))["m"] or 0
+
+        livrable = Livrable.objects.create(
+            assignation=assignation,
+            deposant=self.context["request"].user,
+            numero=dernier + 1,
+            commentaire=validated_data["commentaire"],
+        )
+        for fichier in validated_data["fichiers"]:
+            element = FichierLivrable.objects.create(livrable=livrable, nom=fichier.name[:255], fichier=fichier)
+            demander_apercu(element)
+        for url in validated_data["liens"]:
+            FichierLivrable.objects.create(livrable=livrable, nom=url[:255], url=url)
+        return livrable

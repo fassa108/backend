@@ -1,3 +1,6 @@
+import os
+import uuid
+
 from django.conf import settings
 from django.core.validators import FileExtensionValidator
 from django.db import models
@@ -17,8 +20,62 @@ EXTENSIONS_LIVRABLES = ["pdf", "pptx", "docx", "txt"]
 # Extensions autorisées pour les ressources
 EXTENSIONS_RESSOURCES = ["pdf", "pptx", "docx", "txt"]
 
+# Nombre maximal d'éléments (fichiers + liens) dans un dépôt
+MAX_ELEMENTS_PAR_DEPOT = 10
 
-class Ressource(models.Model):
+
+def _nom_aleatoire(nom_original):
+    """Nom de fichier sur disque : aléatoire, extension conservée (le vrai nom est en base)."""
+    ext = os.path.splitext(nom_original)[1].lower()
+    return f"{uuid.uuid4().hex}{ext}"
+
+
+def chemin_ressource(instance, nom_original):
+    return f"ressources/{instance.tenant_id}/{_nom_aleatoire(nom_original)}"
+
+
+def chemin_fichier_livrable(instance, nom_original):
+    brief = instance.livrable.assignation.brief
+    tenant_id = brief.promotion.formation.tenant_id
+    return f"livrables/{tenant_id}/{brief.id}/{_nom_aleatoire(nom_original)}"
+
+
+def chemin_apercu(instance, nom_original):
+    return f"apercus/{instance.tenant_id_fichier}/{_nom_aleatoire(nom_original)}"
+
+
+class StatutApercu(models.TextChoices):
+    """
+    Aperçu PDF d'un fichier Office (docx, pptx), produit par Gotenberg.
+    Vide : pas d'aperçu demandé (PDF, TXT, lien, ou conversion coupée).
+    """
+    EN_COURS = "EN_COURS", "En préparation"
+    PRET = "PRET", "Prêt"
+    ECHEC = "ECHEC", "Échec"
+
+
+class AvecApercu(models.Model):
+    """Champs communs aux modèles dont le fichier peut avoir un aperçu PDF."""
+
+    apercu = models.FileField(upload_to=chemin_apercu, blank=True, null=True)
+    apercu_statut = models.CharField(
+        max_length=10,
+        choices=StatutApercu.choices,
+        blank=True,
+        default="",
+    )
+
+    class Meta:
+        abstract = True
+
+    @property
+    def extension(self):
+        if not self.fichier:
+            return ""
+        return os.path.splitext(self.fichier.name)[1].lstrip(".").lower()
+
+
+class Ressource(AvecApercu):
     """
     Ressource de la bibliothèque de l'organisme (fichier ou lien).
 
@@ -51,7 +108,7 @@ class Ressource(models.Model):
     )
 
     fichier = models.FileField(
-        upload_to="ressources/",
+        upload_to=chemin_ressource,
         blank=True,
         null=True,
         validators=[
@@ -75,6 +132,14 @@ class Ressource(models.Model):
                 name="ressource_exactement_une_source",
             ),
         ]
+
+    @property
+    def tenant_id_fichier(self):
+        return self.tenant_id
+
+    @property
+    def nom_affiche(self):
+        return f"{self.titre}.{self.extension}" if self.extension else self.titre
 
     def __str__(self):
         return self.titre
@@ -260,10 +325,14 @@ class Assignation(models.Model):
 
 
 class Livrable(models.Model):
-    class Statut(models.TextChoices):
-        SOUMIS = "SOUMIS", "Soumis"
-        INVALIDE = "INVALIDE", "Invalide"
-        RETENU = "RETENU", "Retenu"
+    """
+    Un dépôt de l'apprenant sur une assignation (« Dépôt n°1, n°2… »).
+
+    Plusieurs dépôts par assignation ; un dépôt n'est ni modifié ni
+    supprimé (on en dépose un nouveau). Il contient un ou plusieurs
+    éléments (FichierLivrable : fichier ou lien). Le retard est calculé
+    (date_depot > date limite du brief), pas stocké.
+    """
 
     assignation = models.ForeignKey(
         Assignation,
@@ -275,29 +344,38 @@ class Livrable(models.Model):
         on_delete=models.PROTECT,
         related_name="livrables_deposes",
     )
-    titre = models.CharField(max_length=255)
-    description = models.TextField(blank=True)
-    statut = models.CharField(
-        max_length=20,
-        choices=Statut.choices,
-        default=Statut.SOUMIS,
-    )
+    # Numéro du dépôt dans l'assignation (1, 2, 3…)
+    numero = models.PositiveIntegerField()
+    commentaire = models.TextField(blank=True)
     date_depot = models.DateTimeField(auto_now_add=True)
-    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date_depot"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assignation", "numero"],
+                name="unique_numero_depot_par_assignation",
+            ),
+        ]
+
+    @property
+    def en_retard(self):
+        return self.date_depot > self.assignation.brief.date_limite
 
     def __str__(self):
-        return self.titre
+        return f"Dépôt n°{self.numero}"
 
 
-class FichierLivrable(models.Model):
+class FichierLivrable(AvecApercu):
     livrable = models.ForeignKey(
         Livrable,
         on_delete=models.CASCADE,
         related_name="fichiers",
     )
+    # Nom affiché : nom d'origine du fichier, ou l'adresse du lien
     nom = models.CharField(max_length=255)
     fichier = models.FileField(
-        upload_to="livrables/",
+        upload_to=chemin_fichier_livrable,
         blank=True,
         null=True,
         validators=[
@@ -331,6 +409,14 @@ class FichierLivrable(models.Model):
                 name="fichier_livrable_exactement_une_source",
             )
         ]
+
+    @property
+    def tenant_id_fichier(self):
+        return self.livrable.assignation.brief.promotion.formation.tenant_id
+
+    @property
+    def nom_affiche(self):
+        return self.nom
 
     def __str__(self):
         return self.nom

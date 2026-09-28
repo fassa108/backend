@@ -152,6 +152,13 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 
+# Fichiers déposés (ressources, livrables)
+# Rangés dans un dossier dédié, qui n'est JAMAIS servi publiquement :
+# pas de MEDIA_URL exposée, le téléchargement passe uniquement par l'API,
+# qui vérifie les droits (routes « telecharger »).
+MEDIA_ROOT = BASE_DIR / "media"
+
+
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
@@ -211,6 +218,13 @@ ANYMAIL = {
 }
 
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
+
+# Aperçu des fichiers Office (docx, pptx) : conversion en PDF par Gotenberg,
+# un conteneur isolé (sans accès réseau sortant) appelé par Celery au dépôt.
+# APERCU_OFFICE_ACTIF=0 coupe la conversion : ces fichiers restent
+# téléchargeables, sans aperçu.
+GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://gotenberg:3000")
+APERCU_OFFICE_ACTIF = os.getenv("APERCU_OFFICE_ACTIF", "1") == "1" and "test" not in sys.argv
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",

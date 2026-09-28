@@ -16,4 +16,5 @@ dependencies = [
     "nh3>=0.3.7",
     "psycopg2-binary>=2.9.13",
     "redis>=8.1.0",
+    "requests>=2.34.2",
 ]

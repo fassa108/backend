@@ -48,6 +48,7 @@ dependencies = [
     { name = "nh3" },
     { name = "psycopg2-binary" },
     { name = "redis" },
+    { name = "requests" },
 ]
 
 [package.metadata]
@@ -63,6 +64,7 @@ requires-dist = [
     { name = "nh3", specifier = ">=0.3.7" },
     { name = "psycopg2-binary", specifier = ">=2.9.13" },
     { name = "redis", specifier = ">=8.1.0" },
+    { name = "requests", specifier = ">=2.34.2" },
 ]
 
 [[package]]

@@ -13,18 +13,24 @@ Couvre :
   avec livrables (audit S12)
 - Livrables : dépôt par l'apprenant ou un membre actif du groupe (audit B5)
 - Fichiers : types acceptés / refusés
+- Consultation : PDF / TXT tels quels, aperçu PDF des fichiers Office
+  (Gotenberg simulé), mêmes droits que le téléchargement
 - Multi-tenant : isolation
 """
 
 import io
+import os
 import shutil
 import tempfile
 import zipfile
+from datetime import timedelta
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -140,6 +146,10 @@ class ActivitesBaseTestCase(APITestCase):
         return utilisateur
 
     def creer_brief(self, promotion=None, statut=Brief.Statut.PUBLIE, **extra):
+        # Dates relatives : brief ouvert depuis hier, à rendre dans une semaine
+        maintenant = timezone.now()
+        extra.setdefault("date_debut", maintenant - timedelta(days=1))
+        extra.setdefault("date_limite", maintenant + timedelta(days=7))
         return Brief.objects.create(
             promotion=promotion or self.promotion,
             module=self.module,
@@ -147,15 +157,16 @@ class ActivitesBaseTestCase(APITestCase):
             description="Description",
             modalites_evaluation="<p>Revue de code</p>",
             livrables_attendus="<p>Lien du dépôt</p>",
-            date_debut="2026-09-01T08:00:00Z",
-            date_limite="2026-09-30T18:00:00Z",
             statut=statut,
             **extra,
         )
 
     def deposer(self, assignation, apprenant=None):
+        """Dépôt créé directement en base (sans passer par l'API)."""
         return Livrable.objects.create(
-            assignation=assignation, deposant=apprenant or self.apprenant, titre="L",
+            assignation=assignation,
+            deposant=apprenant or self.apprenant,
+            numero=assignation.livrables.count() + 1,
         )
 
     def url(self, nom, pk=None):
@@ -753,15 +764,126 @@ class LivrableTests(ActivitesBaseTestCase):
         self.brief = self.creer_brief()
         self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
 
-    def deposer_api(self, assignation):
-        return self.client.post(self.url("livrable"),
-                                {"assignation": assignation.id, "titre": "Mon livrable"}, format="json")
+    def deposer_api(self, assignation, fichiers=(), liens=("https://github.com/x/y",), commentaire=""):
+        return self.client.post(self.url("livrable"), {
+            "assignation": assignation.id,
+            "commentaire": commentaire,
+            "fichiers": list(fichiers),
+            "liens": list(liens),
+        })
 
-    def test_apprenant_depose(self):
+    def test_apprenant_depose_fichier_et_lien(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.deposer_api(self.assignation, fichiers=[fichier_test("maquette.pdf")],
+                               commentaire="Première version")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.data["deposant"], self.apprenant.id)
+        self.assertEqual(res.data["numero"], 1)
+        self.assertEqual(res.data["commentaire"], "Première version")
+        self.assertFalse(res.data["en_retard"])
+        self.assertEqual(sorted(f["type"] for f in res.data["fichiers"]), ["fichier", "lien"])
+        # Le chemin sur le disque n'est jamais exposé
+        self.assertNotIn("fichier", res.data["fichiers"][0])
+        element = FichierLivrable.objects.get(livrable_id=res.data["id"], url__isnull=True)
+        self.assertEqual(element.nom, "maquette.pdf")
+        self.assertTrue(element.fichier.name.startswith(f"livrables/{self.tenant.id}/{self.brief.id}/"))
+        self.assertNotIn("maquette", element.fichier.name)
+
+    def test_numeros_successifs(self):
+        self.client.force_authenticate(user=self.apprenant)
+        self.deposer_api(self.assignation)
+        res = self.deposer_api(self.assignation)
+        self.assertEqual(res.data["numero"], 2)
+
+    def test_au_moins_un_element(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.deposer_api(self.assignation, liens=())
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_au_plus_10_elements(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.deposer_api(self.assignation, liens=[f"https://x.test/{i}" for i in range(11)])
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_un_fichier_refuse_annule_tout_le_depot(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.deposer_api(self.assignation, fichiers=[fichier_test("ok.pdf"), fichier_test("image.png")])
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("image.png", str(res.data["fichiers"]))
+        self.assertFalse(Livrable.objects.exists())
+
+    def test_types_et_contenus(self):
+        self.client.force_authenticate(user=self.apprenant)
+        for nom in ("doc.pdf", "slides.pptx", "rapport.docx", "notes.txt"):
+            self.assertEqual(self.deposer_api(self.assignation, fichiers=[fichier_test(nom)]).status_code,
+                             status.HTTP_201_CREATED, nom)
+        faux = {
+            "faux.pdf": b"MZ\x90\x00 executable",
+            "slides.docx": CONTENU_VALIDE["pptx"],
+            "binaire.txt": b"texte\x00\x01 binaire",
+            "image.png": b"png",
+        }
+        for nom, contenu in faux.items():
+            res = self.deposer_api(self.assignation, fichiers=[fichier_test(nom, contenu)])
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST, nom)
+
+    def test_taille_maximale_10_mo(self):
+        self.client.force_authenticate(user=self.apprenant)
+        gros = fichier_test("gros.pdf", CONTENU_VALIDE["pdf"] + b"x" * (10 * 1024 * 1024))
+        res = self.deposer_api(self.assignation, fichiers=[gros])
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("10 Mo", str(res.data["fichiers"]))
+
+    def test_refuse_avant_la_date_de_debut(self):
+        self.brief.date_debut = timezone.now() + timedelta(days=1)
+        self.brief.date_limite = timezone.now() + timedelta(days=5)
+        self.brief.save()
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.deposer_api(self.assignation)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("ouvrent le", str(res.data["assignation"]))
+
+    def test_accepte_apres_la_date_limite_marque_en_retard(self):
+        self.brief.date_debut = timezone.now() - timedelta(days=5)
+        self.brief.date_limite = timezone.now() - timedelta(days=1)
+        self.brief.save()
         self.client.force_authenticate(user=self.apprenant)
         res = self.deposer_api(self.assignation)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(res.data["deposant"], self.apprenant.id)
+        self.assertTrue(res.data["en_retard"])
+
+    def test_refuse_sur_brief_archive_brouillon_ou_promotion_cloturee(self):
+        self.client.force_authenticate(user=self.apprenant)
+        for statut in (Brief.Statut.ARCHIVE, Brief.Statut.BROUILLON):
+            self.brief.statut = statut
+            self.brief.save()
+            self.assertEqual(self.deposer_api(self.assignation).status_code, status.HTTP_400_BAD_REQUEST, statut)
+        self.brief.statut = Brief.Statut.PUBLIE
+        self.brief.save()
+        self.promotion.actif = False
+        self.promotion.save()
+        self.assertEqual(self.deposer_api(self.assignation).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_ni_modification_ni_suppression(self):
+        livrable = self.deposer(self.assignation)
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.patch(self.url("livrable", livrable.id), {"commentaire": "x"}).status_code,
+                         status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(self.client.delete(self.url("livrable", livrable.id)).status_code,
+                         status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_membre_d_un_groupe_depose_pour_le_groupe(self):
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe B")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant)
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b)
+        assignation = Assignation.objects.create(brief=self.creer_brief(), groupe=groupe)
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.deposer_api(assignation)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["cible"], {"type": "groupe", "id": groupe.id, "nom": "Groupe B"})
+        # L'autre membre voit le dépôt du groupe
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertIn(res.data["id"], self.ids(self.client.get(self.url("livrable"))))
 
     def test_apprenant_ne_depose_pas_pour_un_autre(self):
         self.client.force_authenticate(user=self.apprenant_b)
@@ -785,90 +907,376 @@ class LivrableTests(ActivitesBaseTestCase):
     def test_formateur_ne_depose_pas(self):
         self.assertEqual(self.deposer_api(self.assignation).status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_apprenant_ne_voit_pas_les_livrables_des_autres(self):
-        # Audit S1
-        self.deposer(self.assignation)
-        self.client.force_authenticate(user=self.apprenant_b)
-        self.assertEqual(self.client.get(self.url("livrable")).data, [])
-        self.client.force_authenticate(user=self.apprenant_hors_promo)
-        self.assertEqual(self.client.get(self.url("livrable")).data, [])
-
-    def test_apprenant_voit_ses_livrables(self):
-        livrable = self.deposer(self.assignation)
-        self.client.force_authenticate(user=self.apprenant)
-        self.assertEqual(self.ids(self.client.get(self.url("livrable"))), [livrable.id])
-
-    def test_formateur_non_affecte_ne_voit_pas(self):
-        self.deposer(self.assignation)
-        self.client.force_authenticate(user=self.formateur_2)
-        self.assertEqual(self.client.get(self.url("livrable")).data, [])
-
-    def test_suppression_interdite(self):
-        livrable = self.deposer(self.assignation)
-        self.client.force_authenticate(user=self.apprenant)
-        res = self.client.delete(self.url("livrable", livrable.id))
-        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
-
     def test_admin_saas_exclu(self):
         self.client.force_authenticate(user=self.admin_saas)
         self.assertEqual(self.client.get(self.url("livrable")).status_code, status.HTTP_403_FORBIDDEN)
 
 
-class FichierLivrableTests(ActivitesBaseTestCase):
+class VisibiliteLivrableTests(ActivitesBaseTestCase):
+    """Audit S1 et travaux des pairs (visibles après son propre dépôt)."""
+
     def setUp(self):
         super().setUp()
-        assignation = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant)
-        self.livrable = self.deposer(assignation)
-        self.client.force_authenticate(user=self.apprenant)
+        self.brief = self.creer_brief()
+        self.a_apprenant = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        self.a_b = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        self.v1_b = self.deposer(self.a_b, self.apprenant_b)
+        self.v2_b = self.deposer(self.a_b, self.apprenant_b)
 
-    def envoyer(self, nom, contenu=None):
-        return self.client.post(self.url("fichier-livrable"),
-                                {"livrable": self.livrable.id, "nom": nom, "fichier": fichier_test(nom, contenu)})
+    def liste(self, utilisateur, params=""):
+        self.client.force_authenticate(user=utilisateur)
+        return self.ids(self.client.get(self.url("livrable") + params))
 
-    def test_types_acceptes(self):
-        for nom in ("doc.pdf", "slides.pptx", "rapport.docx", "notes.txt"):
-            self.assertEqual(self.envoyer(nom).status_code, status.HTTP_201_CREATED, nom)
+    def test_sans_depot_ne_voit_pas_les_pairs(self):
+        self.assertEqual(self.liste(self.apprenant), [])
+        self.assertEqual(self.liste(self.apprenant_hors_promo), [])
 
-    def test_types_refuses(self):
-        for nom in ("image.png", "photo.jpg", "video.mp4", "archive.zip"):
-            self.assertEqual(self.envoyer(nom).status_code, status.HTTP_400_BAD_REQUEST, nom)
+    def test_apres_son_depot_voit_le_dernier_depot_des_pairs(self):
+        mien = self.deposer(self.a_apprenant)
+        self.assertEqual(self.liste(self.apprenant), sorted([mien.id, self.v2_b.id]))
 
-    def test_url_seule_acceptee(self):
-        res = self.client.post(self.url("fichier-livrable"),
-                               {"livrable": self.livrable.id, "nom": "Dépôt", "url": "https://github.com/x/y"})
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+    def test_voit_tous_ses_depots(self):
+        self.assertEqual(self.liste(self.apprenant_b), sorted([self.v1_b.id, self.v2_b.id]))
 
-    def test_url_et_fichier_refuses(self):
-        fichier = fichier_test("doc.pdf")
-        res = self.client.post(self.url("fichier-livrable"), {
-            "livrable": self.livrable.id, "nom": "X", "fichier": fichier, "url": "https://x.test",
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_pairs_d_un_autre_brief_invisibles(self):
+        autre = self.creer_brief()
+        a_autre = Assignation.objects.create(brief=autre, apprenant=self.apprenant_b)
+        pair_autre_brief = self.deposer(a_autre, self.apprenant_b)
+        self.deposer(self.a_apprenant)
+        self.assertNotIn(pair_autre_brief.id, self.liste(self.apprenant))
 
-    def test_taille_maximale_10_mo(self):
-        base = CONTENU_VALIDE["pdf"]
-        self.assertEqual(self.envoyer("moyen.pdf", base + b"x" * (6 * 1024 * 1024)).status_code,
-                         status.HTTP_201_CREATED)
-        self.assertEqual(self.envoyer("gros.pdf", base + b"x" * (10 * 1024 * 1024)).status_code,
-                         status.HTTP_400_BAD_REQUEST)
+    def test_formateurs_et_admin(self):
+        self.assertEqual(self.liste(self.formateur), sorted([self.v1_b.id, self.v2_b.id]))
+        self.assertEqual(self.liste(self.admin), sorted([self.v1_b.id, self.v2_b.id]))
+        self.assertEqual(self.liste(self.formateur_2), [])
 
-    def test_contenu_ne_correspondant_pas_a_l_extension(self):
-        cas = {
-            "faux.pdf": b"MZ\x90\x00 executable",           # binaire renommé en pdf
-            "faux.docx": _zip(["autre/fichier.txt"]),         # zip qui n'est pas un document Word
-            "slides.docx": CONTENU_VALIDE["pptx"],            # PowerPoint renommé en docx
-            "faux.pptx": b"pas une archive",
-            "binaire.txt": b"texte\x00\x01\x02 binaire",
-        }
-        for nom, contenu in cas.items():
-            res = self.envoyer(nom, contenu)
-            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST, nom)
-            self.assertIn("ne correspond pas", str(res.data["fichier"]), nom)
+    def test_filtres(self):
+        mien = self.deposer(self.a_apprenant)
+        self.assertEqual(self.liste(self.formateur, f"?assignation={self.a_apprenant.id}"), [mien.id])
+        self.assertEqual(len(self.liste(self.formateur, f"?brief={self.brief.id}")), 3)
 
-    def test_autre_apprenant_ne_voit_pas_les_fichiers(self):
-        FichierLivrable.objects.create(livrable=self.livrable, nom="Lien", url="https://x.test")
+
+class FichierLivrableTests(ActivitesBaseTestCase):
+    """Éléments des dépôts : lecture seule, téléchargement contrôlé."""
+
+    def setUp(self):
+        super().setUp()
+        brief = self.creer_brief()
+        self.a_apprenant = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.a_b = Assignation.objects.create(brief=brief, apprenant=self.apprenant_b)
         self.client.force_authenticate(user=self.apprenant_b)
-        self.assertEqual(self.client.get(self.url("fichier-livrable")).data, [])
+        res = self.client.post(self.url("livrable"), {
+            "assignation": self.a_b.id,
+            "fichiers": [fichier_test("rapport.pdf")],
+            "liens": ["https://github.com/x/y"],
+        })
+        self.depot_b = Livrable.objects.get(pk=res.data["id"])
+        self.fichier_b = self.depot_b.fichiers.get(url__isnull=True)
+        self.lien_b = self.depot_b.fichiers.get(url__isnull=False)
+
+    def telecharger(self, utilisateur, element):
+        self.client.force_authenticate(user=utilisateur)
+        return self.client.get(f"{self.url('fichier-livrable', element.id)}telecharger/")
+
+    def test_deposant_telecharge_son_fichier(self):
+        res = self.telecharger(self.apprenant_b, self.fichier_b)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(b"".join(res.streaming_content), CONTENU_VALIDE["pdf"])
+        self.assertIn('attachment; filename="rapport.pdf"', res["Content-Disposition"])
+        self.assertEqual(res["X-Content-Type-Options"], "nosniff")
+
+    def test_pair_telecharge_seulement_apres_son_propre_depot(self):
+        self.assertEqual(self.telecharger(self.apprenant, self.fichier_b).status_code, status.HTTP_404_NOT_FOUND)
+        self.deposer(self.a_apprenant)
+        self.assertEqual(self.telecharger(self.apprenant, self.fichier_b).status_code, status.HTTP_200_OK)
+
+    def test_hors_promotion_et_formateur_non_affecte(self):
+        self.assertEqual(self.telecharger(self.apprenant_hors_promo, self.fichier_b).status_code,
+                         status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.telecharger(self.formateur_2, self.fichier_b).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.telecharger(self.formateur, self.fichier_b).status_code, status.HTTP_200_OK)
+
+    def test_un_lien_ne_se_telecharge_pas(self):
+        self.assertEqual(self.telecharger(self.apprenant_b, self.lien_b).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_elements_en_lecture_seule(self):
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.client.post(self.url("fichier-livrable"),
+                               {"livrable": self.depot_b.id, "nom": "X", "url": "https://x.test"})
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
+# ─── Consultation et aperçus ──────────────────────────────────────────────────
+
+class ReponseGotenberg:
+    def __init__(self, status_code=200, content=b"%PDF-1.7\n% apercu\n"):
+        self.status_code = status_code
+        self.content = content
+
+
+@override_settings(APERCU_OFFICE_ACTIF=True)
+@patch("activites.tasks.generer_apercu.delay")
+class ConsultationTests(ActivitesBaseTestCase):
+    """
+    Consultation dans la plateforme : PDF et TXT tels quels, fichiers Office
+    via un aperçu PDF produit par Gotenberg (appel simulé).
+    """
+
+    def setUp(self):
+        super().setUp()
+        brief = self.creer_brief()
+        self.a_apprenant = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.a_b = Assignation.objects.create(brief=brief, apprenant=self.apprenant_b)
+
+    def deposer_fichier(self, fichier, apprenant=None, assignation=None):
+        self.client.force_authenticate(user=apprenant or self.apprenant_b)
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(self.url("livrable"), {
+                "assignation": (assignation or self.a_b).id, "fichiers": [fichier],
+            })
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        return FichierLivrable.objects.get(livrable_id=res.data["id"])
+
+    def consulter(self, element, utilisateur=None):
+        self.client.force_authenticate(user=utilisateur or self.apprenant_b)
+        return self.client.get(f"{self.url('fichier-livrable', element.id)}consulter/")
+
+    def generer(self, element, reponse=None, retries=0):
+        from .tasks import generer_apercu
+        with patch("activites.tasks.requests.post", return_value=reponse or ReponseGotenberg()) as post:
+            generer_apercu.apply(args=["activites.fichierlivrable", element.id], retries=retries)
+        element.refresh_from_db()
+        return post
+
+    def test_pdf_affiche_tel_quel(self, delay):
+        element = self.deposer_fichier(fichier_test("rapport.pdf"))
+        res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res["Content-Type"], "application/pdf")
+        self.assertIn("inline", res["Content-Disposition"])
+        self.assertEqual(b"".join(res.streaming_content), CONTENU_VALIDE["pdf"])
+        self.assertEqual(element.apercu_statut, "")
+        delay.assert_not_called()
+
+    def test_txt_renvoye_en_utf8(self, delay):
+        element = self.deposer_fichier(fichier_test("notes.txt", "Élève à l'œuvre".encode("cp1252")))
+        res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(res.content.decode("utf-8"), "Élève à l'œuvre")
+
+    def test_un_lien_ne_se_consulte_pas(self, delay):
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.client.post(self.url("livrable"), {"assignation": self.a_b.id, "liens": ["https://x.test"]})
+        lien = FichierLivrable.objects.get(livrable_id=res.data["id"])
+        self.assertEqual(self.consulter(lien).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_office_converti_au_depot(self, delay):
+        element = self.deposer_fichier(fichier_test("slides.pptx"))
+        self.assertEqual(element.apercu_statut, "EN_COURS")
+        delay.assert_called_once_with("activites.fichierlivrable", element.id)
+
+        # Pas encore prêt : 202
+        res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(res.data["apercu"], "EN_COURS")
+
+        post = self.generer(element)
+        self.assertEqual(post.call_args.args[0], "http://gotenberg:3000/forms/libreoffice/convert")
+        self.assertEqual(post.call_args.kwargs["data"], {"metadata": '{"Title": "slides.pptx"}'})
+        self.assertEqual(element.apercu_statut, "PRET")
+        self.assertTrue(element.apercu.name.startswith(f"apercus/{self.tenant.id}/"))
+
+        res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res["Content-Type"], "application/pdf")
+        self.assertIn('inline; filename="slides.pptx.pdf"', res["Content-Disposition"])
+        self.assertTrue(b"".join(res.streaming_content).startswith(b"%PDF-"))
+
+        # L'original reste téléchargeable
+        res = self.client.get(f"{self.url('fichier-livrable', element.id)}telecharger/")
+        self.assertEqual(b"".join(res.streaming_content), CONTENU_VALIDE["pptx"])
+
+    def test_conversion_refusee_par_gotenberg(self, delay):
+        element = self.deposer_fichier(fichier_test("rapport.docx"))
+        self.generer(element, ReponseGotenberg(status_code=500, content=b"erreur"))
+        self.assertEqual(element.apercu_statut, "ECHEC")
+        res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(res.data["apercu"], "ECHEC")
+
+    def test_reponse_qui_n_est_pas_un_pdf(self, delay):
+        element = self.deposer_fichier(fichier_test("rapport.docx"))
+        self.generer(element, ReponseGotenberg(content=b"<html>pas un pdf</html>"))
+        self.assertEqual(element.apercu_statut, "ECHEC")
+        self.assertFalse(element.apercu)
+
+    def test_gotenberg_injoignable_echec_apres_les_nouvelles_tentatives(self, delay):
+        import requests
+        from .tasks import generer_apercu
+        element = self.deposer_fichier(fichier_test("rapport.docx"))
+        with patch("activites.tasks.requests.post", side_effect=requests.ConnectionError("injoignable")):
+            generer_apercu.apply(args=["activites.fichierlivrable", element.id], retries=3)
+        element.refresh_from_db()
+        self.assertEqual(element.apercu_statut, "ECHEC")
+
+    def test_fichier_depose_avant_les_apercus_converti_a_la_demande(self, delay):
+        with override_settings(APERCU_OFFICE_ACTIF=False):
+            element = self.deposer_fichier(fichier_test("slides.pptx"))
+            self.assertEqual(element.apercu_statut, "")
+            # Conversion coupée : aperçu indisponible, rien n'est lancé
+            res = self.consulter(element)
+            self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+            self.assertEqual(res.data["apercu"], "INDISPONIBLE")
+        delay.assert_not_called()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.consulter(element)
+        self.assertEqual(res.status_code, status.HTTP_202_ACCEPTED)
+        delay.assert_called_once_with("activites.fichierlivrable", element.id)
+
+    def test_memes_droits_que_le_telechargement(self, delay):
+        element = self.deposer_fichier(fichier_test("rapport.pdf"))
+        # Pair : seulement après son propre dépôt
+        self.assertEqual(self.consulter(element, self.apprenant).status_code, status.HTTP_404_NOT_FOUND)
+        self.deposer(self.a_apprenant)
+        self.assertEqual(self.consulter(element, self.apprenant).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.consulter(element, self.formateur_2).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.consulter(element, self.formateur).status_code, status.HTTP_200_OK)
+
+    def test_extension_exposee(self, delay):
+        element = self.deposer_fichier(fichier_test("slides.pptx"))
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.client.get(self.url("fichier-livrable", element.id))
+        self.assertEqual(res.data["extension"], "pptx")
+
+
+@override_settings(APERCU_OFFICE_ACTIF=True)
+@patch("activites.tasks.generer_apercu.delay")
+class ConsultationRessourceTests(ActivitesBaseTestCase):
+    def creer(self, fichier):
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.post(self.url("ressource"), {"titre": "Support", "fichier": fichier})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        return Ressource.objects.get(pk=res.data["id"])
+
+    def test_ressource_office_convertie_puis_consultee(self, delay):
+        from .tasks import generer_apercu
+        ressource = self.creer(fichier_test("cours.pptx"))
+        self.assertEqual(ressource.apercu_statut, "EN_COURS")
+        delay.assert_called_once_with("activites.ressource", ressource.id)
+
+        with patch("activites.tasks.requests.post", return_value=ReponseGotenberg()):
+            generer_apercu.apply(args=["activites.ressource", ressource.id])
+        res = self.client.get(f"{self.url('ressource', ressource.id)}consulter/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIn('inline; filename="Support.pptx.pdf"', res["Content-Disposition"])
+
+        # Apprenant : seulement si la ressource est jointe à l'un de ses briefs
+        self.client.force_authenticate(user=self.apprenant)
+        url = f"{self.url('ressource', ressource.id)}consulter/"
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.creer_brief().ressources.add(ressource)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+
+    def test_remplacement_et_suppression_nettoient_le_disque(self, delay):
+        from .tasks import generer_apercu
+        ressource = self.creer(fichier_test("cours.docx"))
+        with patch("activites.tasks.requests.post", return_value=ReponseGotenberg()):
+            generer_apercu.apply(args=["activites.ressource", ressource.id])
+        ressource.refresh_from_db()
+        ancien, ancien_apercu = ressource.fichier.path, ressource.apercu.path
+
+        # Nouveau fichier : l'ancien et son aperçu disparaissent, nouvel aperçu demandé
+        with self.captureOnCommitCallbacks(execute=True):
+            res = self.client.patch(self.url("ressource", ressource.id), {"fichier": fichier_test("cours2.pptx")})
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        ressource.refresh_from_db()
+        self.assertFalse(os.path.exists(ancien))
+        self.assertFalse(os.path.exists(ancien_apercu))
+        self.assertFalse(ressource.apercu)
+        self.assertEqual(ressource.apercu_statut, "EN_COURS")
+
+        # Passage à un lien : plus de fichier ni d'aperçu
+        fichier = ressource.fichier.path
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(self.url("ressource", ressource.id), {"url": "https://x.test", "fichier": None}, format="json")
+        ressource.refresh_from_db()
+        self.assertFalse(os.path.exists(fichier))
+        self.assertEqual(ressource.apercu_statut, "")
+
+        # Suppression : fichier effacé du disque
+        ressource = self.creer(fichier_test("support.pdf"))
+        fichier = ressource.fichier.path
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.delete(self.url("ressource", ressource.id))
+        self.assertFalse(os.path.exists(fichier))
+
+
+# ─── Emails ───────────────────────────────────────────────────────────────────
+
+@patch("activites.notifications.envoyer_email_soumission.delay")
+@patch("activites.notifications.envoyer_email_assignation.delay")
+class NotificationTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe A")
+        GroupeMembre.objects.create(groupe=self.groupe, apprenant=self.apprenant)
+        GroupeMembre.objects.create(groupe=self.groupe, apprenant=self.apprenant_b)
+
+    def assigner(self, brief, **cible):
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(self.url("assignation"), {"brief": brief.id, **cible}, format="json")
+
+    def test_assignation_d_un_brief_publie(self, email_assignation, _soumission):
+        brief = self.creer_brief()
+        self.assigner(brief, groupe=self.groupe.id)
+        email_assignation.assert_called_once()
+        self.assertEqual(email_assignation.call_args.args[0], sorted([self.apprenant.email, self.apprenant_b.email]))
+        self.assertEqual(email_assignation.call_args.args[1], brief.titre)
+
+    def test_brouillon_puis_publication(self, email_assignation, _soumission):
+        brief = self.creer_brief(statut=Brief.Statut.BROUILLON)
+        self.assigner(brief, apprenant=self.apprenant.id)
+        email_assignation.assert_not_called()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(self.url("brief", brief.id), {"statut": "PUBLIE"}, format="json")
+        email_assignation.assert_called_once()
+        self.assertEqual(email_assignation.call_args.args[0], [self.apprenant.email])
+
+    def test_republication_d_un_archive_sans_email(self, email_assignation, _soumission):
+        brief = self.creer_brief(statut=Brief.Statut.ARCHIVE)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.patch(self.url("brief", brief.id), {"statut": "PUBLIE"}, format="json")
+        email_assignation.assert_not_called()
+
+    def test_assignation_multiple_un_seul_envoi(self, email_assignation, _soumission):
+        brief = self.creer_brief()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(f"{self.url('assignation')}multiple/", {
+                "brief": brief.id, "apprenants": [self.apprenant.id, self.apprenant_b.id],
+            }, format="json")
+        email_assignation.assert_called_once()
+        self.assertEqual(len(email_assignation.call_args.args[0]), 2)
+
+    def test_depot_previent_les_formateurs(self, _assignation, email_soumission):
+        FormateurPromotion.objects.create(formateur=self.formateur_2, promotion=self.promotion)
+        assignation = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant)
+        self.client.force_authenticate(user=self.apprenant)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self.url("livrable"), {"assignation": assignation.id, "liens": ["https://x.test"]})
+        email_soumission.assert_called_once()
+        args = email_soumission.call_args.args
+        self.assertCountEqual(args[0], [self.formateur.email, self.formateur_2.email])
+        self.assertEqual(args[4], 1)      # numéro du dépôt
+        self.assertFalse(args[6])         # pas en retard
+
+    def test_depot_refuse_sans_email(self, _assignation, email_soumission):
+        assignation = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant)
+        self.client.force_authenticate(user=self.apprenant)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self.url("livrable"), {"assignation": assignation.id})
+        email_soumission.assert_not_called()
 
 
 # ─── Protections côté pédagogie ───────────────────────────────────────────────

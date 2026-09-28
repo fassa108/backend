@@ -38,9 +38,9 @@ class AssignationAdmin(admin.ModelAdmin):
 
 @admin.register(Livrable)
 class LivrableAdmin(admin.ModelAdmin):
-    list_display = ("titre", "deposant", "statut", "date_depot")
-    list_filter = ("statut",)
-    search_fields = ("titre", "deposant__nom", "deposant__email")
+    list_display = ("__str__", "assignation", "deposant", "date_depot")
+    list_filter = ("assignation__brief__promotion__formation__tenant",)
+    search_fields = ("deposant__nom", "deposant__email", "assignation__brief__titre")
 
 
 @admin.register(FichierLivrable)
