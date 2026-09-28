@@ -862,7 +862,7 @@ class ReglesPedagogieBaseTestCase(PedagogieBaseTestCase):
     def deposer_livrable(self, apprenant, promotion):
         now = timezone.now()
         brief = Brief.objects.create(
-            promotion=promotion, titre="B", description="d", consignes="c",
+            promotion=promotion, module=self.m1, titre="B", description="d", consignes="c",
             date_debut=now, date_limite=now + timedelta(days=1),
         )
         assignation = Assignation.objects.create(brief=brief, apprenant=apprenant)
