@@ -10,6 +10,8 @@ wheels/
 .venv/
 .env
 
-# Fichiers uploadés (livrables, ressources)
+# Fichiers déposés (MEDIA_ROOT) : jamais versionnés
+media/
+# Anciens emplacements, avant MEDIA_ROOT
 livrables/
 ressources/
