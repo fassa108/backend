@@ -4,9 +4,9 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     AssignationViewSet,
     BriefViewSet,
+    CategorieBriefViewSet,
     FichierLivrableViewSet,
     LivrableViewSet,
-    RessourceBriefViewSet,
     RessourceViewSet,
 )
 
@@ -14,11 +14,7 @@ router = DefaultRouter()
 
 router.register("ressources", RessourceViewSet, basename="ressource")
 router.register("briefs", BriefViewSet, basename="brief")
-router.register(
-    "ressources-briefs",
-    RessourceBriefViewSet,
-    basename="ressource-brief",
-)
+router.register("categories-briefs", CategorieBriefViewSet, basename="categorie-brief")
 router.register(
     "assignations",
     AssignationViewSet,

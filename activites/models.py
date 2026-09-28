@@ -4,9 +4,10 @@ from django.db import models
 from django.db.models import Q
 
 from pedagogie.models import (
-    Competence,
+    CompetenceNiveau,
     Groupe,
     InscriptionPromotion,
+    Module,
     Promotion,
 )
 
@@ -19,10 +20,11 @@ EXTENSIONS_RESSOURCES = ["pdf", "pptx", "docx", "txt"]
 
 class Ressource(models.Model):
     """
-    Ressource pédagogique indépendante d'un Brief.
+    Ressource de la bibliothèque de l'organisme (fichier ou lien).
 
-    Une ressource appartient à un tenant et est créée par un formateur
-    ou un administrateur. Elle n'est pas rattachée à un Brief.
+    Créée par un formateur ou un administrateur ; on la joint ensuite à
+    un ou plusieurs briefs. Seuls son créateur et l'admin d'organisme la
+    modifient ou la suppriment.
 
     Contient soit une URL, soit un fichier — jamais les deux.
     """
@@ -78,11 +80,48 @@ class Ressource(models.Model):
         return self.titre
 
 
+class CategorieBrief(models.Model):
+    """
+    Catégorie d'activité propre à chaque organisme (ex. : Brief projet, TP,
+    Atelier, Veille). Sert uniquement à classer : les règles du brief sont
+    les mêmes quelle que soit la catégorie.
+    """
+
+    tenant = models.ForeignKey(
+        "tenants.Tenant",
+        on_delete=models.CASCADE,
+        related_name="categories_briefs",
+    )
+    nom = models.CharField(max_length=100)
+    actif = models.BooleanField(default=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tenant", "nom"],
+                name="unique_categorie_brief_par_tenant",
+            ),
+        ]
+        ordering = ["nom"]
+
+    def __str__(self):
+        return self.nom
+
+
 class Brief(models.Model):
+    """
+    Activité proposée à une promotion.
+
+    Le brief appartient à la promotion (et non au formateur) : s'il est
+    retiré de la promotion, ses briefs restent gérés par les autres
+    formateurs. « cree_par » garde la trace de l'auteur.
+    """
+
     class Statut(models.TextChoices):
         BROUILLON = "BROUILLON", "Brouillon"
         PUBLIE = "PUBLIE", "Publié"
-        TERMINE = "TERMINE", "Terminé"
         ARCHIVE = "ARCHIVE", "Archivé"
 
     promotion = models.ForeignKey(
@@ -90,9 +129,41 @@ class Brief(models.Model):
         on_delete=models.CASCADE,
         related_name="briefs",
     )
+    # Module principal du brief (obligatoire). RESTRICT : un module utilisé
+    # ne peut pas être supprimé seul, mais la suppression en cascade de toute
+    # la formation (qui supprime aussi ses briefs) reste possible.
+    module = models.ForeignKey(
+        Module,
+        on_delete=models.RESTRICT,
+        related_name="briefs",
+    )
+    cree_par = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="briefs_crees",
+    )
+    # Catégorie facultative (classement). RESTRICT : une catégorie utilisée
+    # ne se supprime pas seule (on la désactive).
+    categorie = models.ForeignKey(
+        CategorieBrief,
+        on_delete=models.RESTRICT,
+        null=True,
+        blank=True,
+        related_name="briefs",
+    )
     titre = models.CharField(max_length=255)
+    # Résumé court en texte simple (listes, cartes)
     description = models.TextField()
-    consignes = models.TextField()
+
+    # Sections en texte riche (HTML nettoyé, voir texte_riche.py).
+    # Obligatoires : modalites_evaluation et livrables_attendus.
+    contexte = models.TextField(blank=True)
+    modalites_pedagogiques = models.TextField(blank=True)
+    modalites_evaluation = models.TextField(blank=True)
+    criteres_performance = models.TextField(blank=True)
+    livrables_attendus = models.TextField(blank=True)
 
     date_debut = models.DateTimeField()
     date_limite = models.DateTimeField()
@@ -103,8 +174,17 @@ class Brief(models.Model):
         default=Statut.BROUILLON,
     )
 
-    competences = models.ManyToManyField(
-        Competence,
+    # Compétences visées, chacune à un niveau (peuvent venir d'autres
+    # modules de la formation que le module principal)
+    competence_niveaux = models.ManyToManyField(
+        CompetenceNiveau,
+        related_name="briefs",
+        blank=True,
+    )
+
+    # Ressources de la bibliothèque de l'organisme jointes au brief
+    ressources = models.ManyToManyField(
+        "Ressource",
         related_name="briefs",
         blank=True,
     )
@@ -118,53 +198,6 @@ class Brief(models.Model):
             models.CheckConstraint(
                 condition=Q(date_limite__gte=models.F("date_debut")),
                 name="brief_date_limite_gte_date_debut",
-            ),
-        ]
-
-    def __str__(self):
-        return self.titre
-
-
-class RessourceBrief(models.Model):
-    """
-    DÉPRÉCIÉ — conservé pour la migration des données existantes.
-    Sera supprimé dans une migration ultérieure après migration des données.
-    Utiliser Ressource à la place.
-    """
-
-    brief = models.ForeignKey(
-        Brief,
-        on_delete=models.CASCADE,
-        related_name="ressources",
-    )
-    titre = models.CharField(max_length=255)
-
-    url = models.URLField(
-        blank=True,
-        null=True,
-    )
-
-    fichier = models.FileField(
-        upload_to="briefs/ressources/",
-        blank=True,
-        null=True,
-        validators=[
-            FileExtensionValidator(
-                allowed_extensions=["pdf", "txt"]
-            )
-        ],
-    )
-
-    date_creation = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        constraints = [
-            models.CheckConstraint(
-                condition=(
-                    Q(url__isnull=False, url__gt="", fichier="")
-                    | Q(url__isnull=True, fichier__gt="")
-                ),
-                name="ressource_brief_exactement_une_source",
             ),
         ]
 

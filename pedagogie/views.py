@@ -484,8 +484,8 @@ class ModuleViewSet(ReferentielViewSet):
 
     def perform_destroy(self, instance):
         _refuser_suppression_si(
-            instance.competences.exists(),
-            "Ce module a des compétences.",
+            instance.competences.exists() or instance.briefs.exists(),
+            "Ce module a des compétences ou est utilisé par des briefs.",
         )
         instance.delete()
 
@@ -512,8 +512,8 @@ class CompetenceViewSet(ReferentielViewSet):
 
     def perform_destroy(self, instance):
         _refuser_suppression_si(
-            instance.niveaux.exists() or instance.briefs.exists(),
-            "Cette compétence est décrite par niveau ou utilisée dans des briefs.",
+            instance.niveaux.exists(),
+            "Cette compétence est décrite par niveau.",
         )
         instance.delete()
 
@@ -569,6 +569,16 @@ class CompetenceNiveauViewSet(ReferentielViewSet):
         if visibles is not None:
             qs = qs.filter(competence__module__formation_id__in=visibles)
         return qs
+
+    def perform_destroy(self, instance):
+        # Suppression directe (pas de désactivation) : refusée si un brief
+        # vise ce niveau de la compétence.
+        if instance.briefs.exists():
+            raise PermissionDenied(
+                "Ce niveau de la compétence est visé par des briefs : "
+                "il ne peut pas être retiré."
+            )
+        instance.delete()
 
 
 # ─── Groupes ──────────────────────────────────────────────────────────────────

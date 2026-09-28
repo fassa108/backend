@@ -3,10 +3,10 @@ from django.contrib import admin
 from .models import (
     Assignation,
     Brief,
+    CategorieBrief,
     FichierLivrable,
     Livrable,
     Ressource,
-    RessourceBrief,
 )
 
 
@@ -17,16 +17,16 @@ class RessourceAdmin(admin.ModelAdmin):
     search_fields = ("titre", "formateur__nom", "formateur__email")
 
 
+@admin.register(CategorieBrief)
+class CategorieBriefAdmin(admin.ModelAdmin):
+    list_display = ("nom", "tenant", "actif")
+    list_filter = ("tenant", "actif")
+
+
 @admin.register(Brief)
 class BriefAdmin(admin.ModelAdmin):
-    list_display = ("titre", "promotion", "statut", "date_debut", "date_limite")
+    list_display = ("titre", "promotion", "module", "statut", "date_debut", "date_limite", "cree_par")
     list_filter = ("statut", "promotion__formation__tenant")
-    search_fields = ("titre",)
-
-
-@admin.register(RessourceBrief)
-class RessourceBriefAdmin(admin.ModelAdmin):
-    list_display = ("titre", "brief", "date_creation")
     search_fields = ("titre",)
 
 
