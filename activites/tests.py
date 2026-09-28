@@ -1,21 +1,27 @@
 """
-Tests complets pour le flux activités EduHub.
+Tests du module activités (étape 1 : briefs, assignations, ressources).
 
 Couvre :
-- Briefs : création, modification après soumission, permissions
-- Ressources indépendantes : CRUD, isolation tenant, indépendance du Brief
-- RessourceBrief (déprécié) : compatibilité
-- Assignations : apprenant, groupe, apprenant+groupe, doublons, Formateur limité à ses promotions,
-  Utilisateur.actif non bloquant, Admin SaaS exclu
-- Livrables : dépôt, types de fichiers, statut, permissions
-- FichierLivrable : PDF/PPTX/DOCX/TXT acceptés, autres refusés
-- Multi-tenant : isolation complète
+- Briefs : module obligatoire, compétences visées (CompetenceNiveau),
+  ressources, créé par, brief figé après le premier livrable,
+  promotion clôturée, permissions
+- Visibilité par rôle (audit S1) : l'apprenant ne voit que les briefs
+  publiés / archivés de sa promotion et ses propres assignations et livrables
+- Ressources : bibliothèque, modification réservée au créateur et à l'admin
+  (audit S11), visibilité apprenant
+- Assignations : cibles, doublons, groupe inactif, suppression interdite
+  avec livrables (audit S12)
+- Livrables : dépôt par l'apprenant ou un membre actif du groupe (audit B5)
+- Fichiers : types acceptés / refusés
+- Multi-tenant : isolation
 """
 
-from datetime import date
+import shutil
+import tempfile
 
-from django.core.files.uploadedfile import SimpleUploadedFile
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -23,31 +29,35 @@ from rest_framework.test import APITestCase
 from accounts.models import MembreTenant
 from pedagogie.models import (
     Competence,
+    CompetenceNiveau,
     FormateurPromotion,
     Formation,
     Groupe,
     GroupeMembre,
     InscriptionPromotion,
     Module,
+    Niveau,
     Promotion,
 )
+from pedagogie.services import InscriptionService
 from tenants.models import Tenant
 
-from .models import (
-    Assignation,
-    Brief,
-    FichierLivrable,
-    Livrable,
-    Ressource,
-    RessourceBrief,
-)
+from .models import Assignation, Brief, FichierLivrable, Livrable, Ressource
 
 User = get_user_model()
+
+MEDIA_TEST = tempfile.mkdtemp()
 
 
 # ─── Base ─────────────────────────────────────────────────────────────────────
 
+@override_settings(MEDIA_ROOT=MEDIA_TEST)
 class ActivitesBaseTestCase(APITestCase):
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(MEDIA_TEST, ignore_errors=True)
+        super().tearDownClass()
+
     def setUp(self):
         self.tenant = Tenant.objects.create(nom="Organisme Test")
         self.tenant_2 = Tenant.objects.create(nom="Organisme B")
@@ -56,40 +66,15 @@ class ActivitesBaseTestCase(APITestCase):
             email="saas@test.com", password="pw", nom="SaaS", prenom="A",
             actif=True, est_admin_saas=True,
         )
-
-        self.admin = User.objects.create_user(
-            email="admin@test.com", password="pw", nom="Admin", prenom="T", actif=True,
-        )
-        MembreTenant.objects.create(utilisateur=self.admin, tenant=self.tenant,
-                                    role=MembreTenant.Role.ADMINISTRATEUR, actif=True)
-
-        self.formateur = User.objects.create_user(
-            email="formateur@test.com", password="pw", nom="Form", prenom="T", actif=True,
-        )
-        MembreTenant.objects.create(utilisateur=self.formateur, tenant=self.tenant,
-                                    role=MembreTenant.Role.FORMATEUR, actif=True)
-
-        self.formateur_2 = User.objects.create_user(
-            email="formateur2@test.com", password="pw", nom="Form2", prenom="T", actif=True,
-        )
-        MembreTenant.objects.create(utilisateur=self.formateur_2, tenant=self.tenant,
-                                    role=MembreTenant.Role.FORMATEUR, actif=True)
-
-        self.apprenant = User.objects.create_user(
-            email="apprenant@test.com", password="pw", nom="App", prenom="T", actif=True,
-        )
-        MembreTenant.objects.create(utilisateur=self.apprenant, tenant=self.tenant,
-                                    role=MembreTenant.Role.APPRENANT, actif=True)
-
-        # Apprenant avec compte non activé — MembreTenant.actif=True
-        self.apprenant_inactif = User.objects.create_user(
-            email="apprenant_inactif@test.com", password="pw", nom="Inactif", prenom="App",
-            actif=False,
-        )
-        MembreTenant.objects.create(utilisateur=self.apprenant_inactif, tenant=self.tenant,
-                                    role=MembreTenant.Role.APPRENANT, actif=True)
+        self.admin = self.membre("admin@test.com", MembreTenant.Role.ADMINISTRATEUR)
+        self.formateur = self.membre("formateur@test.com", MembreTenant.Role.FORMATEUR)
+        self.formateur_2 = self.membre("formateur2@test.com", MembreTenant.Role.FORMATEUR)
+        self.apprenant = self.membre("apprenant@test.com", MembreTenant.Role.APPRENANT)
+        self.apprenant_b = self.membre("apprenant_b@test.com", MembreTenant.Role.APPRENANT)
+        self.apprenant_hors_promo = self.membre("hors@test.com", MembreTenant.Role.APPRENANT)
 
         self.formation = Formation.objects.create(tenant=self.tenant, nom="Formation Web")
+        self.autre_formation = Formation.objects.create(tenant=self.tenant, nom="Formation Data")
         self.promotion = Promotion.objects.create(
             formation=self.formation, nom="Promo 2026", date_debut="2026-01-01"
         )
@@ -97,279 +82,334 @@ class ActivitesBaseTestCase(APITestCase):
             formation=self.formation, nom="Promo 2026 B", date_debut="2026-06-01"
         )
 
-        self.module = Module.objects.create(
-            formation=self.formation, nom="Développement Web", ordre=1
+        self.module = Module.objects.create(formation=self.formation, nom="Développement Web", ordre=1)
+        self.module_2 = Module.objects.create(formation=self.formation, nom="Base de données", ordre=2)
+        self.module_autre = Module.objects.create(formation=self.autre_formation, nom="Statistiques", ordre=1)
+
+        self.niveau = Niveau.objects.create(tenant=self.tenant, nom="Imiter", ordre=1)
+        self.cn = CompetenceNiveau.objects.create(
+            competence=Competence.objects.create(module=self.module, nom="Développer une API", ordre=1),
+            niveau=self.niveau, description="Reproduire une API existante",
         )
-        self.competence = Competence.objects.create(
-            module=self.module, nom="Développer une API", ordre=1
+        self.cn_module_2 = CompetenceNiveau.objects.create(
+            competence=Competence.objects.create(module=self.module_2, nom="Modéliser", ordre=1),
+            niveau=self.niveau,
+        )
+        self.cn_autre_formation = CompetenceNiveau.objects.create(
+            competence=Competence.objects.create(module=self.module_autre, nom="Analyser", ordre=1),
+            niveau=self.niveau,
         )
 
-        InscriptionPromotion.objects.create(
-            promotion=self.promotion, apprenant=self.apprenant, actif=True
-        )
-        InscriptionPromotion.objects.create(
-            promotion=self.promotion, apprenant=self.apprenant_inactif, actif=True
-        )
+        InscriptionPromotion.objects.create(promotion=self.promotion, apprenant=self.apprenant)
+        InscriptionPromotion.objects.create(promotion=self.promotion, apprenant=self.apprenant_b)
 
-        # Formateur affecté à promotion uniquement
+        # Formateur affecté à promotion uniquement ; formateur_2 à aucune
         FormateurPromotion.objects.create(formateur=self.formateur, promotion=self.promotion)
-        # formateur_2 n'est PAS affecté
 
         self.client.force_authenticate(user=self.formateur)
 
-    def creer_brief(self, promotion=None):
-        p = promotion or self.promotion
+    def membre(self, email, role, tenant=None):
+        utilisateur = User.objects.create_user(
+            email=email, password="pw", nom="Nom", prenom="Prenom", actif=True,
+        )
+        MembreTenant.objects.create(utilisateur=utilisateur, tenant=tenant or self.tenant, role=role)
+        return utilisateur
+
+    def creer_brief(self, promotion=None, statut=Brief.Statut.PUBLIE, **extra):
         return Brief.objects.create(
-            promotion=p,
+            promotion=promotion or self.promotion,
+            module=self.module,
             titre="Créer une API REST",
             description="Description",
             consignes="Consignes",
             date_debut="2026-09-01T08:00:00Z",
             date_limite="2026-09-30T18:00:00Z",
+            statut=statut,
+            **extra,
         )
 
-    def brief_url(self):
-        return reverse("brief-list", kwargs={"tenant_id": self.tenant.id})
+    def deposer(self, assignation, apprenant=None):
+        return Livrable.objects.create(
+            assignation=assignation, deposant=apprenant or self.apprenant, titre="L",
+        )
 
-    def brief_detail_url(self, brief_id):
-        return reverse("brief-detail", kwargs={"tenant_id": self.tenant.id, "pk": brief_id})
+    def url(self, nom, pk=None):
+        kwargs = {"tenant_id": self.tenant.id}
+        if pk is not None:
+            kwargs["pk"] = pk
+            return reverse(f"{nom}-detail", kwargs=kwargs)
+        return reverse(f"{nom}-list", kwargs=kwargs)
+
+    def ids(self, res):
+        return sorted(x["id"] for x in res.data)
+
+    def payload_brief(self, **extra):
+        return {
+            "promotion": self.promotion.id,
+            "module": self.module.id,
+            "titre": "Brief API",
+            "description": "Description",
+            "consignes": "Consignes",
+            "date_debut": "2026-09-01T08:00:00Z",
+            "date_limite": "2026-09-30T18:00:00Z",
+            "competence_niveaux": [self.cn.id],
+            **extra,
+        }
 
 
 # ─── Briefs ───────────────────────────────────────────────────────────────────
 
-class BriefTests(ActivitesBaseTestCase):
-    def test_formateur_peut_creer_brief_dans_sa_promotion(self):
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief API",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+class BriefCreationTests(ActivitesBaseTestCase):
+    def test_formateur_cree_un_brief_complet(self):
+        ressource = Ressource.objects.create(tenant=self.tenant, formateur=self.formateur,
+                                             titre="Doc", url="https://example.com")
+        res = self.client.post(self.url("brief"), self.payload_brief(
+            competence_niveaux=[self.cn.id, self.cn_module_2.id],
+            ressources=[ressource.id],
+        ), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        brief = Brief.objects.get(pk=res.data["id"])
+        self.assertEqual(brief.cree_par, self.formateur)
+        self.assertEqual(brief.module, self.module)
+        # Compétences d'un autre module de la même formation acceptées
+        self.assertCountEqual(brief.competence_niveaux.all(), [self.cn, self.cn_module_2])
+        self.assertEqual(list(brief.ressources.all()), [ressource])
+        self.assertEqual(res.data["statut"], Brief.Statut.BROUILLON)
+        self.assertTrue(res.data["modifiable"])
 
-    def test_formateur_ne_peut_pas_creer_brief_promo_non_affectee(self):
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion_2.id,
-            "titre": "Brief Interdit",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
+    def test_module_obligatoire(self):
+        payload = self.payload_brief()
+        del payload["module"]
+        res = self.client.post(self.url("brief"), payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("module", res.data)
+
+    def test_module_d_une_autre_formation_refuse(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(module=self.module_autre.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("module", res.data)
+
+    def test_competence_d_une_autre_formation_refusee(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(
+            competence_niveaux=[self.cn_autre_formation.id]), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("competence_niveaux", res.data)
+
+    def test_ressource_d_un_autre_organisme_refusee(self):
+        ressource = Ressource.objects.create(tenant=self.tenant_2, titre="Doc", url="https://example.com")
+        res = self.client.post(self.url("brief"), self.payload_brief(ressources=[ressource.id]), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_formateur_non_affecte_ne_peut_pas_creer_brief(self):
-        self.client.force_authenticate(user=self.formateur_2)
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief Formateur 2",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
+    def test_statut_termine_n_existe_plus(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(statut="TERMINE"), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_admin_organisme_peut_consulter_briefs(self):
-        self.creer_brief()
-        self.client.force_authenticate(user=self.admin)
-        res = self.client.get(self.brief_url())
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-
-    def test_admin_organisme_ne_peut_pas_creer_brief(self):
-        self.client.force_authenticate(user=self.admin)
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief Admin",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_apprenant_ne_peut_pas_creer_brief(self):
-        self.client.force_authenticate(user=self.apprenant)
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief App",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_consulter_briefs(self):
-        self.creer_brief()
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.get(self.brief_url())
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_creer_brief(self):
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief SaaS",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_brief_non_modifiable_apres_soumission(self):
-        brief = self.creer_brief()
-        assignation = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
-        Livrable.objects.create(
-            assignation=assignation, deposant=self.apprenant,
-            titre="Livrable", description="Desc",
-        )
-        res = self.client.patch(
-            self.brief_detail_url(brief.id), {"titre": "Modifié"}, format="json"
-        )
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_brief_non_supprimable_apres_soumission(self):
-        brief = self.creer_brief()
-        assignation = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
-        Livrable.objects.create(
-            assignation=assignation, deposant=self.apprenant, titre="L", description="D"
-        )
-        res = self.client.delete(self.brief_detail_url(brief.id))
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_dates_invalides_refusees(self):
-        res = self.client.post(self.brief_url(), {
-            "promotion": self.promotion.id,
-            "titre": "Brief Date",
-            "description": "Desc",
-            "consignes": "Cons",
-            "date_debut": "2026-09-30T08:00:00Z",
-            "date_limite": "2026-09-01T08:00:00Z",
-        }, format="json")
+        res = self.client.post(self.url("brief"), self.payload_brief(
+            date_debut="2026-09-30T08:00:00Z", date_limite="2026-09-01T18:00:00Z"), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_isolation_multi_tenant_brief(self):
-        autre_tenant = Tenant.objects.create(nom="Autre Org")
-        autre_admin = User.objects.create_user(
-            email="autre_admin@test.com", password="pw", nom="A", prenom="B", actif=True
-        )
-        MembreTenant.objects.create(utilisateur=autre_admin, tenant=autre_tenant,
-                                    role=MembreTenant.Role.ADMINISTRATEUR, actif=True)
-        self.client.force_authenticate(user=autre_admin)
-        res = self.client.get(self.brief_url())
+    def test_promotion_non_affectee_refusee(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(promotion=self.promotion_2.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_promotion_cloturee_refusee(self):
+        InscriptionService.cloturer(self.promotion)
+        res = self.client.post(self.url("brief"), self.payload_brief(), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("clôturée", str(res.data["promotion"]))
+
+    def test_seul_le_formateur_cree(self):
+        for utilisateur in (self.admin, self.apprenant, self.admin_saas):
+            self.client.force_authenticate(user=utilisateur)
+            res = self.client.post(self.url("brief"), self.payload_brief(), format="json")
+            self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN, utilisateur.email)
+
+
+class BriefModificationTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.brief = self.creer_brief()
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+
+    def test_modifiable_sans_livrable(self):
+        res = self.client.patch(self.url("brief", self.brief.id), {"titre": "Nouveau titre"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_fige_apres_le_premier_livrable(self):
+        self.deposer(self.assignation)
+        res = self.client.patch(self.url("brief", self.brief.id),
+                                {"date_limite": "2026-10-30T18:00:00Z"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(self.client.get(self.url("brief", self.brief.id)).data["modifiable"])
+
+    def test_statut_modifiable_apres_livrable(self):
+        self.deposer(self.assignation)
+        res = self.client.patch(self.url("brief", self.brief.id), {"statut": "ARCHIVE"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_non_supprimable_apres_livrable(self):
+        self.deposer(self.assignation)
+        res = self.client.delete(self.url("brief", self.brief.id))
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_formateur_ne_voit_pas_briefs_promo_non_affectee(self):
-        brief_p2 = self.creer_brief(promotion=self.promotion_2)
-        brief_p1 = self.creer_brief(promotion=self.promotion)
-        # formateur_2 n'est pas affecté à promotion
+    def test_supprimable_sans_livrable(self):
+        res = self.client.delete(self.url("brief", self.brief.id))
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_ne_change_pas_de_promotion(self):
+        FormateurPromotion.objects.create(formateur=self.formateur, promotion=self.promotion_2)
+        res = self.client.patch(self.url("brief", self.brief.id), {"promotion": self.promotion_2.id}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_promotion_cloturee_lecture_seule(self):
+        InscriptionService.cloturer(self.promotion)
+        self.assertEqual(
+            self.client.patch(self.url("brief", self.brief.id), {"titre": "X"}, format="json").status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(self.client.delete(self.url("brief", self.brief.id)).status_code,
+                         status.HTTP_403_FORBIDDEN)
+
+    def test_formateur_non_affecte_ne_modifie_pas(self):
         self.client.force_authenticate(user=self.formateur_2)
-        res = self.client.get(self.brief_url())
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        ids = [b["id"] for b in res.data]
-        self.assertNotIn(brief_p1.id, ids)
+        res = self.client.patch(self.url("brief", self.brief.id), {"titre": "X"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_action_non_prevue_refusee(self):
+        # PUT n'est pas exposé ; toute action non listée est refusée
+        res = self.client.put(self.url("brief", self.brief.id), self.payload_brief(), format="json")
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-# ─── Ressources indépendantes ─────────────────────────────────────────────────
+class BriefVisibiliteTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.publie = self.creer_brief(statut=Brief.Statut.PUBLIE)
+        self.archive = self.creer_brief(statut=Brief.Statut.ARCHIVE)
+        self.brouillon = self.creer_brief(statut=Brief.Statut.BROUILLON)
+        self.autre_promo = self.creer_brief(promotion=self.promotion_2)
+
+    def lister(self, utilisateur):
+        self.client.force_authenticate(user=utilisateur)
+        return self.client.get(self.url("brief"))
+
+    def test_apprenant_voit_publies_et_archives_de_sa_promotion(self):
+        self.assertEqual(self.ids(self.lister(self.apprenant)), sorted([self.publie.id, self.archive.id]))
+
+    def test_apprenant_ne_voit_pas_un_brouillon_en_detail(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.get(self.url("brief", self.brouillon.id))
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_apprenant_sans_promotion_ne_voit_rien(self):
+        self.assertEqual(self.ids(self.lister(self.apprenant_hors_promo)), [])
+
+    def test_apprenant_promotion_cloturee_voit_encore(self):
+        InscriptionService.cloturer(self.promotion)
+        self.assertEqual(self.ids(self.lister(self.apprenant)), sorted([self.publie.id, self.archive.id]))
+
+    def test_formateur_voit_ses_promotions_brouillons_compris(self):
+        self.assertEqual(self.ids(self.lister(self.formateur)),
+                         sorted([self.publie.id, self.archive.id, self.brouillon.id]))
+
+    def test_admin_voit_tout(self):
+        self.assertEqual(len(self.lister(self.admin).data), 4)
+
+    def test_admin_saas_exclu(self):
+        self.assertEqual(self.lister(self.admin_saas).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_isolation_multi_tenant(self):
+        admin_b = self.membre("admin_b@test.com", MembreTenant.Role.ADMINISTRATEUR, tenant=self.tenant_2)
+        self.client.force_authenticate(user=admin_b)
+        res = self.client.get(self.url("brief"))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ─── Ressources ───────────────────────────────────────────────────────────────
 
 class RessourceTests(ActivitesBaseTestCase):
-    def ressource_url(self):
-        return reverse("ressource-list", kwargs={"tenant_id": self.tenant.id})
-
-    def test_formateur_peut_creer_ressource_avec_url(self):
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Documentation",
-            "url": "https://example.com/doc",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        r = Ressource.objects.get(id=res.data["id"])
-        self.assertEqual(r.tenant, self.tenant)
-        self.assertEqual(r.formateur, self.formateur)
-
-    def test_formateur_peut_creer_ressource_avec_fichier(self):
-        fichier = SimpleUploadedFile("doc.pdf", b"contenu", content_type="application/pdf")
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Mon PDF",
-            "fichier": fichier,
-        })
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_url_et_fichier_simultanes_refuse(self):
-        fichier = SimpleUploadedFile("doc.pdf", b"contenu", content_type="application/pdf")
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Invalide",
-            "url": "https://example.com",
-            "fichier": fichier,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_sans_source_refuse(self):
-        res = self.client.post(self.ressource_url(), {"titre": "Vide"}, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_ressource_independante_du_brief(self):
-        """Une Ressource ne doit pas avoir de lien vers un Brief."""
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Indépendante",
-            "url": "https://example.com",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertNotIn("brief", res.data)
-
-    def test_apprenant_peut_consulter_ressource(self):
-        Ressource.objects.create(
-            tenant=self.tenant, formateur=self.formateur,
-            titre="Res", url="https://example.com"
+    def setUp(self):
+        super().setUp()
+        self.ressource = Ressource.objects.create(
+            tenant=self.tenant, formateur=self.formateur, titre="Doc", url="https://example.com",
         )
+
+    def test_formateur_cree_avec_url(self):
+        res = self.client.post(self.url("ressource"), {"titre": "Lien", "url": "https://docs.test"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(res.data["formateur"], self.formateur.id)
+
+    def test_formateur_cree_avec_fichier(self):
+        fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
+        res = self.client.post(self.url("ressource"), {"titre": "Fichier", "fichier": fichier})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_url_et_fichier_simultanes_refuses(self):
+        fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
+        res = self.client.post(self.url("ressource"),
+                               {"titre": "X", "url": "https://docs.test", "fichier": fichier})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_sans_source_refusee(self):
+        res = self.client.post(self.url("ressource"), {"titre": "X"})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_admin_cree_une_ressource(self):
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.post(self.url("ressource"), {"titre": "Lien", "url": "https://docs.test"})
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_autre_formateur_ne_modifie_ni_ne_supprime(self):
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(
+            self.client.patch(self.url("ressource", self.ressource.id), {"titre": "X"}).status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(self.client.delete(self.url("ressource", self.ressource.id)).status_code,
+                         status.HTTP_403_FORBIDDEN)
+
+    def test_createur_et_admin_modifient(self):
+        self.assertEqual(
+            self.client.patch(self.url("ressource", self.ressource.id), {"titre": "Par le créateur"}).status_code,
+            status.HTTP_200_OK,
+        )
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(
+            self.client.patch(self.url("ressource", self.ressource.id), {"titre": "Par l'admin"}).status_code,
+            status.HTTP_200_OK,
+        )
+
+    def test_ressource_jointe_a_un_brief_non_supprimable(self):
+        self.creer_brief().ressources.add(self.ressource)
+        res = self.client.delete(self.url("ressource", self.ressource.id))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_ressource_libre_supprimable(self):
+        res = self.client.delete(self.url("ressource", self.ressource.id))
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_apprenant_ne_voit_que_les_ressources_de_ses_briefs(self):
+        jointe = Ressource.objects.create(tenant=self.tenant, titre="Jointe", url="https://a.test")
+        brouillon = Ressource.objects.create(tenant=self.tenant, titre="Brouillon", url="https://b.test")
+        self.creer_brief(statut=Brief.Statut.PUBLIE).ressources.add(jointe)
+        self.creer_brief(statut=Brief.Statut.BROUILLON).ressources.add(brouillon)
+
         self.client.force_authenticate(user=self.apprenant)
-        res = self.client.get(self.ressource_url())
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 1)
+        self.assertEqual(self.ids(self.client.get(self.url("ressource"))), [jointe.id])
 
-    def test_admin_saas_ne_peut_pas_creer_ressource(self):
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Ressource SaaS",
-            "url": "https://example.com",
-        }, format="json")
+    def test_apprenant_ne_cree_pas(self):
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.post(self.url("ressource"), {"titre": "X", "url": "https://docs.test"})
         self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_admin_saas_ne_peut_pas_consulter_ressource(self):
-        Ressource.objects.create(
-            tenant=self.tenant, formateur=self.formateur,
-            titre="Res", url="https://example.com"
-        )
+    def test_admin_saas_exclu(self):
         self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.get(self.ressource_url())
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get(self.url("ressource")).status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_isolation_tenant_ressource(self):
-        """Une ressource d'un autre tenant n'est pas visible."""
-        autre_formateur = User.objects.create_user(
-            email="f_b@test.com", password="pw", nom="F", prenom="B", actif=True
-        )
-        MembreTenant.objects.create(utilisateur=autre_formateur, tenant=self.tenant_2,
-                                    role=MembreTenant.Role.FORMATEUR, actif=True)
-        Ressource.objects.create(
-            tenant=self.tenant_2, formateur=autre_formateur,
-            titre="Res T2", url="https://example.com"
-        )
-        self.client.force_authenticate(user=self.admin)
-        res = self.client.get(self.ressource_url())
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(res.data), 0)
-
-    def test_admin_organisme_peut_gerer_ressource(self):
-        self.client.force_authenticate(user=self.admin)
-        res = self.client.post(self.ressource_url(), {
-            "titre": "Res Admin",
-            "url": "https://example.com",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+    def test_isolation_tenant(self):
+        Ressource.objects.create(tenant=self.tenant_2, titre="Autre", url="https://c.test")
+        self.assertEqual(self.ids(self.client.get(self.url("ressource"))), [self.ressource.id])
 
 
 # ─── Assignations ─────────────────────────────────────────────────────────────
@@ -379,130 +419,95 @@ class AssignationTests(ActivitesBaseTestCase):
         super().setUp()
         self.brief = self.creer_brief()
         self.groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe A")
+        GroupeMembre.objects.create(groupe=self.groupe, apprenant=self.apprenant)
 
-    def assignation_url(self):
-        return reverse("assignation-list", kwargs={"tenant_id": self.tenant.id})
+    def assigner(self, **cible):
+        return self.client.post(self.url("assignation"), {"brief": self.brief.id, **cible}, format="json")
 
     def test_assignation_apprenant(self):
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_201_CREATED)
 
     def test_assignation_groupe(self):
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "groupe": self.groupe.id,
-        }, format="json")
+        self.assertEqual(self.assigner(groupe=self.groupe.id).status_code, status.HTTP_201_CREATED)
+
+    def test_assignation_apprenant_et_groupe(self):
+        res = self.assigner(apprenant=self.apprenant_b.id, groupe=self.groupe.id)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
-    def test_assignation_apprenant_inactif_autorisee(self):
-        """
-        Utilisateur.actif=False ne bloque pas l'assignation si MembreTenant.actif=True
-        et inscription active dans la promotion.
-        """
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant_inactif.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+    def test_sans_cible_refusee(self):
+        self.assertEqual(self.assigner().status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_assignation_apprenant_et_groupe_simultanément_acceptee(self):
-        """
-        Une assignation peut cibler un apprenant ET un groupe en même temps.
-        Nouvelle règle : OR (pas XOR).
-        """
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-            "groupe": self.groupe.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_assignation_sans_cible_refusee(self):
-        """
-        Une assignation sans apprenant ni groupe doit être refusée.
-        C'est le seul cas invalide avec la règle OR.
-        """
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_doublon_apprenant_refuse(self):
-        Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_doublon_groupe_refuse(self):
-        Assignation.objects.create(brief=self.brief, groupe=self.groupe)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "groupe": self.groupe.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_doublons_refuses(self):
+        self.assigner(apprenant=self.apprenant.id)
+        self.assigner(groupe=self.groupe.id)
+        self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.assigner(groupe=self.groupe.id).status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_apprenant_non_inscrit_refuse(self):
-        autre_app = User.objects.create_user(
-            email="autre_app@test.com", password="pw", nom="A", prenom="B", actif=True
-        )
-        MembreTenant.objects.create(utilisateur=autre_app, tenant=self.tenant,
-                                    role=MembreTenant.Role.APPRENANT, actif=True)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": autre_app.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.assigner(apprenant=self.apprenant_hors_promo.id).status_code,
+                         status.HTTP_400_BAD_REQUEST)
 
-    def test_formateur_non_affecte_ne_peut_pas_assigner(self):
-        """formateur_2 n'est pas affecté à promotion."""
-        self.client.force_authenticate(user=self.formateur_2)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_admin_organisme_ne_peut_pas_creer_assignation(self):
-        self.client.force_authenticate(user=self.admin)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_apprenant_ne_peut_pas_creer_assignation(self):
-        self.client.force_authenticate(user=self.apprenant)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_creer_assignation(self):
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "apprenant": self.apprenant.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_consulter_assignations(self):
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.get(self.assignation_url())
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_groupe_autre_promotion_refuse(self):
+    def test_groupe_d_une_autre_promotion_refuse(self):
         groupe_p2 = Groupe.objects.create(promotion=self.promotion_2, nom="Groupe P2")
-        res = self.client.post(self.assignation_url(), {
-            "brief": self.brief.id,
-            "groupe": groupe_p2.id,
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.assigner(groupe=groupe_p2.id).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_groupe_desactive_refuse(self):
+        self.groupe.actif = False
+        self.groupe.save()
+        self.assertEqual(self.assigner(groupe=self.groupe.id).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_brief_archive_refuse(self):
+        self.brief.statut = Brief.Statut.ARCHIVE
+        self.brief.save()
+        self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_promotion_cloturee_refusee(self):
+        InscriptionService.cloturer(self.promotion)
+        self.assertEqual(self.assigner(groupe=self.groupe.id).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_formateur_non_affecte_refuse(self):
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_seul_le_formateur_assigne(self):
+        for utilisateur in (self.admin, self.apprenant, self.admin_saas):
+            self.client.force_authenticate(user=utilisateur)
+            self.assertEqual(self.assigner(apprenant=self.apprenant.id).status_code,
+                             status.HTTP_403_FORBIDDEN, utilisateur.email)
+
+    def test_pas_de_modification(self):
+        assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        res = self.client.patch(self.url("assignation", assignation.id), {"apprenant": self.apprenant_b.id})
+        self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_suppression_interdite_avec_livrables(self):
+        assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        self.deposer(assignation)
+        res = self.client.delete(self.url("assignation", assignation.id))
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Livrable.objects.filter(assignation=assignation).exists())
+
+    def test_suppression_sans_livrable(self):
+        assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        res = self.client.delete(self.url("assignation", assignation.id))
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_apprenant_voit_ses_assignations_directes_et_de_groupe(self):
+        directe = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        via_groupe = Assignation.objects.create(brief=self.brief, groupe=self.groupe)
+        Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        brouillon = self.creer_brief(statut=Brief.Statut.BROUILLON)
+        Assignation.objects.create(brief=brouillon, apprenant=self.apprenant)
+
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.ids(self.client.get(self.url("assignation"))),
+                         sorted([directe.id, via_groupe.id]))
+
+    def test_membre_inactif_ne_voit_plus_l_assignation_de_groupe(self):
+        Assignation.objects.create(brief=self.brief, groupe=self.groupe)
+        GroupeMembre.objects.filter(apprenant=self.apprenant).update(actif=False)
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.ids(self.client.get(self.url("assignation"))), [])
 
 
 # ─── Livrables ────────────────────────────────────────────────────────────────
@@ -511,194 +516,131 @@ class LivrableTests(ActivitesBaseTestCase):
     def setUp(self):
         super().setUp()
         self.brief = self.creer_brief()
-        self.assignation = Assignation.objects.create(
-            brief=self.brief, apprenant=self.apprenant
-        )
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
 
-    def livrable_url(self):
-        return reverse("livrable-list", kwargs={"tenant_id": self.tenant.id})
+    def deposer_api(self, assignation):
+        return self.client.post(self.url("livrable"),
+                                {"assignation": assignation.id, "titre": "Mon livrable"}, format="json")
 
-    def livrable_detail_url(self, livrable_id):
-        return reverse("livrable-detail", kwargs={"tenant_id": self.tenant.id, "pk": livrable_id})
-
-    def test_apprenant_peut_deposer_livrable(self):
+    def test_apprenant_depose(self):
         self.client.force_authenticate(user=self.apprenant)
-        res = self.client.post(self.livrable_url(), {
-            "assignation": self.assignation.id,
-            "titre": "Mon livrable",
-            "description": "Desc",
-        }, format="json")
+        res = self.deposer_api(self.assignation)
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(Livrable.objects.get(id=res.data["id"]).deposant, self.apprenant)
+        self.assertEqual(res.data["deposant"], self.apprenant.id)
 
-    def test_apprenant_ne_peut_pas_deposer_pour_autre(self):
-        autre_app = User.objects.create_user(
-            email="autre2@test.com", password="pw", nom="A", prenom="B", actif=True
-        )
-        MembreTenant.objects.create(utilisateur=autre_app, tenant=self.tenant,
-                                    role=MembreTenant.Role.APPRENANT, actif=True)
-        InscriptionPromotion.objects.create(
-            promotion=self.promotion, apprenant=autre_app, actif=True
-        )
-        autre_ass = Assignation.objects.create(brief=self.brief, apprenant=autre_app)
+    def test_apprenant_ne_depose_pas_pour_un_autre(self):
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.deposer_api(self.assignation).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_membre_du_groupe_depose_sur_assignation_apprenant_et_groupe(self):
+        # Audit B5 : l'assignation vise un apprenant ET un groupe
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe B")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b)
+        mixte = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant, groupe=groupe)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.deposer_api(mixte).status_code, status.HTTP_201_CREATED)
+
+    def test_membre_inactif_du_groupe_ne_depose_pas(self):
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe B")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b, actif=False)
+        assignation = Assignation.objects.create(brief=self.brief, groupe=groupe)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.deposer_api(assignation).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_formateur_ne_depose_pas(self):
+        self.assertEqual(self.deposer_api(self.assignation).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_apprenant_ne_voit_pas_les_livrables_des_autres(self):
+        # Audit S1
+        self.deposer(self.assignation)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.get(self.url("livrable")).data, [])
+        self.client.force_authenticate(user=self.apprenant_hors_promo)
+        self.assertEqual(self.client.get(self.url("livrable")).data, [])
+
+    def test_apprenant_voit_ses_livrables(self):
+        livrable = self.deposer(self.assignation)
         self.client.force_authenticate(user=self.apprenant)
-        res = self.client.post(self.livrable_url(), {
-            "assignation": autre_ass.id,
-            "titre": "Interdit",
-            "description": "Desc",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.ids(self.client.get(self.url("livrable"))), [livrable.id])
 
-    def test_formateur_ne_peut_pas_deposer_livrable(self):
-        res = self.client.post(self.livrable_url(), {
-            "assignation": self.assignation.id,
-            "titre": "Livrable Formateur",
-            "description": "Desc",
-        }, format="json")
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+    def test_formateur_non_affecte_ne_voit_pas(self):
+        self.deposer(self.assignation)
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.client.get(self.url("livrable")).data, [])
 
-    def test_formateur_peut_modifier_statut(self):
-        livrable = Livrable.objects.create(
-            assignation=self.assignation, deposant=self.apprenant, titre="L", description="D"
-        )
-        res = self.client.patch(
-            self.livrable_detail_url(livrable.id),
-            {"statut": Livrable.Statut.RETENU},
-            format="json",
-        )
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        livrable.refresh_from_db()
-        self.assertEqual(livrable.statut, Livrable.Statut.RETENU)
-
-    def test_apprenant_ne_peut_pas_modifier_statut(self):
-        livrable = Livrable.objects.create(
-            assignation=self.assignation, deposant=self.apprenant, titre="L", description="D"
-        )
+    def test_suppression_interdite(self):
+        livrable = self.deposer(self.assignation)
         self.client.force_authenticate(user=self.apprenant)
-        res = self.client.patch(
-            self.livrable_detail_url(livrable.id),
-            {"statut": Livrable.Statut.RETENU},
-            format="json",
-        )
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_consulter_livrables(self):
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.get(self.livrable_url())
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_admin_saas_ne_peut_pas_modifier_statut_livrable(self):
-        livrable = Livrable.objects.create(
-            assignation=self.assignation, deposant=self.apprenant, titre="L", description="D"
-        )
-        self.client.force_authenticate(user=self.admin_saas)
-        res = self.client.patch(
-            self.livrable_detail_url(livrable.id),
-            {"statut": Livrable.Statut.RETENU},
-            format="json",
-        )
-        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
-
-    def test_suppression_livrable_interdite(self):
-        livrable = Livrable.objects.create(
-            assignation=self.assignation, deposant=self.apprenant, titre="L", description="D"
-        )
-        res = self.client.delete(self.livrable_detail_url(livrable.id))
+        res = self.client.delete(self.url("livrable", livrable.id))
         self.assertEqual(res.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    def test_formateur_ne_voit_pas_livrables_promo_non_affectee(self):
-        """formateur_2 n'est pas affecté à promotion."""
-        livrable = Livrable.objects.create(
-            assignation=self.assignation, deposant=self.apprenant, titre="L", description="D"
-        )
-        self.client.force_authenticate(user=self.formateur_2)
-        res = self.client.get(self.livrable_url())
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        ids = [l["id"] for l in res.data]
-        self.assertNotIn(livrable.id, ids)
+    def test_admin_saas_exclu(self):
+        self.client.force_authenticate(user=self.admin_saas)
+        self.assertEqual(self.client.get(self.url("livrable")).status_code, status.HTTP_403_FORBIDDEN)
 
 
-# ─── FichierLivrable — types de fichiers ─────────────────────────────────────
-
-class FichierLivrableTypeTests(ActivitesBaseTestCase):
+class FichierLivrableTests(ActivitesBaseTestCase):
     def setUp(self):
         super().setUp()
-        brief = self.creer_brief()
-        assignation = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
-        self.livrable = Livrable.objects.create(
-            assignation=assignation, deposant=self.apprenant, titre="L", description="D"
-        )
+        assignation = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant)
+        self.livrable = self.deposer(assignation)
         self.client.force_authenticate(user=self.apprenant)
 
-    def fichier_url(self):
-        return reverse("fichier-livrable-list", kwargs={"tenant_id": self.tenant.id})
-
-    def _post_fichier(self, nom, contenu, content_type="application/pdf"):
+    def envoyer(self, nom, contenu=b"contenu", content_type="application/octet-stream"):
         fichier = SimpleUploadedFile(nom, contenu, content_type=content_type)
-        return self.client.post(self.fichier_url(), {
-            "livrable": self.livrable.id,
-            "nom": nom,
-            "fichier": fichier,
-        })
+        return self.client.post(self.url("fichier-livrable"),
+                                {"livrable": self.livrable.id, "nom": nom, "fichier": fichier})
 
-    def test_pdf_accepte(self):
-        res = self._post_fichier("doc.pdf", b"PDF content")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+    def test_types_acceptes(self):
+        for nom in ("doc.pdf", "slides.pptx", "rapport.docx", "notes.txt"):
+            self.assertEqual(self.envoyer(nom).status_code, status.HTTP_201_CREATED, nom)
 
-    def test_pptx_accepte(self):
-        res = self._post_fichier("slides.pptx", b"PPTX content",
-                                 "application/vnd.openxmlformats-officedocument.presentationml.presentation")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_docx_accepte(self):
-        res = self._post_fichier("rapport.docx", b"DOCX content",
-                                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_txt_accepte(self):
-        res = self._post_fichier("notes.txt", b"Texte", "text/plain")
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-
-    def test_png_refuse(self):
-        res = self._post_fichier("image.png", b"PNG data", "image/png")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_jpg_refuse(self):
-        res = self._post_fichier("photo.jpg", b"JPG data", "image/jpeg")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_mp4_refuse(self):
-        res = self._post_fichier("video.mp4", b"MP4 data", "video/mp4")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_zip_refuse(self):
-        res = self._post_fichier("archive.zip", b"ZIP data", "application/zip")
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_types_refuses(self):
+        for nom in ("image.png", "photo.jpg", "video.mp4", "archive.zip"):
+            self.assertEqual(self.envoyer(nom).status_code, status.HTTP_400_BAD_REQUEST, nom)
 
     def test_url_seule_acceptee(self):
-        res = self.client.post(self.fichier_url(), {
-            "livrable": self.livrable.id,
-            "nom": "Lien externe",
-            "url": "https://example.com/doc",
-        }, format="json")
+        res = self.client.post(self.url("fichier-livrable"),
+                               {"livrable": self.livrable.id, "nom": "Dépôt", "url": "https://github.com/x/y"})
         self.assertEqual(res.status_code, status.HTTP_201_CREATED)
 
     def test_url_et_fichier_refuses(self):
         fichier = SimpleUploadedFile("doc.pdf", b"PDF", content_type="application/pdf")
-        res = self.client.post(self.fichier_url(), {
-            "livrable": self.livrable.id,
-            "nom": "Invalide",
-            "url": "https://example.com",
-            "fichier": fichier,
+        res = self.client.post(self.url("fichier-livrable"), {
+            "livrable": self.livrable.id, "nom": "X", "fichier": fichier, "url": "https://x.test",
         })
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_taille_maximale_respectee(self):
-        gros_fichier = SimpleUploadedFile("gros.pdf", b"0" * (5 * 1024 * 1024 + 1),
-                                          content_type="application/pdf")
-        res = self.client.post(self.fichier_url(), {
-            "livrable": self.livrable.id,
-            "nom": "gros.pdf",
-            "fichier": gros_fichier,
-        })
-        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+    def test_taille_maximale(self):
+        self.assertEqual(self.envoyer("gros.pdf", b"x" * (5 * 1024 * 1024 + 1)).status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+    def test_autre_apprenant_ne_voit_pas_les_fichiers(self):
+        FichierLivrable.objects.create(livrable=self.livrable, nom="Lien", url="https://x.test")
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.get(self.url("fichier-livrable")).data, [])
+
+
+# ─── Protections côté pédagogie ───────────────────────────────────────────────
+
+class ReferentielUtiliseParUnBriefTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.creer_brief().competence_niveaux.add(self.cn)
+        self.client.force_authenticate(user=self.admin)
+        self.base = f"/api/tenants/{self.tenant.id}"
+
+    def test_module_utilise_non_supprimable(self):
+        vide = Module.objects.create(formation=self.formation, nom="Vide", ordre=9)
+        Brief.objects.filter(module=self.module).update(module=vide)
+        res = self.client.delete(f"{self.base}/modules/{vide.id}/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_niveau_de_competence_vise_non_retirable(self):
+        res = self.client.delete(f"{self.base}/competence-niveaux/{self.cn.id}/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(CompetenceNiveau.objects.filter(pk=self.cn.pk).exists())
+
+    def test_niveau_de_competence_libre_retirable(self):
+        res = self.client.delete(f"{self.base}/competence-niveaux/{self.cn_module_2.id}/")
+        self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)

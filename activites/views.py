@@ -1,9 +1,17 @@
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from accounts.models import MembreTenant
-from pedagogie.models import FormateurPromotion
+from pedagogie.permissions import IsAdminOrganisme, _est_formateur_de_promotion
+from pedagogie.views import (
+    _param_entier,
+    _promotions_de_l_apprenant,
+    _promotions_du_formateur,
+)
+from tenants.models import Tenant
 
 from .models import (
     Assignation,
@@ -11,20 +19,13 @@ from .models import (
     FichierLivrable,
     Livrable,
     Ressource,
-    RessourceBrief,
 )
 from .permissions import (
-    CanConsultAssignation,
-    CanConsultBrief,
-    CanConsultLivrable,
-    CanConsultRessource,
-    CanConsultRessourceBrief,
     CanCreateLivrable,
-    CanManageAssignation,
-    CanManageBrief,
     CanManageRessource,
-    CanManageRessourceBrief,
     CanUpdateLivrableStatut,
+    IsFormateurOrganisme,
+    IsMembreOrganisme,
 )
 from .serializers import (
     AssignationSerializer,
@@ -32,112 +33,175 @@ from .serializers import (
     FichierLivrableSerializer,
     LivrableSerializer,
     LivrableStatutSerializer,
-    RessourceBriefSerializer,
     RessourceSerializer,
+    brief_a_des_livrables,
 )
 
-
-def _promotions_du_formateur(user, tenant_id):
-    return FormateurPromotion.objects.filter(
-        formateur=user,
-        promotion__formation__tenant_id=tenant_id,
-    ).values_list("promotion_id", flat=True)
+ACTIONS_LECTURE = ("list", "retrieve")
 
 
-def _est_admin_organisme(user, tenant_id):
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _role(user, tenant_id):
+    """Rôle actif de l'utilisateur dans le tenant (None s'il n'est pas membre)."""
     return MembreTenant.objects.filter(
-        utilisateur=user,
-        tenant_id=tenant_id,
-        role=MembreTenant.Role.ADMINISTRATEUR,
-        actif=True,
-    ).exists()
+        utilisateur=user, tenant_id=tenant_id, actif=True
+    ).values_list("role", flat=True).first()
 
 
-# ─── Ressource indépendante ───────────────────────────────────────────────────
+def _briefs_visibles_apprenant(user, tenant_id):
+    """Briefs publiés ou archivés des promotions de l'apprenant (jamais les brouillons)."""
+    return Q(
+        promotion_id__in=list(_promotions_de_l_apprenant(user, tenant_id)),
+        statut__in=[Brief.Statut.PUBLIE, Brief.Statut.ARCHIVE],
+    )
+
+
+def _assignations_de_l_apprenant(user, tenant_id, prefixe=""):
+    """
+    Assignations qui visent l'apprenant : directement, ou via un groupe dont
+    il est membre actif ; sur un brief qu'il peut voir.
+    « prefixe » permet d'appliquer le filtre depuis un modèle lié
+    (ex. « assignation__ » depuis Livrable).
+    """
+    p = prefixe
+    promotions = list(_promotions_de_l_apprenant(user, tenant_id))
+    return (
+        Q(**{f"{p}apprenant": user})
+        | Q(**{f"{p}groupe__membres__apprenant": user, f"{p}groupe__membres__actif": True})
+    ) & Q(**{
+        f"{p}brief__promotion_id__in": promotions,
+        f"{p}brief__statut__in": [Brief.Statut.PUBLIE, Brief.Statut.ARCHIVE],
+    })
+
+
+class Refus(IsAdminOrganisme):
+    """Action non prévue : refusée (au lieu de n'appliquer aucune permission)."""
+
+    def has_permission(self, request, view):
+        return False
+
+
+def _refus_par_defaut(view):
+    """
+    Action non prévue : refusée (audit S13 : ne jamais renvoyer « aucune
+    permission »). Pour une méthode HTTP non exposée par la vue,
+    on exige d'être membre, puis DRF répond 405.
+    """
+    if view.request.method.lower() not in view.http_method_names:
+        return [IsMembreOrganisme()]
+    return [Refus()]
+
+
+# ─── Ressources ───────────────────────────────────────────────────────────────
 
 class RessourceViewSet(viewsets.ModelViewSet):
     """
-    Ressources indépendantes d'un Brief.
-    Consultation : tout membre actif du tenant.
-    Gestion (CUD) : Formateur ou Admin organisme.
-    Admin SaaS exclu.
+    Bibliothèque de ressources de l'organisme (fichiers ou liens).
+
+    - Admin organisme, Formateur : toute la bibliothèque ; création.
+    - Modification / suppression : créateur de la ressource ou admin organisme.
+    - Apprenant : uniquement les ressources jointes à ses briefs.
+    - Admin SaaS : aucun accès.
     """
 
+    serializer_class = RessourceSerializer
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultRessource()]
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
         return [CanManageRessource()]
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
-        return Ressource.objects.filter(tenant_id=tenant_id).select_related(
+        user = self.request.user
+        qs = Ressource.objects.filter(tenant_id=tenant_id).select_related(
             "formateur"
         ).order_by("-date_creation")
 
-    def get_serializer_class(self):
-        return RessourceSerializer
+        if _role(user, tenant_id) == MembreTenant.Role.APPRENANT:
+            briefs = Brief.objects.filter(_briefs_visibles_apprenant(user, tenant_id))
+            qs = qs.filter(briefs__in=briefs).distinct()
+        return qs
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context["tenant_id"] = self.kwargs["tenant_id"]
         return context
 
-    def perform_create(self, serializer):
-        from tenants.models import Tenant
-        from django.shortcuts import get_object_or_404
+    def _verifier_proprietaire(self, ressource):
+        user = self.request.user
         tenant_id = self.kwargs["tenant_id"]
-        tenant = get_object_or_404(Tenant, pk=tenant_id)
+        if ressource.formateur_id != user.id and _role(user, tenant_id) != MembreTenant.Role.ADMINISTRATEUR:
+            raise PermissionDenied(
+                "Seuls le créateur de la ressource et l'administrateur peuvent la modifier."
+            )
+
+    def perform_create(self, serializer):
+        tenant = get_object_or_404(Tenant, pk=self.kwargs["tenant_id"])
         serializer.save(tenant=tenant, formateur=self.request.user)
 
+    def perform_update(self, serializer):
+        self._verifier_proprietaire(serializer.instance)
+        serializer.save()
 
-# ─── Brief ────────────────────────────────────────────────────────────────────
+    def perform_destroy(self, instance):
+        self._verifier_proprietaire(instance)
+        if instance.briefs.exists():
+            raise PermissionDenied(
+                "Cette ressource est jointe à des briefs : retirez-la d'abord de ces briefs."
+            )
+        instance.delete()
+
+
+# ─── Briefs ───────────────────────────────────────────────────────────────────
 
 class BriefViewSet(viewsets.ModelViewSet):
     """
-    Consultation : APPRENANT, FORMATEUR, ADMINISTRATEUR (filtrage par promotion).
-    Gestion : FORMATEUR (ses promotions uniquement).
-    Admin SaaS exclu.
+    - Formateur : briefs de ses promotions ; création et gestion.
+    - Admin organisme : lecture de tous les briefs du tenant.
+    - Apprenant : briefs publiés ou archivés de ses promotions.
+    - Admin SaaS : aucun accès.
+
+    Un brief est figé dès le premier livrable (seul son statut change encore)
+    et ne peut alors plus être supprimé.
     """
 
     serializer_class = BriefSerializer
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultBrief()]
-        elif self.action in ["create", "partial_update", "destroy"]:
-            return [CanManageBrief()]
-        return []
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action in ("create", "partial_update", "destroy"):
+            return [IsFormateurOrganisme()]
+        return _refus_par_defaut(self)
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
         user = self.request.user
 
-        base_qs = (
-            Brief.objects.filter(
-                promotion__formation__tenant_id=tenant_id
-            )
-            .select_related("promotion", "promotion__formation")
-            .prefetch_related("competences")
+        qs = (
+            Brief.objects.filter(promotion__formation__tenant_id=tenant_id)
+            .select_related("promotion", "promotion__formation", "module", "cree_par")
+            .prefetch_related("competence_niveaux", "ressources")
+            .order_by("-date_creation")
         )
 
-        # Admin organisme : tous les briefs du tenant
-        if _est_admin_organisme(user, tenant_id):
-            return base_qs
+        promotion_id = _param_entier(self.request, "promotion")
+        if promotion_id is not None:
+            qs = qs.filter(promotion_id=promotion_id)
+        statut = self.request.query_params.get("statut")
+        if statut:
+            qs = qs.filter(statut=statut)
 
-        # Formateur : uniquement ses promotions affectées
-        role = MembreTenant.objects.filter(
-            utilisateur=user, tenant_id=tenant_id, actif=True
-        ).values_list("role", flat=True).first()
-
+        role = _role(user, tenant_id)
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return qs
         if role == MembreTenant.Role.FORMATEUR:
-            ids = _promotions_du_formateur(user, tenant_id)
-            return base_qs.filter(promotion_id__in=ids)
-
-        # Apprenant : tous les briefs de ses promotions (visibilité publique)
-        return base_qs
+            return qs.filter(promotion_id__in=_promotions_du_formateur(user, tenant_id))
+        return qs.filter(_briefs_visibles_apprenant(user, tenant_id))
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -145,75 +209,49 @@ class BriefViewSet(viewsets.ModelViewSet):
         context["request"] = self.request
         return context
 
-    def perform_update(self, serializer):
-        if serializer.instance.assignations.filter(livrables__isnull=False).exists():
-            raise PermissionDenied(
-                "Ce brief ne peut pas être modifié car il possède des livrables."
-            )
-        serializer.save()
+    def perform_create(self, serializer):
+        serializer.save(cree_par=self.request.user)
 
     def perform_destroy(self, instance):
-        if instance.assignations.filter(livrables__isnull=False).exists():
+        if not _est_formateur_de_promotion(self.request.user, instance.promotion_id):
+            raise PermissionDenied("Vous n'êtes pas affecté à la promotion de ce brief.")
+        if not instance.promotion.actif:
+            raise PermissionDenied("Cette promotion est clôturée : elle est en lecture seule.")
+        if brief_a_des_livrables(instance):
             raise PermissionDenied(
                 "Ce brief ne peut pas être supprimé car il possède des livrables."
             )
         instance.delete()
 
 
-# ─── RessourceBrief (déprécié) ────────────────────────────────────────────────
-
-class RessourceBriefViewSet(viewsets.ModelViewSet):
-    """
-    DÉPRÉCIÉ — conservé pour compatibilité.
-    Utiliser RessourceViewSet à la place.
-    """
-
-    serializer_class = RessourceBriefSerializer
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
-
-    def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultRessourceBrief()]
-        elif self.action in ["create", "partial_update", "destroy"]:
-            return [CanManageRessourceBrief()]
-        return []
-
-    def get_queryset(self):
-        return RessourceBrief.objects.filter(
-            brief__promotion__formation__tenant_id=self.kwargs["tenant_id"]
-        ).select_related("brief", "brief__promotion", "brief__promotion__formation")
-
-    def get_serializer_context(self):
-        context = super().get_serializer_context()
-        context["tenant_id"] = self.kwargs["tenant_id"]
-        context["request"] = self.request
-        return context
-
-
-# ─── Assignation ──────────────────────────────────────────────────────────────
+# ─── Assignations ─────────────────────────────────────────────────────────────
 
 class AssignationViewSet(viewsets.ModelViewSet):
     """
-    Consultation : APPRENANT, FORMATEUR, ADMINISTRATEUR.
-    Gestion : FORMATEUR (ses promotions uniquement — vérifié dans le serializer).
-    Admin SaaS exclu.
+    - Formateur : assignations de ses promotions ; création et suppression.
+    - Admin organisme : lecture de toutes les assignations du tenant.
+    - Apprenant : ses assignations (directes ou via un groupe dont il est
+      membre actif), sur des briefs publiés ou archivés.
+
+    Une assignation ne se modifie pas (la supprimer puis en recréer une) ;
+    elle ne peut plus être supprimée dès qu'elle a des livrables.
     """
 
     serializer_class = AssignationSerializer
-    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+    http_method_names = ["get", "post", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultAssignation()]
-        elif self.action in ["create", "partial_update", "destroy"]:
-            return [CanManageAssignation()]
-        return []
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action in ("create", "destroy"):
+            return [IsFormateurOrganisme()]
+        return _refus_par_defaut(self)
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
         user = self.request.user
 
-        base_qs = Assignation.objects.filter(
+        qs = Assignation.objects.filter(
             brief__promotion__formation__tenant_id=tenant_id
         ).select_related(
             "brief",
@@ -223,18 +261,16 @@ class AssignationViewSet(viewsets.ModelViewSet):
             "apprenant",
         )
 
-        if _est_admin_organisme(user, tenant_id):
-            return base_qs
+        brief_id = _param_entier(self.request, "brief")
+        if brief_id is not None:
+            qs = qs.filter(brief_id=brief_id)
 
-        role = MembreTenant.objects.filter(
-            utilisateur=user, tenant_id=tenant_id, actif=True
-        ).values_list("role", flat=True).first()
-
+        role = _role(user, tenant_id)
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return qs
         if role == MembreTenant.Role.FORMATEUR:
-            ids = _promotions_du_formateur(user, tenant_id)
-            return base_qs.filter(brief__promotion_id__in=ids)
-
-        return base_qs
+            return qs.filter(brief__promotion_id__in=_promotions_du_formateur(user, tenant_id))
+        return qs.filter(_assignations_de_l_apprenant(user, tenant_id)).distinct()
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -242,33 +278,58 @@ class AssignationViewSet(viewsets.ModelViewSet):
         context["request"] = self.request
         return context
 
+    def perform_destroy(self, instance):
+        promotion = instance.brief.promotion
+        if not _est_formateur_de_promotion(self.request.user, promotion.id):
+            raise PermissionDenied("Vous n'êtes pas affecté à la promotion de ce brief.")
+        if not promotion.actif:
+            raise PermissionDenied("Cette promotion est clôturée : elle est en lecture seule.")
+        if instance.livrables.exists():
+            raise PermissionDenied(
+                "Cette assignation a des livrables : elle ne peut pas être supprimée."
+            )
+        instance.delete()
 
-# ─── Livrable ─────────────────────────────────────────────────────────────────
+
+# ─── Livrables ────────────────────────────────────────────────────────────────
+
+def _livrables_visibles(user, tenant_id, qs, prefixe=""):
+    """Filtre un queryset de livrables (ou de fichiers via « prefixe ») selon le rôle."""
+    role = _role(user, tenant_id)
+    if role == MembreTenant.Role.ADMINISTRATEUR:
+        return qs
+    if role == MembreTenant.Role.FORMATEUR:
+        return qs.filter(**{
+            f"{prefixe}assignation__brief__promotion_id__in": _promotions_du_formateur(user, tenant_id)
+        })
+    # Apprenant : les livrables de ses propres assignations
+    return qs.filter(
+        _assignations_de_l_apprenant(user, tenant_id, prefixe=f"{prefixe}assignation__")
+    ).distinct()
+
 
 class LivrableViewSet(viewsets.ModelViewSet):
     """
-    Consultation : tout membre actif (filtrage par promotion pour formateur).
-    Création : APPRENANT uniquement.
-    PATCH statut : FORMATEUR (ses promotions uniquement).
-    Admin SaaS exclu.
+    - Apprenant : dépôt ; lecture des livrables de ses assignations.
+    - Formateur : lecture des livrables de ses promotions.
+    - Admin organisme : lecture de tous les livrables du tenant.
+    - Admin SaaS : aucun accès.
     """
 
     http_method_names = ["get", "post", "patch", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultLivrable()]
-        elif self.action == "create":
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action == "create":
             return [CanCreateLivrable()]
-        elif self.action == "partial_update":
+        if self.action == "partial_update":
             return [CanUpdateLivrableStatut()]
-        return []
+        return _refus_par_defaut(self)
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
-        user = self.request.user
-
-        base_qs = (
+        qs = (
             Livrable.objects.filter(
                 assignation__brief__promotion__formation__tenant_id=tenant_id
             )
@@ -283,19 +344,7 @@ class LivrableViewSet(viewsets.ModelViewSet):
             )
             .prefetch_related("fichiers")
         )
-
-        if _est_admin_organisme(user, tenant_id):
-            return base_qs
-
-        role = MembreTenant.objects.filter(
-            utilisateur=user, tenant_id=tenant_id, actif=True
-        ).values_list("role", flat=True).first()
-
-        if role == MembreTenant.Role.FORMATEUR:
-            ids = _promotions_du_formateur(user, tenant_id)
-            return base_qs.filter(assignation__brief__promotion_id__in=ids)
-
-        return base_qs
+        return _livrables_visibles(self.request.user, tenant_id, qs)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -319,24 +368,21 @@ class LivrableViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-# ─── FichierLivrable ──────────────────────────────────────────────────────────
-
 class FichierLivrableViewSet(viewsets.ModelViewSet):
     serializer_class = FichierLivrableSerializer
     http_method_names = ["get", "post", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ["list", "retrieve"]:
-            return [CanConsultLivrable()]
-        elif self.action == "create":
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action == "create":
             return [CanCreateLivrable()]
-        return []
+        return _refus_par_defaut(self)
 
     def get_queryset(self):
-        return FichierLivrable.objects.filter(
-            livrable__assignation__brief__promotion__formation__tenant_id=(
-                self.kwargs["tenant_id"]
-            )
+        tenant_id = self.kwargs["tenant_id"]
+        qs = FichierLivrable.objects.filter(
+            livrable__assignation__brief__promotion__formation__tenant_id=tenant_id
         ).select_related(
             "livrable",
             "livrable__assignation",
@@ -344,6 +390,7 @@ class FichierLivrableViewSet(viewsets.ModelViewSet):
             "livrable__assignation__brief__promotion",
             "livrable__assignation__brief__promotion__formation",
         )
+        return _livrables_visibles(self.request.user, tenant_id, qs, prefixe="livrable__")
 
     def get_serializer_context(self):
         context = super().get_serializer_context()

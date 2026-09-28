@@ -6,7 +6,6 @@ from .models import (
     FichierLivrable,
     Livrable,
     Ressource,
-    RessourceBrief,
 )
 
 
@@ -19,14 +18,8 @@ class RessourceAdmin(admin.ModelAdmin):
 
 @admin.register(Brief)
 class BriefAdmin(admin.ModelAdmin):
-    list_display = ("titre", "promotion", "statut", "date_debut", "date_limite")
+    list_display = ("titre", "promotion", "module", "statut", "date_debut", "date_limite", "cree_par")
     list_filter = ("statut", "promotion__formation__tenant")
-    search_fields = ("titre",)
-
-
-@admin.register(RessourceBrief)
-class RessourceBriefAdmin(admin.ModelAdmin):
-    list_display = ("titre", "brief", "date_creation")
     search_fields = ("titre",)
 
 

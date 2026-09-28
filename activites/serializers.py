@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from accounts.models import MembreTenant
-from pedagogie.models import Competence, FormateurPromotion
+from pedagogie.models import CompetenceNiveau, FormateurPromotion
 
 from .models import (
     Assignation,
@@ -9,7 +9,6 @@ from .models import (
     FichierLivrable,
     Livrable,
     Ressource,
-    RessourceBrief,
 )
 
 
@@ -18,6 +17,11 @@ def _est_formateur_de_promotion(user, promotion_id):
         formateur=user,
         promotion_id=promotion_id,
     ).exists()
+
+
+def brief_a_des_livrables(brief):
+    """Un brief est figé dès qu'un livrable a été déposé."""
+    return Livrable.objects.filter(assignation__brief=brief).exists()
 
 
 # ─── Ressource indépendante ───────────────────────────────────────────────────
@@ -68,42 +72,76 @@ class RessourceSerializer(serializers.ModelSerializer):
 # ─── Brief ────────────────────────────────────────────────────────────────────
 
 class BriefSerializer(serializers.ModelSerializer):
-    competences = serializers.PrimaryKeyRelatedField(
+    competence_niveaux = serializers.PrimaryKeyRelatedField(
         many=True,
-        queryset=Competence.objects.all(),
+        queryset=CompetenceNiveau.objects.select_related("competence__module"),
         required=False,
     )
+    ressources = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=Ressource.objects.all(),
+        required=False,
+    )
+    cree_par_nom = serializers.SerializerMethodField()
+    # False dès le premier livrable : le brief est alors figé
+    # (seul son statut peut encore changer).
+    modifiable = serializers.SerializerMethodField()
 
     class Meta:
         model = Brief
         fields = [
             "id",
             "promotion",
+            "module",
             "titre",
             "description",
             "consignes",
             "date_debut",
             "date_limite",
             "statut",
-            "competences",
+            "competence_niveaux",
+            "ressources",
+            "cree_par",
+            "cree_par_nom",
+            "modifiable",
             "date_creation",
             "date_modification",
         ]
         read_only_fields = [
             "id",
+            "cree_par",
             "date_creation",
             "date_modification",
         ]
 
+    def get_cree_par_nom(self, brief):
+        if not brief.cree_par:
+            return None
+        return f"{brief.cree_par.prenom} {brief.cree_par.nom}"
+
+    def get_modifiable(self, brief):
+        return not brief_a_des_livrables(brief)
+
     def validate(self, attrs):
         tenant_id = self.context["tenant_id"]
-        request = self.context.get("request")
+        request = self.context["request"]
+        instance = self.instance
 
-        promotion = attrs.get(
-            "promotion",
-            getattr(self.instance, "promotion", None),
-        )
+        # Brief figé après le premier livrable : seul le statut change encore.
+        if instance and brief_a_des_livrables(instance):
+            autres = set(attrs) - {"statut"}
+            if autres:
+                raise serializers.ValidationError(
+                    "Ce brief a déjà des livrables : il ne peut plus être modifié "
+                    "(seul son statut peut changer)."
+                )
 
+        if instance and "promotion" in attrs and attrs["promotion"].pk != instance.promotion_id:
+            raise serializers.ValidationError(
+                {"promotion": "Un brief ne peut pas changer de promotion."}
+            )
+
+        promotion = attrs.get("promotion", getattr(instance, "promotion", None))
         if promotion is None:
             raise serializers.ValidationError({"promotion": "La promotion est obligatoire."})
 
@@ -112,95 +150,59 @@ class BriefSerializer(serializers.ModelSerializer):
                 "promotion": "Cette promotion n'appartient pas à cet organisme."
             })
 
-        # Vérification que le formateur est affecté à la promotion
-        if request and request.user and not request.user.est_admin_saas:
-            is_admin = MembreTenant.objects.filter(
-                utilisateur=request.user,
-                tenant_id=tenant_id,
-                role=MembreTenant.Role.ADMINISTRATEUR,
-                actif=True,
-            ).exists()
-            if not is_admin:
-                if not _est_formateur_de_promotion(request.user, promotion.id):
-                    raise serializers.ValidationError({
-                        "promotion": "Vous n'êtes pas affecté à cette promotion."
-                    })
+        if not _est_formateur_de_promotion(request.user, promotion.id):
+            raise serializers.ValidationError({
+                "promotion": "Vous n'êtes pas affecté à cette promotion."
+            })
 
-        date_debut = attrs.get("date_debut", getattr(self.instance, "date_debut", None))
-        date_limite = attrs.get("date_limite", getattr(self.instance, "date_limite", None))
+        if not promotion.actif:
+            raise serializers.ValidationError({
+                "promotion": "Cette promotion est clôturée : elle est en lecture seule."
+            })
+
+        # Module principal : obligatoire, dans la formation de la promotion
+        module = attrs.get("module", getattr(instance, "module", None))
+        if module is None:
+            raise serializers.ValidationError({"module": "Le module est obligatoire."})
+        if module.formation_id != promotion.formation_id:
+            raise serializers.ValidationError({
+                "module": "Le module doit appartenir à la formation de la promotion."
+            })
+
+        # Compétences visées : de n'importe quel module de la formation
+        competence_niveaux = attrs.get("competence_niveaux")
+        if competence_niveaux is not None:
+            if any(
+                cn.competence.module.formation_id != promotion.formation_id
+                for cn in competence_niveaux
+            ):
+                raise serializers.ValidationError({
+                    "competence_niveaux": (
+                        "Les compétences visées doivent appartenir à la formation "
+                        "de la promotion."
+                    )
+                })
+
+        ressources = attrs.get("ressources")
+        if ressources is not None:
+            if any(str(r.tenant_id) != str(tenant_id) for r in ressources):
+                raise serializers.ValidationError({
+                    "ressources": "Ces ressources n'appartiennent pas à cet organisme."
+                })
+
+        date_debut = attrs.get("date_debut", getattr(instance, "date_debut", None))
+        date_limite = attrs.get("date_limite", getattr(instance, "date_limite", None))
 
         if date_debut and date_limite and date_limite < date_debut:
             raise serializers.ValidationError({
                 "date_limite": "La date limite doit être postérieure ou égale à la date de début."
             })
 
-        competences = attrs.get("competences")
-        if competences is not None:
-            formation_id = promotion.formation_id
-            invalides = [
-                c.id for c in competences
-                if c.module.formation_id != formation_id
-            ]
-            if invalides:
-                raise serializers.ValidationError({
-                    "competences": "Toutes les compétences doivent appartenir à la formation de la promotion."
-                })
-
         if "titre" in attrs:
             titre = attrs["titre"].strip()
             if not titre:
                 raise serializers.ValidationError({"titre": "Le titre ne peut pas être vide."})
             attrs["titre"] = titre
-
-        return attrs
-
-
-# ─── RessourceBrief (déprécié — conservé pour compatibilité) ─────────────────
-
-class RessourceBriefSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = RessourceBrief
-        fields = [
-            "id",
-            "brief",
-            "titre",
-            "url",
-            "fichier",
-            "date_creation",
-        ]
-        read_only_fields = [
-            "id",
-            "date_creation",
-        ]
-
-    def validate(self, attrs):
-        tenant_id = self.context["tenant_id"]
-
-        brief = attrs.get("brief", getattr(self.instance, "brief", None))
-
-        if brief is None:
-            raise serializers.ValidationError({"brief": "Le brief est obligatoire."})
-
-        if str(brief.promotion.formation.tenant_id) != str(tenant_id):
-            raise serializers.ValidationError({"brief": "Ce brief n'appartient pas à cet organisme."})
-
-        url = attrs.get("url", getattr(self.instance, "url", None))
-        fichier = attrs.get("fichier", getattr(self.instance, "fichier", None))
-
-        if bool(url) == bool(fichier):
-            raise serializers.ValidationError({
-                "url": "Une seule source doit être renseignée : une URL ou un fichier.",
-                "fichier": "Une seule source doit être renseignée : une URL ou un fichier.",
-            })
-
-        if "titre" in attrs:
-            titre = attrs["titre"].strip()
-            if not titre:
-                raise serializers.ValidationError({"titre": "Le titre ne peut pas être vide."})
-            attrs["titre"] = titre
-
-        if fichier and hasattr(fichier, "size") and fichier.size > 5 * 1024 * 1024:
-            raise serializers.ValidationError({"fichier": "Le fichier ne doit pas dépasser 5 Mo."})
 
         return attrs
 
@@ -224,11 +226,11 @@ class AssignationSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         tenant_id = self.context["tenant_id"]
-        request = self.context.get("request")
+        request = self.context["request"]
 
-        brief = attrs.get("brief", getattr(self.instance, "brief", None))
-        groupe = attrs.get("groupe", getattr(self.instance, "groupe", None))
-        apprenant = attrs.get("apprenant", getattr(self.instance, "apprenant", None))
+        brief = attrs.get("brief")
+        groupe = attrs.get("groupe")
+        apprenant = attrs.get("apprenant")
 
         if brief is None:
             raise serializers.ValidationError({"brief": "Le brief est obligatoire."})
@@ -237,21 +239,20 @@ class AssignationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"brief": "Ce brief n'appartient pas à cet organisme."})
 
         # Le formateur doit être affecté à la promotion du brief
-        if request and request.user and not request.user.est_admin_saas:
-            is_admin = MembreTenant.objects.filter(
-                utilisateur=request.user,
-                tenant_id=tenant_id,
-                role=MembreTenant.Role.ADMINISTRATEUR,
-                actif=True,
-            ).exists()
-            if not is_admin:
-                if not _est_formateur_de_promotion(request.user, brief.promotion_id):
-                    raise serializers.ValidationError({
-                        "brief": "Vous n'êtes pas affecté à la promotion de ce brief."
-                    })
+        if not _est_formateur_de_promotion(request.user, brief.promotion_id):
+            raise serializers.ValidationError({
+                "brief": "Vous n'êtes pas affecté à la promotion de ce brief."
+            })
 
-        # Règle : au moins une cible doit être renseignée.
-        # apprenant seul, groupe seul, ou les deux sont tous acceptés.
+        if not brief.promotion.actif:
+            raise serializers.ValidationError({
+                "brief": "La promotion de ce brief est clôturée : elle est en lecture seule."
+            })
+
+        if brief.statut == Brief.Statut.ARCHIVE:
+            raise serializers.ValidationError({"brief": "Ce brief est archivé."})
+
+        # Au moins une cible : apprenant seul, groupe seul, ou les deux.
         if not groupe and not apprenant:
             raise serializers.ValidationError({
                 "groupe": "Au moins une cible doit être renseignée : un groupe, un apprenant, ou les deux.",
@@ -265,10 +266,8 @@ class AssignationSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     "groupe": "Le groupe doit appartenir à la promotion du brief."
                 })
-            if str(groupe.promotion.formation.tenant_id) != str(tenant_id):
-                raise serializers.ValidationError({
-                    "groupe": "Ce groupe n'appartient pas à cet organisme."
-                })
+            if not groupe.actif:
+                raise serializers.ValidationError({"groupe": "Ce groupe est désactivé."})
 
         if apprenant:
             # NOTE : Utilisateur.actif n'est PAS vérifié.
@@ -296,15 +295,14 @@ class AssignationSerializer(serializers.ModelSerializer):
                 })
 
         # Anti-doublon
-        if self.instance is None:
-            if groupe and Assignation.objects.filter(brief=brief, groupe=groupe).exists():
-                raise serializers.ValidationError({
-                    "groupe": "Ce groupe est déjà assigné à ce brief."
-                })
-            if apprenant and Assignation.objects.filter(brief=brief, apprenant=apprenant).exists():
-                raise serializers.ValidationError({
-                    "apprenant": "Cet apprenant est déjà assigné à ce brief."
-                })
+        if groupe and Assignation.objects.filter(brief=brief, groupe=groupe).exists():
+            raise serializers.ValidationError({
+                "groupe": "Ce groupe est déjà assigné à ce brief."
+            })
+        if apprenant and Assignation.objects.filter(brief=brief, apprenant=apprenant).exists():
+            raise serializers.ValidationError({
+                "apprenant": "Cet apprenant est déjà assigné à ce brief."
+            })
 
         return attrs
 
@@ -351,51 +349,23 @@ class LivrableSerializer(serializers.ModelSerializer):
         if not utilisateur.is_active:
             raise serializers.ValidationError({"assignation": "Votre compte est inactif."})
 
-        # Assignation individuelle
-        if assignation.apprenant_id:
-            if assignation.apprenant_id != utilisateur.id:
-                raise serializers.ValidationError({
-                    "assignation": "Vous ne pouvez pas déposer un livrable pour cette assignation."
-                })
-
-            inscription_active = (
-                assignation.brief.promotion.inscriptions.filter(
-                    apprenant=utilisateur,
-                    actif=True,
-                ).exists()
-            )
-
-            if not inscription_active:
-                raise serializers.ValidationError({
-                    "assignation": "Vous n'êtes plus inscrit activement à cette promotion."
-                })
-
-        # Assignation de groupe
-        elif assignation.groupe_id:
-            membre_groupe = assignation.groupe.membres.filter(
-                apprenant=utilisateur,
-            ).exists()
-
-            if not membre_groupe:
-                raise serializers.ValidationError({
-                    "assignation": "Vous n'êtes pas membre de ce groupe."
-                })
-
-            inscription_active = (
-                assignation.brief.promotion.inscriptions.filter(
-                    apprenant=utilisateur,
-                    actif=True,
-                ).exists()
-            )
-
-            if not inscription_active:
-                raise serializers.ValidationError({
-                    "assignation": "Vous n'êtes plus inscrit activement à cette promotion."
-                })
-
-        else:
+        # L'apprenant visé, ou un membre actif du groupe visé (une assignation
+        # peut cibler les deux à la fois).
+        est_cible = assignation.apprenant_id == utilisateur.id or (
+            assignation.groupe_id
+            and assignation.groupe.membres.filter(apprenant=utilisateur, actif=True).exists()
+        )
+        if not est_cible:
             raise serializers.ValidationError({
-                "assignation": "Cette assignation ne possède aucune cible valide."
+                "assignation": "Vous ne pouvez pas déposer un livrable pour cette assignation."
+            })
+
+        if not assignation.brief.promotion.inscriptions.filter(
+            apprenant=utilisateur,
+            actif=True,
+        ).exists():
+            raise serializers.ValidationError({
+                "assignation": "Vous n'êtes plus inscrit activement à cette promotion."
             })
 
         if "titre" in attrs:
