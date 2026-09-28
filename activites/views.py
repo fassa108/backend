@@ -1,7 +1,7 @@
 import os
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
@@ -26,10 +26,11 @@ from .models import (
     Livrable,
     Ressource,
 )
+from .apercus import demander_apercu, reponse_consultation
+from .notifications import notifier_assignations, notifier_depot, notifier_publication
 from .permissions import (
     CanCreateLivrable,
     CanManageRessource,
-    CanUpdateLivrableStatut,
     IsFormateurOrganisme,
     IsMembreOrganisme,
 )
@@ -37,9 +38,9 @@ from .serializers import (
     AssignationSerializer,
     BriefSerializer,
     CategorieBriefSerializer,
+    DepotSerializer,
     FichierLivrableSerializer,
     LivrableSerializer,
-    LivrableStatutSerializer,
     RessourceSerializer,
     brief_a_des_livrables,
 )
@@ -116,7 +117,7 @@ class RessourceViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch", "delete", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ACTIONS_LECTURE + ("telecharger",):
+        if self.action in ACTIONS_LECTURE + ("telecharger", "consulter"):
             return [IsMembreOrganisme()]
         return [CanManageRessource()]
 
@@ -133,11 +134,14 @@ class RessourceViewSet(viewsets.ModelViewSet):
             fichier = ressource.fichier.open("rb")
         except FileNotFoundError:
             raise NotFound("Le fichier de cette ressource est introuvable.")
-        return FileResponse(
-            fichier,
-            as_attachment=True,
-            filename=os.path.basename(ressource.fichier.name),
-        )
+        # Sur le disque, le nom est aléatoire : on propose « titre.extension »
+        ext = os.path.splitext(ressource.fichier.name)[1]
+        return FileResponse(fichier, as_attachment=True, filename=f"{ressource.titre}{ext}")
+
+    @action(detail=True, methods=["get"], url_path="consulter")
+    def consulter(self, request, tenant_id=None, pk=None):
+        """Affichage dans la plateforme (PDF, texte, ou aperçu PDF d'un fichier Office)."""
+        return reponse_consultation(self.get_object())
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]
@@ -166,11 +170,25 @@ class RessourceViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         tenant = get_object_or_404(Tenant, pk=self.kwargs["tenant_id"])
-        serializer.save(tenant=tenant, formateur=self.request.user)
+        ressource = serializer.save(tenant=tenant, formateur=self.request.user)
+        demander_apercu(ressource)
 
     def perform_update(self, serializer):
-        self._verifier_proprietaire(serializer.instance)
-        serializer.save()
+        ressource = serializer.instance
+        self._verifier_proprietaire(ressource)
+        # Nouveau fichier ou passage à un lien : l'ancien fichier et son
+        # aperçu partent, une fois la modification enregistrée.
+        change_de_source = "fichier" in serializer.validated_data or serializer.validated_data.get("url")
+        anciens = [f for f in (ressource.fichier, ressource.apercu) if f] if change_de_source else []
+        anciens = [(f.storage, f.name) for f in anciens]
+        if change_de_source:
+            ressource.apercu = None
+            ressource.apercu_statut = ""
+        ressource = serializer.save()
+        for stockage, nom in anciens:
+            transaction.on_commit(lambda s=stockage, n=nom: s.delete(n))
+        if change_de_source:
+            demander_apercu(ressource)
 
     def perform_destroy(self, instance):
         self._verifier_proprietaire(instance)
@@ -178,7 +196,10 @@ class RessourceViewSet(viewsets.ModelViewSet):
             raise PermissionDenied(
                 "Cette ressource est jointe à des briefs : retirez-la d'abord de ces briefs."
             )
+        fichiers = [(f.storage, f.name) for f in (instance.fichier, instance.apercu) if f]
         instance.delete()
+        for stockage, nom in fichiers:
+            transaction.on_commit(lambda s=stockage, n=nom: s.delete(n))
 
 
 # ─── Catégories de brief ─────────────────────────────────────────────────────
@@ -277,6 +298,13 @@ class BriefViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(cree_par=self.request.user)
 
+    def perform_update(self, serializer):
+        etait_brouillon = serializer.instance.statut == Brief.Statut.BROUILLON
+        brief = serializer.save()
+        # Publication d'un brouillon : les apprenants déjà assignés sont prévenus
+        if etait_brouillon and brief.statut == Brief.Statut.PUBLIE:
+            notifier_publication(brief)
+
     def perform_destroy(self, instance):
         if not _est_formateur_de_promotion(self.request.user, instance.promotion_id):
             raise PermissionDenied("Vous n'êtes pas affecté à la promotion de ce brief.")
@@ -360,6 +388,7 @@ class AssignationViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        notifier_assignations(creees)
         return Response(
             AssignationSerializer(creees, many=True).data,
             status=status.HTTP_201_CREATED,
@@ -396,6 +425,9 @@ class AssignationViewSet(viewsets.ModelViewSet):
         context["request"] = self.request
         return context
 
+    def perform_create(self, serializer):
+        notifier_assignations([serializer.save()])
+
     def perform_destroy(self, instance):
         promotion = instance.brief.promotion
         if not _est_formateur_de_promotion(self.request.user, promotion.id):
@@ -412,7 +444,12 @@ class AssignationViewSet(viewsets.ModelViewSet):
 # ─── Livrables ────────────────────────────────────────────────────────────────
 
 def _livrables_visibles(user, tenant_id, qs, prefixe=""):
-    """Filtre un queryset de livrables (ou de fichiers via « prefixe ») selon le rôle."""
+    """
+    Filtre un queryset de livrables (ou de fichiers via « prefixe ») selon le rôle.
+
+    Apprenant : tous les dépôts de ses assignations ; et, sur chaque brief où
+    il a déjà déposé, le dernier dépôt de chacun des autres (travaux des pairs).
+    """
     role = _role(user, tenant_id)
     if role == MembreTenant.Role.ADMINISTRATEUR:
         return qs
@@ -420,29 +457,45 @@ def _livrables_visibles(user, tenant_id, qs, prefixe=""):
         return qs.filter(**{
             f"{prefixe}assignation__brief__promotion_id__in": _promotions_du_formateur(user, tenant_id)
         })
-    # Apprenant : les livrables de ses propres assignations
+
+    siens = Livrable.objects.filter(
+        _assignations_de_l_apprenant(user, tenant_id, prefixe="assignation__")
+    )
+    briefs_deposes = siens.values_list("assignation__brief_id", flat=True)
+    derniers_des_pairs = (
+        Livrable.objects.filter(assignation__brief_id__in=briefs_deposes)
+        .order_by()  # sans le tri par défaut, qui fausserait le regroupement
+        .values("assignation_id")
+        .annotate(dernier=Max("id"))
+        .values_list("dernier", flat=True)
+    )
     return qs.filter(
-        _assignations_de_l_apprenant(user, tenant_id, prefixe=f"{prefixe}assignation__")
+        Q(**{f"{prefixe}id__in": siens.values_list("id", flat=True)})
+        | Q(**{f"{prefixe}id__in": list(derniers_des_pairs)})
     ).distinct()
 
 
 class LivrableViewSet(viewsets.ModelViewSet):
     """
-    - Apprenant : dépôt ; lecture des livrables de ses assignations.
-    - Formateur : lecture des livrables de ses promotions.
-    - Admin organisme : lecture de tous les livrables du tenant.
+    Dépôts (« Dépôt n°1, n°2… ») : jamais modifiés ni supprimés.
+
+    - Apprenant : dépôt (fichiers et liens en une requête) ; lecture de ses
+      dépôts, et du dernier dépôt de ses pairs sur les briefs où il a déposé.
+    - Formateur : lecture des dépôts de ses promotions.
+    - Admin organisme : lecture de tous les dépôts du tenant.
     - Admin SaaS : aucun accès.
+
+    Filtres : ?brief=, ?assignation=.
     """
 
-    http_method_names = ["get", "post", "patch", "head", "options"]
+    serializer_class = LivrableSerializer
+    http_method_names = ["get", "post", "head", "options"]
 
     def get_permissions(self):
         if self.action in ACTIONS_LECTURE:
             return [IsMembreOrganisme()]
         if self.action == "create":
             return [CanCreateLivrable()]
-        if self.action == "partial_update":
-            return [CanUpdateLivrableStatut()]
         return _refus_par_defaut(self)
 
     def get_queryset(self):
@@ -454,14 +507,18 @@ class LivrableViewSet(viewsets.ModelViewSet):
             .select_related(
                 "assignation",
                 "assignation__brief",
-                "assignation__brief__promotion",
-                "assignation__brief__promotion__formation",
                 "assignation__groupe",
                 "assignation__apprenant",
                 "deposant",
             )
             .prefetch_related("fichiers")
         )
+        brief_id = _param_entier(self.request, "brief")
+        if brief_id is not None:
+            qs = qs.filter(assignation__brief_id=brief_id)
+        assignation_id = _param_entier(self.request, "assignation")
+        if assignation_id is not None:
+            qs = qs.filter(assignation_id=assignation_id)
         return _livrables_visibles(self.request.user, tenant_id, qs)
 
     def get_serializer_context(self):
@@ -470,32 +527,44 @@ class LivrableViewSet(viewsets.ModelViewSet):
         context["request"] = self.request
         return context
 
-    def get_serializer_class(self):
-        if self.action == "partial_update":
-            return LivrableStatutSerializer
-        return LivrableSerializer
-
-    def perform_create(self, serializer):
-        serializer.save(deposant=self.request.user)
-
-    def partial_update(self, request, *args, **kwargs):
-        livrable = self.get_object()
-        serializer = self.get_serializer(livrable, data=request.data, partial=True)
+    def create(self, request, *args, **kwargs):
+        serializer = DepotSerializer(data=request.data, context=self.get_serializer_context())
         serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        livrable = serializer.save()
+        notifier_depot(livrable)
+        return Response(LivrableSerializer(livrable).data, status=status.HTTP_201_CREATED)
 
 
-class FichierLivrableViewSet(viewsets.ModelViewSet):
+class FichierLivrableViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Éléments des dépôts, en lecture. Ils sont créés avec le dépôt ; un fichier
+    se consulte (« consulter ») ou se télécharge (« telecharger ») via des
+    routes qui vérifient les droits.
+    """
+
     serializer_class = FichierLivrableSerializer
-    http_method_names = ["get", "post", "head", "options"]
+    http_method_names = ["get", "head", "options"]
 
     def get_permissions(self):
-        if self.action in ACTIONS_LECTURE:
+        if self.action in ACTIONS_LECTURE + ("telecharger", "consulter"):
             return [IsMembreOrganisme()]
-        if self.action == "create":
-            return [CanCreateLivrable()]
         return _refus_par_defaut(self)
+
+    @action(detail=True, methods=["get"], url_path="telecharger")
+    def telecharger(self, request, tenant_id=None, pk=None):
+        element = self.get_object()
+        if not element.fichier:
+            raise NotFound("Cet élément est un lien, pas un fichier.")
+        try:
+            fichier = element.fichier.open("rb")
+        except FileNotFoundError:
+            raise NotFound("Le fichier est introuvable.")
+        return FileResponse(fichier, as_attachment=True, filename=element.nom)
+
+    @action(detail=True, methods=["get"], url_path="consulter")
+    def consulter(self, request, tenant_id=None, pk=None):
+        """Affichage dans la plateforme (PDF, texte, ou aperçu PDF d'un fichier Office)."""
+        return reponse_consultation(self.get_object())
 
     def get_queryset(self):
         tenant_id = self.kwargs["tenant_id"]

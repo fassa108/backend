@@ -50,10 +50,3 @@ class CanCreateLivrable(_PermissionOrganisme):
 
     message = "Seul un apprenant autorisé peut déposer un livrable."
     roles = (MembreTenant.Role.APPRENANT,)
-
-
-class CanUpdateLivrableStatut(_PermissionOrganisme):
-    """Modification du statut d'un livrable : Formateur uniquement."""
-
-    message = "Seul un formateur autorisé peut modifier le statut d'un livrable."
-    roles = (MembreTenant.Role.FORMATEUR,)
