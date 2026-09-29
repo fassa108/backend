@@ -15,6 +15,9 @@ Couvre :
 - Fichiers : types acceptés / refusés
 - Consultation : PDF / TXT tels quels, aperçu PDF des fichiers Office
   (Gotenberg simulé), mêmes droits que le téléchargement
+- Évaluations : évaluateur (créateur du brief), compétences visées,
+  rien d'acquis sans dépôt, validation définitive, groupes, emails
+- Progression : compétences-niveaux validées, briefs validés, visibilité
 - Multi-tenant : isolation
 """
 
@@ -50,7 +53,16 @@ from pedagogie.models import (
 from pedagogie.services import InscriptionService
 from tenants.models import Tenant
 
-from .models import Assignation, Brief, CategorieBrief, FichierLivrable, Livrable, Ressource
+from .models import (
+    Assignation,
+    Brief,
+    CategorieBrief,
+    CompetenceValidee,
+    Evaluation,
+    FichierLivrable,
+    Livrable,
+    Ressource,
+)
 
 User = get_user_model()
 
@@ -274,6 +286,24 @@ class BriefCreationTests(ActivitesBaseTestCase):
             competence_niveaux=[self.cn_autre_formation.id]), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("competence_niveaux", res.data)
+
+    def test_competence_deja_visee_par_un_autre_brief_de_la_promotion(self):
+        self.creer_brief().competence_niveaux.add(self.cn)
+        res = self.client.post(self.url("brief"), self.payload_brief(), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Créer une API REST", str(res.data["competence_niveaux"]))
+
+    def test_meme_competence_dans_une_autre_promotion(self):
+        self.creer_brief().competence_niveaux.add(self.cn)
+        FormateurPromotion.objects.create(formateur=self.formateur, promotion=self.promotion_2)
+        res = self.client.post(self.url("brief"), self.payload_brief(promotion=self.promotion_2.id), format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+    def test_modifier_un_brief_en_gardant_ses_competences(self):
+        brief_id = self.client.post(self.url("brief"), self.payload_brief(), format="json").data["id"]
+        res = self.client.patch(self.url("brief", brief_id),
+                                {"titre": "Nouveau titre", "competence_niveaux": [self.cn.id]}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
 
     def test_ressource_d_un_autre_organisme_refusee(self):
         ressource = Ressource.objects.create(tenant=self.tenant_2, titre="Doc", url="https://example.com")
@@ -1211,6 +1241,273 @@ class ConsultationRessourceTests(ActivitesBaseTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             self.client.delete(self.url("ressource", ressource.id))
         self.assertFalse(os.path.exists(fichier))
+
+
+# ─── Évaluations ──────────────────────────────────────────────────────────────
+
+@patch("activites.notifications.envoyer_email_evaluation.delay")
+class EvaluationTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.niveau_2 = Niveau.objects.create(tenant=self.tenant, nom="Adapter", ordre=2)
+        self.cn2 = CompetenceNiveau.objects.create(competence=self.cn.competence, niveau=self.niveau_2)
+        self.brief = self.creer_brief(cree_par=self.formateur)
+        self.brief.competence_niveaux.set([self.cn, self.cn2])
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        self.deposer(self.assignation)
+        # Autre formateur de la même promotion
+        self.formateur_3 = self.membre("formateur3@test.com", MembreTenant.Role.FORMATEUR)
+        FormateurPromotion.objects.create(formateur=self.formateur_3, promotion=self.promotion)
+
+    def evaluer(self, assignation=None, acquis=(True, False), utilisateur=None, commentaire="Bon travail"):
+        self.client.force_authenticate(user=utilisateur or self.formateur)
+        lignes = [
+            {"competence_niveau": cn.id, "acquis": a}
+            for cn, a in zip((self.cn, self.cn2), acquis)
+        ]
+        return self.client.post(self.url("evaluation"), {
+            "assignation": (assignation or self.assignation).id,
+            "commentaire": commentaire,
+            "competences": lignes,
+        }, format="json")
+
+    def test_createur_du_brief_evalue(self, email):
+        res = self.evaluer()
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.data["evaluateur"], self.formateur.id)
+        self.assertEqual(res.data["commentaire"], "Bon travail")
+        self.assertEqual(res.data["cible"]["type"], "apprenant")
+        lignes = {l["competence_niveau"]: l for l in res.data["competences"]}
+        self.assertTrue(lignes[self.cn.id]["acquis"])
+        self.assertEqual(lignes[self.cn2.id]["niveau_nom"], "Adapter")
+        self.assertEqual(
+            list(CompetenceValidee.objects.filter(apprenant=self.apprenant).values_list("competence_niveau", flat=True)),
+            [self.cn.id],
+        )
+
+    def test_autre_formateur_de_la_promotion_refuse(self, email):
+        self.assertEqual(self.evaluer(utilisateur=self.formateur_3).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_createur_desaffecte_un_autre_formateur_evalue(self, email):
+        FormateurPromotion.objects.filter(formateur=self.formateur, promotion=self.promotion).delete()
+        self.assertEqual(self.evaluer().status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.evaluer(utilisateur=self.formateur_3).status_code, status.HTTP_201_CREATED)
+
+    def test_hors_promotion_admin_et_apprenant_refuses(self, email):
+        for u in (self.formateur_2, self.admin, self.apprenant):
+            self.assertEqual(self.evaluer(utilisateur=u).status_code, status.HTTP_403_FORBIDDEN, u.email)
+
+    def test_toutes_les_competences_visees_une_fois(self, email):
+        self.client.force_authenticate(user=self.formateur)
+        for lignes in (
+            [{"competence_niveau": self.cn.id, "acquis": True}],
+            [{"competence_niveau": self.cn.id, "acquis": True}, {"competence_niveau": self.cn.id, "acquis": True}],
+            [{"competence_niveau": self.cn.id, "acquis": True}, {"competence_niveau": self.cn2.id, "acquis": True},
+             {"competence_niveau": self.cn_module_2.id, "acquis": True}],
+        ):
+            res = self.client.post(self.url("evaluation"),
+                                   {"assignation": self.assignation.id, "competences": lignes}, format="json")
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn("competences", res.data)
+
+    def test_sans_depot_rien_ne_peut_etre_acquis(self, email):
+        sans_depot = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        res = self.evaluer(assignation=sans_depot)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.evaluer(assignation=sans_depot, acquis=(False, False)).status_code,
+                         status.HTTP_201_CREATED)
+
+    def test_validation_definitive(self, email):
+        self.evaluer(acquis=(True, False))
+        res = self.evaluer(acquis=(False, True))
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("définitif", str(res.data["competences"]))
+        # Réévaluation : ce qui manquait est désormais acquis ; historique gardé
+        self.assertEqual(self.evaluer(acquis=(True, True)).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.assignation.evaluations.count(), 2)
+        self.assertEqual(CompetenceValidee.objects.filter(apprenant=self.apprenant).count(), 2)
+
+    def test_competence_validee_ailleurs_le_reste(self, email):
+        self.evaluer(acquis=(True, False))
+        autre = self.creer_brief(cree_par=self.formateur)
+        autre.competence_niveaux.set([self.cn, self.cn2])
+        a = Assignation.objects.create(brief=autre, apprenant=self.apprenant)
+        self.deposer(a)
+        self.assertEqual(self.evaluer(assignation=a, acquis=(False, False)).status_code, status.HTTP_201_CREATED)
+        self.assertTrue(CompetenceValidee.objects.filter(apprenant=self.apprenant, competence_niveau=self.cn).exists())
+
+    def test_groupe_valide_pour_ses_membres_actifs(self, email):
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="G1")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant)
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b, actif=False)
+        brief = self.creer_brief(cree_par=self.formateur)
+        brief.competence_niveaux.set([self.cn, self.cn2])
+        a = Assignation.objects.create(brief=brief, groupe=groupe)
+        self.deposer(a)
+        self.assertEqual(self.evaluer(assignation=a, acquis=(True, True)).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(CompetenceValidee.objects.filter(apprenant=self.apprenant).count(), 2)
+        self.assertFalse(CompetenceValidee.objects.filter(apprenant=self.apprenant_b).exists())
+
+    def test_brouillon_et_promotion_cloturee_refuses(self, email):
+        Brief.objects.filter(pk=self.brief.pk).update(statut=Brief.Statut.BROUILLON)
+        self.assertEqual(self.evaluer().status_code, status.HTTP_400_BAD_REQUEST)
+        Brief.objects.filter(pk=self.brief.pk).update(statut=Brief.Statut.ARCHIVE)
+        Promotion.objects.filter(pk=self.promotion.pk).update(actif=False)
+        self.assertEqual(self.evaluer().status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_brief_sans_competence_commentaire_seul(self, email):
+        brief = self.creer_brief(cree_par=self.formateur)
+        a = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(self.url("evaluation"), {"assignation": a.id, "commentaire": "Vu"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+    def test_visibilite(self, email):
+        self.evaluer()
+        a_b = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        self.evaluer(assignation=a_b, acquis=(False, False))
+
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.get(self.url("evaluation"))
+        self.assertEqual([e["assignation"] for e in res.data], [self.assignation.id])
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.client.get(self.url("evaluation")).data, [])
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(len(self.client.get(self.url("evaluation")).data), 2)
+        res = self.client.get(self.url("evaluation"), {"assignation": a_b.id})
+        self.assertEqual(len(res.data), 1)
+
+    def test_ni_modifiee_ni_supprimee(self, email):
+        evaluation_id = self.evaluer().data["id"]
+        url = self.url("evaluation", evaluation_id)
+        self.assertEqual(self.client.patch(url, {"commentaire": "x"}).status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+        self.assertEqual(self.client.delete(url).status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def test_brief_indique_qui_peut_evaluer(self, email):
+        self.client.force_authenticate(user=self.formateur)
+        data = self.client.get(self.url("brief", self.brief.id)).data
+        self.assertTrue(data["peut_evaluer"])
+        self.assertEqual(
+            [(c["competence"], c["niveau"]) for c in data["competences_visees"]],
+            [("Développer une API", "Imiter"), ("Développer une API", "Adapter")],
+        )
+        self.client.force_authenticate(user=self.formateur_3)
+        self.assertFalse(self.client.get(self.url("brief", self.brief.id)).data["peut_evaluer"])
+
+    def test_email_a_l_apprenant(self, email):
+        with self.captureOnCommitCallbacks(execute=True):
+            self.evaluer(acquis=(True, False))
+        email.assert_called_once()
+        destinataires, titre, evaluateur, nb_acquises, nb_visees, url = email.call_args.args
+        self.assertEqual(destinataires, [self.apprenant.email])
+        self.assertEqual((nb_acquises, nb_visees), (1, 2))
+        self.assertTrue(url.endswith(f"/activites/{self.brief.id}"))
+
+    def test_suppression_en_cascade_d_un_organisme_evalue(self, email):
+        self.evaluer(acquis=(True, True))
+        self.tenant.delete()
+        self.assertFalse(Evaluation.objects.exists())
+        self.assertFalse(CompetenceValidee.objects.exists())
+
+    def test_niveau_de_competence_evalue_non_retirable(self, email):
+        self.evaluer()
+        self.brief.competence_niveaux.remove(self.cn2)
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.delete(f"/api/tenants/{self.tenant.id}/competence-niveaux/{self.cn2.id}/")
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ─── Progression ──────────────────────────────────────────────────────────────
+
+@patch("activites.notifications.envoyer_email_evaluation.delay")
+class ProgressionTests(ActivitesBaseTestCase):
+    """Référentiel de la formation : cn et cn_module_2 (module_2), plus cn2."""
+
+    def setUp(self):
+        super().setUp()
+        self.cn2 = CompetenceNiveau.objects.create(
+            competence=self.cn.competence, niveau=Niveau.objects.create(tenant=self.tenant, nom="Adapter", ordre=2)
+        )
+        self.brief = self.creer_brief(cree_par=self.formateur)
+        self.brief.competence_niveaux.set([self.cn, self.cn2])
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        # Brief sans compétence : hors compteur des briefs
+        Assignation.objects.create(brief=self.creer_brief(cree_par=self.formateur), apprenant=self.apprenant)
+
+    def evaluer(self, acquis):
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(self.url("evaluation"), {
+            "assignation": self.assignation.id,
+            "competences": [{"competence_niveau": cn.id, "acquis": a} for cn, a in zip((self.cn, self.cn2), acquis)],
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+    def moi(self):
+        self.client.force_authenticate(user=self.apprenant)
+        return self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
+
+    def test_compteurs(self, email):
+        res = self.moi()
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["resume"], {
+            "competences_validees": 0, "competences_total": 3, "briefs_valides": 0, "briefs_total": 1,
+        })
+        self.assertEqual(res.data["briefs"][0]["statut"], "NON_RENDU")
+
+        self.deposer(self.assignation)
+        self.assertEqual({b["id"]: b["statut"] for b in self.moi().data["briefs"]}[self.brief.id], "A_EVALUER")
+
+        self.evaluer((True, False))
+        data = self.moi().data
+        self.assertEqual(data["resume"]["competences_validees"], 1)
+        self.assertEqual(data["resume"]["briefs_valides"], 0)
+        etat = {b["id"]: b for b in data["briefs"]}[self.brief.id]
+        self.assertEqual((etat["statut"], etat["nb_acquises"], etat["nb_visees"]), ("NON_VALIDE", 1, 2))
+
+        self.evaluer((True, True))
+        data = self.moi().data
+        self.assertEqual(data["resume"], {
+            "competences_validees": 2, "competences_total": 3, "briefs_valides": 1, "briefs_total": 1,
+        })
+
+    def test_referentiel_detaille(self, email):
+        self.deposer(self.assignation)
+        self.evaluer((True, False))
+        modules = self.moi().data["modules"]
+        self.assertEqual([m["nom"] for m in modules], ["Développement Web", "Base de données"])
+        niveaux = modules[0]["competences"][0]["niveaux"]
+        self.assertEqual([(n["niveau"], n["valide"]) for n in niveaux], [("Imiter", True), ("Adapter", False)])
+
+    def test_liste_par_promotion(self, email):
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.get(self.url("progression"), {"promotion": self.promotion.id})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(sorted(r["apprenant"] for r in res.data), sorted([self.apprenant.id, self.apprenant_b.id]))
+        self.assertEqual(res.data[0]["competences_total"], 3)
+
+        self.client.force_authenticate(user=self.admin)
+        self.assertEqual(self.client.get(self.url("progression"), {"promotion": self.promotion.id}).status_code,
+                         status.HTTP_200_OK)
+        for u in (self.formateur_2, self.apprenant):
+            self.client.force_authenticate(user=u)
+            self.assertEqual(self.client.get(self.url("progression"), {"promotion": self.promotion.id}).status_code,
+                             status.HTTP_404_NOT_FOUND)
+
+    def test_detail_d_un_apprenant(self, email):
+        url = self.url("progression", self.apprenant.id)
+        self.client.force_authenticate(user=self.formateur)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_200_OK)
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.get(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.get(url).data["apprenant"]["id"], self.apprenant.id)
+
+    def test_apprenant_sans_promotion(self, email):
+        self.client.force_authenticate(user=self.apprenant_hors_promo)
+        res = self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
 
 # ─── Emails ───────────────────────────────────────────────────────────────────

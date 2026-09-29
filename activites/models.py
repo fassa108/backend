@@ -420,3 +420,98 @@ class FichierLivrable(AvecApercu):
 
     def __str__(self):
         return self.nom
+
+
+# ─── Évaluations ──────────────────────────────────────────────────────────────
+
+class Evaluation(models.Model):
+    """
+    Évaluation d'un rendu (une assignation) par un formateur.
+
+    Une ligne par compétence-niveau visée par le brief (acquis ou non) et
+    un commentaire général. On ne modifie pas une
+    évaluation : on en fait une nouvelle, et la plus récente fait foi.
+    Pour un groupe, elle vaut pour tous ses membres actifs.
+    """
+
+    assignation = models.ForeignKey(
+        Assignation,
+        on_delete=models.CASCADE,
+        related_name="evaluations",
+    )
+    evaluateur = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="evaluations_faites",
+    )
+    commentaire = models.TextField(blank=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date_creation", "-id"]
+
+    def __str__(self):
+        return f"Évaluation de {self.assignation}"
+
+
+class EvaluationCompetence(models.Model):
+    evaluation = models.ForeignKey(
+        Evaluation,
+        on_delete=models.CASCADE,
+        related_name="competences",
+    )
+    competence_niveau = models.ForeignKey(
+        CompetenceNiveau,
+        on_delete=models.RESTRICT,
+        related_name="evaluations",
+    )
+    acquis = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["evaluation", "competence_niveau"],
+                name="evaluation_competence_unique",
+            )
+        ]
+
+
+class CompetenceValidee(models.Model):
+    """
+    Compétence-niveau acquise par un apprenant : définitive, même si une
+    évaluation ultérieure (sur ce brief ou un autre) la juge non acquise.
+    Base de la progression.
+    """
+
+    apprenant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="competences_validees",
+    )
+    # CASCADE : suit la suppression d'un organisme entier (l'apprenant, lui,
+    # n'est pas supprimé). Un niveau déjà évalué ne se retire pas par l'API.
+    competence_niveau = models.ForeignKey(
+        CompetenceNiveau,
+        on_delete=models.CASCADE,
+        related_name="validations",
+    )
+    # Évaluation qui l'a validée en premier
+    evaluation = models.ForeignKey(
+        Evaluation,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name="validations",
+    )
+    date_validation = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["apprenant", "competence_niveau"],
+                name="competence_validee_unique",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.apprenant} : {self.competence_niveau}"

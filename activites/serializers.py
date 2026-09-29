@@ -2,6 +2,7 @@ from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
 from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion, GroupeMembre
@@ -15,6 +16,9 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    CompetenceValidee,
+    Evaluation,
+    EvaluationCompetence,
     FichierLivrable,
     Livrable,
     Ressource,
@@ -26,6 +30,38 @@ def _est_formateur_de_promotion(user, promotion_id):
         formateur=user,
         promotion_id=promotion_id,
     ).exists()
+
+
+def peut_evaluer(user, brief):
+    """
+    Seul le créateur du brief évalue ; s'il n'est plus affecté à la
+    promotion (ou n'existe plus), tout formateur de la promotion le peut.
+    """
+    formateurs = set(
+        FormateurPromotion.objects.filter(promotion_id=brief.promotion_id)
+        .values_list("formateur_id", flat=True)
+    )
+    if user.id not in formateurs:
+        return False
+    return brief.cree_par_id == user.id or brief.cree_par_id not in formateurs
+
+
+def cible_assignation(a):
+    """Qui est visé par l'assignation (apprenant ou groupe)."""
+    if a.groupe_id:
+        return {"type": "groupe", "id": a.groupe_id, "nom": a.groupe.nom}
+    return {
+        "type": "apprenant",
+        "id": a.apprenant_id,
+        "nom": f"{a.apprenant.prenom} {a.apprenant.nom}",
+    }
+
+
+def apprenants_de_l_assignation(a):
+    """L'apprenant visé, ou les membres actifs du groupe visé."""
+    if a.apprenant_id:
+        return [a.apprenant]
+    return [m.apprenant for m in a.groupe.membres.filter(actif=True).select_related("apprenant")]
 
 
 def brief_a_des_livrables(brief):
@@ -156,6 +192,10 @@ class BriefSerializer(serializers.ModelSerializer):
     # False dès le premier livrable : le brief est alors figé
     # (seul son statut peut encore changer).
     modifiable = serializers.SerializerMethodField()
+    # L'utilisateur connecté peut-il évaluer les rendus de ce brief ?
+    peut_evaluer = serializers.SerializerMethodField()
+    # Compétences visées avec leurs libellés (lecture)
+    competences_visees = serializers.SerializerMethodField()
 
     class Meta:
         model = Brief
@@ -175,10 +215,12 @@ class BriefSerializer(serializers.ModelSerializer):
             "date_limite",
             "statut",
             "competence_niveaux",
+            "competences_visees",
             "ressources",
             "cree_par",
             "cree_par_nom",
             "modifiable",
+            "peut_evaluer",
             "date_creation",
             "date_modification",
         ]
@@ -196,6 +238,21 @@ class BriefSerializer(serializers.ModelSerializer):
 
     def get_modifiable(self, brief):
         return not brief_a_des_livrables(brief)
+
+    def get_competences_visees(self, brief):
+        return [
+            {
+                "id": cn.id,
+                "competence": cn.competence.nom,
+                "niveau": cn.niveau.nom,
+                "description": cn.description,
+            }
+            for cn in brief.competence_niveaux.all()
+        ]
+
+    def get_peut_evaluer(self, brief):
+        request = self.context.get("request")
+        return bool(request and peut_evaluer(request.user, brief))
 
     def validate(self, attrs):
         tenant_id = self.context["tenant_id"]
@@ -266,6 +323,25 @@ class BriefSerializer(serializers.ModelSerializer):
                         "Les compétences visées doivent appartenir à la formation "
                         "de la promotion."
                     )
+                })
+
+            # Une compétence-niveau n'est visée que par un seul brief de la promotion
+            deja_visees = (
+                Brief.competence_niveaux.through.objects.filter(
+                    brief__promotion=promotion,
+                    competenceniveau__in=competence_niveaux,
+                )
+                .exclude(brief_id=getattr(instance, "pk", None))
+                .select_related("brief", "competenceniveau__competence", "competenceniveau__niveau")
+            )
+            if deja_visees:
+                noms = ", ".join(
+                    f"{d.competenceniveau.competence.nom} ({d.competenceniveau.niveau.nom}) "
+                    f"par « {d.brief.titre} »"
+                    for d in deja_visees
+                )
+                raise serializers.ValidationError({
+                    "competence_niveaux": f"Déjà visée dans cette promotion : {noms}."
                 })
 
         ressources = attrs.get("ressources")
@@ -514,14 +590,7 @@ class LivrableSerializer(serializers.ModelSerializer):
         return f"{livrable.deposant.prenom} {livrable.deposant.nom}"
 
     def get_cible(self, livrable):
-        a = livrable.assignation
-        if a.groupe_id:
-            return {"type": "groupe", "id": a.groupe_id, "nom": a.groupe.nom}
-        return {
-            "type": "apprenant",
-            "id": a.apprenant_id,
-            "nom": f"{a.apprenant.prenom} {a.apprenant.nom}",
-        }
+        return cible_assignation(livrable.assignation)
 
 
 class DepotSerializer(serializers.Serializer):
@@ -628,3 +697,124 @@ class DepotSerializer(serializers.Serializer):
         for url in validated_data["liens"]:
             FichierLivrable.objects.create(livrable=livrable, nom=url[:255], url=url)
         return livrable
+
+
+# ─── Évaluations ──────────────────────────────────────────────────────────────
+
+class EvaluationCompetenceSerializer(serializers.ModelSerializer):
+    competence_nom = serializers.CharField(source="competence_niveau.competence.nom", read_only=True)
+    niveau_nom = serializers.CharField(source="competence_niveau.niveau.nom", read_only=True)
+
+    class Meta:
+        model = EvaluationCompetence
+        fields = ["competence_niveau", "competence_nom", "niveau_nom", "acquis"]
+
+
+class EvaluationSerializer(serializers.ModelSerializer):
+    """
+    Évaluation d'un rendu. Création : assignation, commentaire général, et
+    une ligne par compétence-niveau visée par le brief (toutes, chacune une
+    fois) : acquise ou non.
+
+    Règles :
+    - évaluateur : créateur du brief, ou un formateur de la promotion si le
+      créateur n'y est plus affecté ;
+    - brief publié ou archivé, promotion ouverte ;
+    - sans dépôt, rien ne peut être acquis ;
+    - une compétence acquise lors de la précédente évaluation de ce rendu ne
+      peut pas redevenir non acquise (une validation est définitive).
+    """
+
+    competences = EvaluationCompetenceSerializer(many=True, required=False)
+    brief = serializers.IntegerField(source="assignation.brief_id", read_only=True)
+    cible = serializers.SerializerMethodField()
+    evaluateur_nom = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Evaluation
+        fields = [
+            "id",
+            "assignation",
+            "brief",
+            "cible",
+            "evaluateur",
+            "evaluateur_nom",
+            "commentaire",
+            "competences",
+            "date_creation",
+        ]
+        read_only_fields = ["id", "evaluateur", "date_creation"]
+
+    def get_cible(self, evaluation):
+        return cible_assignation(evaluation.assignation)
+
+    def get_evaluateur_nom(self, evaluation):
+        e = evaluation.evaluateur
+        return f"{e.prenom} {e.nom}" if e else None
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+        tenant_id = self.context["tenant_id"]
+        assignation = attrs["assignation"]
+        brief = assignation.brief
+
+        if brief.promotion.formation.tenant_id != tenant_id:
+            raise serializers.ValidationError({"assignation": "Assignation introuvable."})
+        if not peut_evaluer(user, brief):
+            raise PermissionDenied(
+                "Seul le formateur qui a créé ce brief peut évaluer ses rendus "
+                "(ou un formateur de la promotion s'il n'y est plus affecté)."
+            )
+        if brief.statut == Brief.Statut.BROUILLON:
+            raise serializers.ValidationError({"assignation": "Un brief en brouillon ne s'évalue pas."})
+        if not brief.promotion.actif:
+            raise serializers.ValidationError(
+                {"assignation": "La promotion est clôturée : ses rendus ne s'évaluent plus."}
+            )
+
+        lignes = attrs.get("competences", [])
+        visees = set(brief.competence_niveaux.values_list("id", flat=True))
+        fournies = [l["competence_niveau"].id for l in lignes]
+        if len(fournies) != len(set(fournies)) or set(fournies) != visees:
+            raise serializers.ValidationError(
+                {"competences": "Évaluez chacune des compétences visées par le brief, une seule fois."}
+            )
+
+        if not assignation.livrables.exists() and any(l["acquis"] for l in lignes):
+            raise serializers.ValidationError(
+                {"competences": "Aucun dépôt pour ce rendu : les compétences ne peuvent pas être acquises."}
+            )
+
+        precedente = assignation.evaluations.first()
+        if precedente:
+            deja_acquises = set(
+                precedente.competences.filter(acquis=True).values_list("competence_niveau_id", flat=True)
+            )
+            retirees = [l for l in lignes if not l["acquis"] and l["competence_niveau"].id in deja_acquises]
+            if retirees:
+                noms = ", ".join(
+                    f"{l['competence_niveau'].competence.nom} ({l['competence_niveau'].niveau.nom})"
+                    for l in retirees
+                )
+                raise serializers.ValidationError(
+                    {"competences": f"Déjà acquis lors de la précédente évaluation, c'est définitif : {noms}."}
+                )
+
+        attrs["commentaire"] = attrs.get("commentaire", "").strip()
+        return attrs
+
+    @transaction.atomic
+    def create(self, validated_data):
+        lignes = validated_data.pop("competences", [])
+        evaluation = Evaluation.objects.create(**validated_data)
+        EvaluationCompetence.objects.bulk_create(
+            EvaluationCompetence(evaluation=evaluation, **l) for l in lignes
+        )
+        # Compétences acquises : validées pour chaque apprenant concerné
+        acquises = [l["competence_niveau"] for l in lignes if l["acquis"]]
+        for apprenant in apprenants_de_l_assignation(evaluation.assignation):
+            for cn in acquises:
+                CompetenceValidee.objects.get_or_create(
+                    apprenant=apprenant, competence_niveau=cn, defaults={"evaluation": evaluation}
+                )
+        return evaluation
