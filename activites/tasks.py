@@ -96,6 +96,22 @@ def envoyer_email_soumission(destinataires, deposant, cible, titre_brief, numero
     )
 
 
+@shared_task
+def envoyer_email_evaluation(destinataires, titre_brief, evaluateur, nb_acquises, nb_visees, url):
+    lignes = [f"{evaluateur} a évalué votre rendu du brief « {titre_brief} »."]
+    if nb_visees:
+        lignes.append(f"Compétences acquises : {nb_acquises} sur {nb_visees}.")
+    lignes.append("Retrouvez le détail et les commentaires dans votre activité.")
+    _envoyer(
+        destinataires,
+        sujet=f"Évaluation : {titre_brief}",
+        titre="Votre rendu a été évalué",
+        lignes=lignes,
+        libelle_bouton="Voir l'évaluation",
+        url=url,
+    )
+
+
 # ─── Aperçus des fichiers Office ─────────────────────────────────────────────
 
 MODELES_AVEC_APERCU = {"activites.ressource", "activites.fichierlivrable"}

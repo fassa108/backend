@@ -5,8 +5,10 @@ from .views import (
     AssignationViewSet,
     BriefViewSet,
     CategorieBriefViewSet,
+    EvaluationViewSet,
     FichierLivrableViewSet,
     LivrableViewSet,
+    ProgressionViewSet,
     RessourceViewSet,
 )
 
@@ -30,6 +32,9 @@ router.register(
     FichierLivrableViewSet,
     basename="fichier-livrable",
 )
+
+router.register("evaluations", EvaluationViewSet, basename="evaluation")
+router.register("progression", ProgressionViewSet, basename="progression")
 
 urlpatterns = [
     path(

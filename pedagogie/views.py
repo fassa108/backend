@@ -572,10 +572,15 @@ class CompetenceNiveauViewSet(ReferentielViewSet):
 
     def perform_destroy(self, instance):
         # Suppression directe (pas de désactivation) : refusée si un brief
-        # vise ce niveau de la compétence.
+        # vise ce niveau de la compétence, ou s'il a déjà été évalué.
         if instance.briefs.exists():
             raise PermissionDenied(
                 "Ce niveau de la compétence est visé par des briefs : "
+                "il ne peut pas être retiré."
+            )
+        if instance.evaluations.exists() or instance.validations.exists():
+            raise PermissionDenied(
+                "Ce niveau de la compétence a déjà été évalué : "
                 "il ne peut pas être retiré."
             )
         instance.delete()

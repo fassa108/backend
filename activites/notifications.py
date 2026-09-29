@@ -4,6 +4,7 @@ Qui prévenir, et quand (les emails eux-mêmes sont dans tasks.py).
 - Assignation : les apprenants visés (membres actifs pour un groupe),
   tout de suite si le brief est publié, sinon à sa publication.
 - Dépôt : les formateurs de la promotion, à chaque dépôt.
+- Évaluation : les apprenants visés (membres actifs pour un groupe).
 
 Les envois partent une fois la transaction validée (on_commit) : pas
 d'email pour une opération annulée.
@@ -16,7 +17,7 @@ from django.utils import timezone
 from pedagogie.models import FormateurPromotion
 
 from .models import Brief
-from .tasks import envoyer_email_assignation, envoyer_email_soumission
+from .tasks import envoyer_email_assignation, envoyer_email_evaluation, envoyer_email_soumission
 
 
 def _date(dt):
@@ -83,3 +84,22 @@ def notifier_depot(livrable):
         f"{settings.FRONTEND_URL}/briefs/{brief.id}",
     )
     transaction.on_commit(lambda: envoyer_email_soumission.delay(*args))
+
+
+def notifier_evaluation(evaluation):
+    """Rendu évalué : prévenir l'apprenant, ou chaque membre actif du groupe."""
+    a = evaluation.assignation
+    emails = _emails_cibles(a)
+    if not emails:
+        return
+    lignes = list(evaluation.competences.all())
+    e = evaluation.evaluateur
+    args = (
+        sorted(emails),
+        a.brief.titre,
+        f"{e.prenom} {e.nom}" if e else "Votre formateur",
+        sum(1 for l in lignes if l.acquis),
+        len(lignes),
+        f"{settings.FRONTEND_URL}/activites/{a.brief_id}",
+    )
+    transaction.on_commit(lambda: envoyer_email_evaluation.delay(*args))

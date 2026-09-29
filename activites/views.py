@@ -1,7 +1,7 @@
 import os
 
 from django.db import transaction
-from django.db.models import Max, Q
+from django.db.models import Max, Prefetch, Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
@@ -10,6 +10,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.response import Response
 
 from accounts.models import MembreTenant
+from pedagogie.models import CompetenceNiveau, InscriptionPromotion, Promotion
 from pedagogie.permissions import IsAdminOrganisme, _est_formateur_de_promotion
 from pedagogie.views import (
     _param_entier,
@@ -22,12 +23,14 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    Evaluation,
     FichierLivrable,
     Livrable,
     Ressource,
 )
+from . import progression
 from .apercus import demander_apercu, reponse_consultation
-from .notifications import notifier_assignations, notifier_depot, notifier_publication
+from .notifications import notifier_assignations, notifier_depot, notifier_evaluation, notifier_publication
 from .permissions import (
     CanCreateLivrable,
     CanManageRessource,
@@ -39,6 +42,7 @@ from .serializers import (
     BriefSerializer,
     CategorieBriefSerializer,
     DepotSerializer,
+    EvaluationSerializer,
     FichierLivrableSerializer,
     LivrableSerializer,
     RessourceSerializer,
@@ -268,7 +272,14 @@ class BriefViewSet(viewsets.ModelViewSet):
         qs = (
             Brief.objects.filter(promotion__formation__tenant_id=tenant_id)
             .select_related("promotion", "promotion__formation", "module", "cree_par", "categorie")
-            .prefetch_related("competence_niveaux", "ressources")
+            .prefetch_related(
+                Prefetch(
+                    "competence_niveaux",
+                    queryset=CompetenceNiveau.objects.select_related("competence", "niveau")
+                    .order_by("competence__ordre", "niveau__ordre"),
+                ),
+                "ressources",
+            )
             .order_by("-date_creation")
         )
 
@@ -584,3 +595,142 @@ class FichierLivrableViewSet(viewsets.ReadOnlyModelViewSet):
         context["tenant_id"] = self.kwargs["tenant_id"]
         context["request"] = self.request
         return context
+
+
+# ─── Évaluations ──────────────────────────────────────────────────────────────
+
+class EvaluationViewSet(viewsets.ModelViewSet):
+    """
+    Évaluations des rendus : créées, jamais modifiées ni supprimées (une
+    nouvelle évaluation remplace la précédente, l'historique est gardé).
+
+    - Formateur : évalue les rendus des briefs qu'il a créés (ou de sa
+      promotion si le créateur n'y est plus affecté) ; lit celles de ses
+      promotions.
+    - Admin organisme : lecture de tout le tenant.
+    - Apprenant : lecture des évaluations de ses rendus (et de ses groupes).
+
+    Filtres : ?brief=, ?assignation=.
+    """
+
+    serializer_class = EvaluationSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action == "create":
+            return [IsFormateurOrganisme()]
+        return _refus_par_defaut(self)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["tenant_id"] = self.kwargs["tenant_id"]
+        return context
+
+    def get_queryset(self):
+        tenant_id = self.kwargs["tenant_id"]
+        user = self.request.user
+        qs = (
+            Evaluation.objects.filter(assignation__brief__promotion__formation__tenant_id=tenant_id)
+            .select_related("assignation", "assignation__groupe", "assignation__apprenant", "evaluateur")
+            .prefetch_related("competences__competence_niveau__competence", "competences__competence_niveau__niveau")
+        )
+        brief_id = _param_entier(self.request, "brief")
+        if brief_id is not None:
+            qs = qs.filter(assignation__brief_id=brief_id)
+        assignation_id = _param_entier(self.request, "assignation")
+        if assignation_id is not None:
+            qs = qs.filter(assignation_id=assignation_id)
+
+        role = _role(user, tenant_id)
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return qs
+        if role == MembreTenant.Role.FORMATEUR:
+            return qs.filter(assignation__brief__promotion_id__in=_promotions_du_formateur(user, tenant_id))
+        return qs.filter(_assignations_de_l_apprenant(user, tenant_id, prefixe="assignation__")).distinct()
+
+    def perform_create(self, serializer):
+        evaluation = serializer.save(evaluateur=self.request.user)
+        notifier_evaluation(evaluation)
+
+
+# ─── Progression ──────────────────────────────────────────────────────────────
+
+class ProgressionViewSet(viewsets.ViewSet):
+    """
+    Progression des apprenants (compétences validées, briefs validés).
+
+    - list ?promotion= : résumé par apprenant inscrit (formateur de la
+      promotion ou admin organisme).
+    - retrieve <apprenant> : détail (référentiel et briefs) ; l'apprenant ne
+      voit que la sienne, le formateur celles de ses promotions.
+    - moi : raccourci de l'apprenant connecté.
+    """
+
+    permission_classes = [IsMembreOrganisme]
+
+    def _promotions_autorisees(self, tenant_id):
+        """None = toutes (admin) ; sinon les promotions du formateur ; vide pour un apprenant."""
+        user = self.request.user
+        role = _role(user, tenant_id)
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return None
+        if role == MembreTenant.Role.FORMATEUR:
+            return set(_promotions_du_formateur(user, tenant_id))
+        return set()
+
+    def list(self, request, tenant_id=None):
+        promotion_id = _param_entier(request, "promotion")
+        if promotion_id is None:
+            raise NotFound("Précisez la promotion (?promotion=).")
+        autorisees = self._promotions_autorisees(tenant_id)
+        if autorisees is not None and promotion_id not in autorisees:
+            raise NotFound("Promotion introuvable.")
+        promotion = get_object_or_404(Promotion, pk=promotion_id, formation__tenant_id=tenant_id)
+        inscriptions = (
+            InscriptionPromotion.objects.filter(promotion=promotion, actif=True)
+            .select_related("apprenant")
+            .order_by("apprenant__nom", "apprenant__prenom")
+        )
+        return Response([
+            {
+                "apprenant": i.apprenant_id,
+                "nom": f"{i.apprenant.prenom} {i.apprenant.nom}",
+                **progression.resume(i.apprenant, promotion),
+            }
+            for i in inscriptions
+        ])
+
+    def retrieve(self, request, tenant_id=None, pk=None):
+        user = request.user
+        inscription = (
+            InscriptionPromotion.objects.filter(apprenant_id=pk, tenant_id=tenant_id, actif=True)
+            .select_related("apprenant", "promotion")
+            .first()
+        )
+        if inscription is None:
+            raise NotFound("Apprenant introuvable.")
+        if _role(user, tenant_id) == MembreTenant.Role.APPRENANT:
+            if inscription.apprenant_id != user.id:
+                raise NotFound("Apprenant introuvable.")
+        else:
+            autorisees = self._promotions_autorisees(tenant_id)
+            if autorisees is not None and inscription.promotion_id not in autorisees:
+                raise NotFound("Apprenant introuvable.")
+        return Response(self._detail(inscription))
+
+    @action(detail=False, methods=["get"])
+    def moi(self, request, tenant_id=None):
+        inscription = progression.inscription_active(request.user, tenant_id)
+        if inscription is None:
+            raise NotFound("Vous n'êtes inscrit à aucune promotion ouverte.")
+        return Response(self._detail(inscription))
+
+    def _detail(self, inscription):
+        a, p = inscription.apprenant, inscription.promotion
+        return {
+            "apprenant": {"id": a.id, "nom": f"{a.prenom} {a.nom}"},
+            "promotion": {"id": p.id, "nom": p.nom},
+            **progression.detail(a, p),
+        }

@@ -4,6 +4,9 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    CompetenceValidee,
+    Evaluation,
+    EvaluationCompetence,
     FichierLivrable,
     Livrable,
     Ressource,
@@ -47,3 +50,21 @@ class LivrableAdmin(admin.ModelAdmin):
 class FichierLivrableAdmin(admin.ModelAdmin):
     list_display = ("nom", "livrable", "date_creation")
     search_fields = ("nom",)
+
+
+class EvaluationCompetenceInline(admin.TabularInline):
+    model = EvaluationCompetence
+    extra = 0
+
+
+@admin.register(Evaluation)
+class EvaluationAdmin(admin.ModelAdmin):
+    list_display = ("assignation", "evaluateur", "date_creation")
+    list_filter = ("assignation__brief__promotion__formation__tenant",)
+    inlines = [EvaluationCompetenceInline]
+
+
+@admin.register(CompetenceValidee)
+class CompetenceValideeAdmin(admin.ModelAdmin):
+    list_display = ("apprenant", "competence_niveau", "date_validation")
+    search_fields = ("apprenant__nom", "apprenant__email")
