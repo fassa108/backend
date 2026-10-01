@@ -23,6 +23,7 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    CommentairePair,
     Evaluation,
     FichierLivrable,
     Livrable,
@@ -30,7 +31,13 @@ from .models import (
 )
 from . import progression
 from .apercus import demander_apercu, reponse_consultation
-from .notifications import notifier_assignations, notifier_depot, notifier_evaluation, notifier_publication
+from .notifications import (
+    notifier_assignations,
+    notifier_commentaire,
+    notifier_depot,
+    notifier_evaluation,
+    notifier_publication,
+)
 from .permissions import (
     CanCreateLivrable,
     CanManageRessource,
@@ -41,12 +48,14 @@ from .serializers import (
     AssignationSerializer,
     BriefSerializer,
     CategorieBriefSerializer,
+    CommentairePairSerializer,
     DepotSerializer,
     EvaluationSerializer,
     FichierLivrableSerializer,
     LivrableSerializer,
     RessourceSerializer,
     brief_a_des_livrables,
+    brief_ouvert_aux_commentaires,
 )
 
 ACTIONS_LECTURE = ("list", "retrieve")
@@ -536,6 +545,7 @@ class LivrableViewSet(viewsets.ModelViewSet):
         context = super().get_serializer_context()
         context["tenant_id"] = self.kwargs["tenant_id"]
         context["request"] = self.request
+        context["role"] = _role(self.request.user, self.kwargs["tenant_id"])
         return context
 
     def create(self, request, *args, **kwargs):
@@ -734,3 +744,114 @@ class ProgressionViewSet(viewsets.ViewSet):
             "promotion": {"id": p.id, "nom": p.nom},
             **progression.detail(a, p),
         }
+
+
+# ─── Feedback entre pairs ─────────────────────────────────────────────────────
+
+class EstApprenantOrganisme(IsMembreOrganisme):
+    message = "Seuls les apprenants commentent les travaux de leurs pairs."
+
+    def has_permission(self, request, view):
+        return (
+            super().has_permission(request, view)
+            and _role(request.user, view.kwargs["tenant_id"]) == MembreTenant.Role.APPRENANT
+        )
+
+
+class CommentairePairViewSet(viewsets.ModelViewSet):
+    """
+    Commentaires des apprenants sur les rendus de leurs pairs (et réponses).
+
+    - Apprenant : lit les commentaires des rendus qu'il peut voir (les siens,
+      et ceux de ses pairs sur les briefs où il a déposé) ; commente, répond,
+      modifie ou supprime les siens. Un commentaire masqué n'est plus visible
+      que de son auteur (et des formateurs).
+    - Formateur : lit ceux de ses promotions, masque / démasque.
+    - Admin organisme : lecture.
+
+    Filtres : ?brief=, ?assignation=.
+    """
+
+    serializer_class = CommentairePairSerializer
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in ACTIONS_LECTURE:
+            return [IsMembreOrganisme()]
+        if self.action in ("create", "partial_update", "destroy"):
+            return [EstApprenantOrganisme()]
+        if self.action in ("masquer", "demasquer"):
+            return [IsFormateurOrganisme()]
+        return _refus_par_defaut(self)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["tenant_id"] = self.kwargs["tenant_id"]
+        return context
+
+    def get_queryset(self):
+        tenant_id = self.kwargs["tenant_id"]
+        user = self.request.user
+        qs = CommentairePair.objects.filter(
+            assignation__brief__promotion__formation__tenant_id=tenant_id
+        ).select_related("auteur", "assignation__brief__promotion")
+        brief_id = _param_entier(self.request, "brief")
+        if brief_id is not None:
+            qs = qs.filter(assignation__brief_id=brief_id)
+        assignation_id = _param_entier(self.request, "assignation")
+        if assignation_id is not None:
+            qs = qs.filter(assignation_id=assignation_id)
+
+        role = _role(user, tenant_id)
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return qs
+        if role == MembreTenant.Role.FORMATEUR:
+            return qs.filter(assignation__brief__promotion_id__in=_promotions_du_formateur(user, tenant_id))
+
+        siens = _assignations_de_l_apprenant(user, tenant_id, prefixe="assignation__")
+        briefs_deposes = Livrable.objects.filter(siens).values_list("assignation__brief_id", flat=True)
+        des_pairs = Q(
+            assignation__brief_id__in=list(briefs_deposes),
+            assignation__livrables__isnull=False,
+        )
+        return (
+            qs.filter(siens | des_pairs)
+            .exclude(Q(masque=True) & ~Q(auteur=user))
+            .exclude(Q(parent__masque=True) & ~Q(auteur=user))
+            .distinct()
+        )
+
+    def perform_create(self, serializer):
+        commentaire = serializer.save(auteur=self.request.user)
+        notifier_commentaire(commentaire)
+
+    def _verifier_auteur(self, commentaire):
+        if commentaire.auteur_id != self.request.user.id:
+            raise PermissionDenied("Seul l'auteur peut modifier ou supprimer son commentaire.")
+
+    def perform_update(self, serializer):
+        self._verifier_auteur(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._verifier_auteur(instance)
+        if not brief_ouvert_aux_commentaires(instance.assignation.brief):
+            raise PermissionDenied("Ce brief est fermé : les commentaires sont en lecture seule.")
+        instance.delete()
+
+    def _changer_masque(self, masque):
+        commentaire = self.get_object()
+        if not _est_formateur_de_promotion(self.request.user, commentaire.assignation.brief.promotion_id):
+            raise PermissionDenied("Seul un formateur de la promotion peut masquer un commentaire.")
+        commentaire.masque = masque
+        commentaire.masque_par = self.request.user if masque else None
+        commentaire.save(update_fields=["masque", "masque_par"])
+        return Response(self.get_serializer(commentaire).data)
+
+    @action(detail=True, methods=["post"])
+    def masquer(self, request, tenant_id=None, pk=None):
+        return self._changer_masque(True)
+
+    @action(detail=True, methods=["post"])
+    def demasquer(self, request, tenant_id=None, pk=None):
+        return self._changer_masque(False)

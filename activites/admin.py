@@ -4,6 +4,7 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    CommentairePair,
     CompetenceValidee,
     Evaluation,
     EvaluationCompetence,
@@ -68,3 +69,10 @@ class EvaluationAdmin(admin.ModelAdmin):
 class CompetenceValideeAdmin(admin.ModelAdmin):
     list_display = ("apprenant", "competence_niveau", "date_validation")
     search_fields = ("apprenant__nom", "apprenant__email")
+
+
+@admin.register(CommentairePair)
+class CommentairePairAdmin(admin.ModelAdmin):
+    list_display = ("auteur", "assignation", "masque", "date_creation")
+    list_filter = ("masque", "assignation__brief__promotion__formation__tenant")
+    search_fields = ("texte", "auteur__nom", "auteur__email")

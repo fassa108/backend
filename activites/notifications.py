@@ -5,6 +5,8 @@ Qui prévenir, et quand (les emails eux-mêmes sont dans tasks.py).
   tout de suite si le brief est publié, sinon à sa publication.
 - Dépôt : les formateurs de la promotion, à chaque dépôt.
 - Évaluation : les apprenants visés (membres actifs pour un groupe).
+- Commentaire d'un pair : les apprenants visés par le rendu commenté, et
+  pour une réponse l'auteur du commentaire d'origine (jamais l'auteur).
 
 Les envois partent une fois la transaction validée (on_commit) : pas
 d'email pour une opération annulée.
@@ -17,7 +19,12 @@ from django.utils import timezone
 from pedagogie.models import FormateurPromotion
 
 from .models import Brief
-from .tasks import envoyer_email_assignation, envoyer_email_evaluation, envoyer_email_soumission
+from .tasks import (
+    envoyer_email_assignation,
+    envoyer_email_commentaire,
+    envoyer_email_evaluation,
+    envoyer_email_soumission,
+)
 
 
 def _date(dt):
@@ -103,3 +110,22 @@ def notifier_evaluation(evaluation):
         f"{settings.FRONTEND_URL}/activites/{a.brief_id}",
     )
     transaction.on_commit(lambda: envoyer_email_evaluation.delay(*args))
+
+
+def notifier_commentaire(commentaire):
+    """Nouveau commentaire (ou réponse) : prévenir les apprenants concernés."""
+    a = commentaire.assignation
+    emails = set(_emails_cibles(a))
+    if commentaire.parent_id:
+        emails.add(commentaire.parent.auteur.email)
+    emails.discard(commentaire.auteur.email)
+    if not emails:
+        return
+    args = (
+        sorted(emails),
+        f"{commentaire.auteur.prenom} {commentaire.auteur.nom}",
+        a.brief.titre,
+        commentaire.parent_id is not None,
+        f"{settings.FRONTEND_URL}/activites/{a.brief_id}",
+    )
+    transaction.on_commit(lambda: envoyer_email_commentaire.delay(*args))

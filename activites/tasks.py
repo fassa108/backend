@@ -112,6 +112,22 @@ def envoyer_email_evaluation(destinataires, titre_brief, evaluateur, nb_acquises
     )
 
 
+@shared_task
+def envoyer_email_commentaire(destinataires, auteur, titre_brief, reponse, url):
+    if reponse:
+        lignes = [f"{auteur} a répondu à un commentaire sur le brief « {titre_brief} »."]
+    else:
+        lignes = [f"{auteur} a commenté votre rendu du brief « {titre_brief} »."]
+    _envoyer(
+        destinataires,
+        sujet=f"Nouveau commentaire : {titre_brief}",
+        titre="Nouveau commentaire",
+        lignes=lignes,
+        libelle_bouton="Lire le commentaire",
+        url=url,
+    )
+
+
 # ─── Aperçus des fichiers Office ─────────────────────────────────────────────
 
 MODELES_AVEC_APERCU = {"activites.ressource", "activites.fichierlivrable"}

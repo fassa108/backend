@@ -18,6 +18,8 @@ Couvre :
 - Évaluations : évaluateur (créateur du brief), compétences visées,
   rien d'acquis sans dépôt, validation définitive, groupes, emails
 - Progression : compétences-niveaux validées, briefs validés, visibilité
+- Feedback entre pairs : après son propre dépôt, pas sur son rendu, une
+  réponse, auteur seul, masquage par le formateur, lecture seule, emails
 - Multi-tenant : isolation
 """
 
@@ -57,6 +59,7 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
+    CommentairePair,
     CompetenceValidee,
     Evaluation,
     FichierLivrable,
@@ -986,6 +989,38 @@ class VisibiliteLivrableTests(ActivitesBaseTestCase):
         self.assertEqual(len(self.liste(self.formateur, f"?brief={self.brief.id}")), 3)
 
 
+class MessageDuDepotTests(ActivitesBaseTestCase):
+    """Le message d'un dépôt : visible de ses auteurs et des formateurs, pas des pairs."""
+
+    def setUp(self):
+        super().setUp()
+        brief = self.creer_brief()
+        self.a_a = Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.a_b = Assignation.objects.create(brief=brief, apprenant=self.apprenant_b)
+        Livrable.objects.create(assignation=self.a_a, deposant=self.apprenant, numero=1, commentaire="Mon message")
+        Livrable.objects.create(assignation=self.a_b, deposant=self.apprenant_b, numero=1, commentaire="Message de B")
+
+    def messages(self, utilisateur):
+        self.client.force_authenticate(user=utilisateur)
+        return {l["assignation"]: l["commentaire"] for l in self.client.get(self.url("livrable")).data}
+
+    def test_pair_ne_voit_pas_le_message(self):
+        self.assertEqual(self.messages(self.apprenant), {self.a_a.id: "Mon message", self.a_b.id: ""})
+
+    def test_formateur_et_admin_le_voient(self):
+        attendu = {self.a_a.id: "Mon message", self.a_b.id: "Message de B"}
+        self.assertEqual(self.messages(self.formateur), attendu)
+        self.assertEqual(self.messages(self.admin), attendu)
+
+    def test_membre_du_groupe_voit_le_message_du_groupe(self):
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="G")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant)
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b)
+        a_g = Assignation.objects.create(brief=self.creer_brief(), groupe=groupe)
+        Livrable.objects.create(assignation=a_g, deposant=self.apprenant_b, numero=1, commentaire="Pour le groupe")
+        self.assertEqual(self.messages(self.apprenant)[a_g.id], "Pour le groupe")
+
+
 class FichierLivrableTests(ActivitesBaseTestCase):
     """Éléments des dépôts : lecture seule, téléchargement contrôlé."""
 
@@ -1508,6 +1543,152 @@ class ProgressionTests(ActivitesBaseTestCase):
         self.client.force_authenticate(user=self.apprenant_hors_promo)
         res = self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+
+# ─── Feedback entre pairs ─────────────────────────────────────────────────────
+
+@patch("activites.notifications.envoyer_email_commentaire.delay")
+class CommentairePairTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.apprenant_c = self.membre("apprenant_c@test.com", MembreTenant.Role.APPRENANT)
+        InscriptionPromotion.objects.create(promotion=self.promotion, apprenant=self.apprenant_c)
+        self.brief = self.creer_brief(cree_par=self.formateur)
+        self.a_a = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+        self.a_b = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        self.a_c = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_c)
+        self.deposer(self.a_a)
+        self.deposer(self.a_b, self.apprenant_b)
+
+    def commenter(self, auteur, assignation, texte="Beau travail !", parent=None):
+        self.client.force_authenticate(user=auteur)
+        data = {"assignation": assignation.id, "texte": texte}
+        if parent:
+            data["parent"] = parent
+        return self.client.post(self.url("commentaire"), data, format="json")
+
+    def lister(self, utilisateur, **params):
+        self.client.force_authenticate(user=utilisateur)
+        return self.client.get(self.url("commentaire"), params).data
+
+    def test_commenter_le_rendu_d_un_pair(self, email):
+        res = self.commenter(self.apprenant, self.a_b, "  Bonne idée la navigation  ")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual(res.data["texte"], "Bonne idée la navigation")
+        self.assertEqual(res.data["auteur_nom"], "Prenom Nom")
+        self.assertTrue(res.data["peut_modifier"])
+
+    def test_sans_depot_pas_de_commentaire(self, email):
+        res = self.commenter(self.apprenant_c, self.a_b)
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Déposez d'abord", str(res.data))
+
+    def test_pas_sur_son_propre_rendu_ni_sur_un_rendu_sans_depot(self, email):
+        self.assertEqual(self.commenter(self.apprenant, self.a_a).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.commenter(self.apprenant, self.a_c).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_formateur_et_admin_ne_commentent_pas(self, email):
+        for u in (self.formateur, self.admin):
+            self.assertEqual(self.commenter(u, self.a_b).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_reponse_un_seul_niveau(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        # L'apprenant commenté répond sur son propre rendu
+        r = self.commenter(self.apprenant_b, self.a_b, "Merci !", parent=c)
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED, r.data)
+        self.assertEqual(self.commenter(self.apprenant, self.a_b, "Et ?", parent=r.data["id"]).status_code,
+                         status.HTTP_400_BAD_REQUEST)
+        # Parent d'un autre rendu
+        self.assertEqual(self.commenter(self.apprenant_b, self.a_a, "x", parent=c).status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+    def test_texte_vide_ou_trop_long(self, email):
+        self.assertEqual(self.commenter(self.apprenant, self.a_b, "   ").status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.commenter(self.apprenant, self.a_b, "x" * 2001).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_auteur_seul_modifie_et_supprime(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        url = self.url("commentaire", c)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.patch(url, {"texte": "Pirate"}, format="json").status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.delete(url).status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.patch(url, {"texte": "Corrigé", "assignation": self.a_a.id}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual((res.data["texte"], res.data["assignation"]), ("Corrigé", self.a_b.id))
+        self.assertEqual(self.client.delete(url).status_code, status.HTTP_204_NO_CONTENT)
+
+    def test_visibilite(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        self.assertEqual([x["id"] for x in self.lister(self.apprenant_b)], [c])  # commenté
+        self.assertEqual(self.lister(self.apprenant_c), [])  # n'a pas déposé
+        self.deposer(self.a_c, self.apprenant_c)
+        self.assertEqual([x["id"] for x in self.lister(self.apprenant_c)], [c])
+        self.assertEqual([x["id"] for x in self.lister(self.formateur)], [c])
+        self.assertEqual(self.lister(self.formateur_2), [])
+        self.assertEqual(len(self.lister(self.admin)), 1)
+        self.assertEqual(self.lister(self.apprenant_hors_promo), [])
+
+    def test_masquage_par_un_formateur_de_la_promotion(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        r = self.commenter(self.apprenant_b, self.a_b, "Merci", parent=c).data["id"]
+        url = f"{self.url('commentaire', c)}masquer/"
+
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_404_NOT_FOUND)
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.post(url).status_code, status.HTTP_403_FORBIDDEN)
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(url)
+        self.assertTrue(res.data["masque"])
+
+        # Masqué (et ses réponses) : invisible des autres apprenants, sauf de leur auteur
+        self.assertEqual([x["id"] for x in self.lister(self.apprenant_b)], [r])
+        vu = self.lister(self.apprenant)
+        self.assertEqual([x["id"] for x in vu], [c])
+        self.assertTrue(vu[0]["masque"])
+        self.assertFalse(vu[0]["peut_modifier"])
+        self.assertEqual(len(self.lister(self.formateur)), 2)
+        # Plus modifiable, plus de réponse
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.patch(self.url("commentaire", c), {"texte": "x"}, format="json").status_code,
+                         status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.commenter(self.apprenant_b, self.a_b, "?", parent=c).status_code,
+                         status.HTTP_400_BAD_REQUEST)
+
+        self.client.force_authenticate(user=self.formateur)
+        self.assertFalse(self.client.post(f"{self.url('commentaire', c)}demasquer/").data["masque"])
+        self.assertEqual(len(self.lister(self.apprenant_b)), 2)
+
+    def test_brief_archive_lecture_seule(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        Brief.objects.filter(pk=self.brief.pk).update(statut=Brief.Statut.ARCHIVE)
+        self.assertEqual(self.commenter(self.apprenant, self.a_b).status_code, status.HTTP_400_BAD_REQUEST)
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.patch(self.url("commentaire", c), {"texte": "x"}, format="json").status_code,
+                         status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.client.delete(self.url("commentaire", c)).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(len(self.lister(self.apprenant_b)), 1)
+
+    def test_emails(self, email):
+        with self.captureOnCommitCallbacks(execute=True):
+            c = self.commenter(self.apprenant, self.a_b).data["id"]
+        destinataires, auteur, titre, reponse, url = email.call_args.args
+        self.assertEqual((destinataires, reponse), ([self.apprenant_b.email], False))
+        self.assertTrue(url.endswith(f"/activites/{self.brief.id}"))
+
+        self.deposer(self.a_c, self.apprenant_c)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.commenter(self.apprenant_c, self.a_b, "Moi aussi", parent=c)
+        destinataires, _, _, reponse, _ = email.call_args.args
+        self.assertEqual(sorted(destinataires), sorted([self.apprenant.email, self.apprenant_b.email]))
+        self.assertTrue(reponse)
+
+        # Réponse du commenté : seul l'auteur d'origine est prévenu
+        with self.captureOnCommitCallbacks(execute=True):
+            self.commenter(self.apprenant_b, self.a_b, "Merci", parent=c)
+        self.assertEqual(email.call_args.args[0], [self.apprenant.email])
 
 
 # ─── Emails ───────────────────────────────────────────────────────────────────
