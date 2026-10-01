@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
@@ -12,10 +12,12 @@ from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
 from .models import (
     EXTENSIONS_LIVRABLES,
+    LONGUEUR_MAX_COMMENTAIRE,
     MAX_ELEMENTS_PAR_DEPOT,
     Assignation,
     Brief,
     CategorieBrief,
+    CommentairePair,
     CompetenceValidee,
     Evaluation,
     EvaluationCompetence,
@@ -560,7 +562,10 @@ class FichierLivrableSerializer(serializers.ModelSerializer):
 
 
 class LivrableSerializer(serializers.ModelSerializer):
-    """Un dépôt, en lecture (avec ses éléments et le retard calculé)."""
+    """
+    Un dépôt, en lecture (avec ses éléments et le retard calculé).
+    Son message n'est pas renvoyé aux pairs.
+    """
 
     brief = serializers.IntegerField(source="assignation.brief_id", read_only=True)
     deposant_nom = serializers.SerializerMethodField()
@@ -588,6 +593,19 @@ class LivrableSerializer(serializers.ModelSerializer):
 
     def get_deposant_nom(self, livrable):
         return f"{livrable.deposant.prenom} {livrable.deposant.nom}"
+
+    def to_representation(self, livrable):
+        data = super().to_representation(livrable)
+        # Le message d'un dépôt est réservé à ses auteurs et aux formateurs :
+        # un apprenant ne voit pas celui de ses pairs.
+        request = self.context.get("request")
+        if (
+            request
+            and self.context.get("role") == MembreTenant.Role.APPRENANT
+            and not est_vise_par(request.user, livrable.assignation)
+        ):
+            data["commentaire"] = ""
+        return data
 
     def get_cible(self, livrable):
         return cible_assignation(livrable.assignation)
@@ -818,3 +836,120 @@ class EvaluationSerializer(serializers.ModelSerializer):
                     apprenant=apprenant, competence_niveau=cn, defaults={"evaluation": evaluation}
                 )
         return evaluation
+
+
+# ─── Feedback entre pairs ─────────────────────────────────────────────────────
+
+def est_vise_par(user, assignation):
+    """L'utilisateur est l'apprenant visé, ou un membre actif du groupe visé."""
+    if assignation.apprenant_id:
+        return assignation.apprenant_id == user.id
+    return assignation.groupe.membres.filter(apprenant=user, actif=True).exists()
+
+
+def a_depose_sur(user, brief):
+    """L'apprenant (ou l'un de ses groupes) a déposé sur ce brief."""
+    return Livrable.objects.filter(assignation__brief=brief).filter(
+        Q(assignation__apprenant=user)
+        | Q(assignation__groupe__membres__apprenant=user, assignation__groupe__membres__actif=True)
+    ).exists()
+
+
+def brief_ouvert_aux_commentaires(brief):
+    return brief.statut == Brief.Statut.PUBLIE and brief.promotion.actif
+
+
+class CommentairePairSerializer(serializers.ModelSerializer):
+    """
+    Commentaire sur le rendu d'un pair, ou réponse (un niveau).
+    Création : assignation (rendu commenté), texte, parent (réponse).
+    Modification : le texte seulement.
+    """
+
+    brief = serializers.IntegerField(source="assignation.brief_id", read_only=True)
+    auteur_nom = serializers.SerializerMethodField()
+    modifie = serializers.SerializerMethodField()
+    peut_modifier = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CommentairePair
+        fields = [
+            "id",
+            "assignation",
+            "brief",
+            "parent",
+            "auteur",
+            "auteur_nom",
+            "texte",
+            "masque",
+            "modifie",
+            "peut_modifier",
+            "date_creation",
+            "date_modification",
+        ]
+        read_only_fields = ["id", "auteur", "masque", "date_creation", "date_modification"]
+
+    def get_auteur_nom(self, c):
+        return f"{c.auteur.prenom} {c.auteur.nom}"
+
+    def get_modifie(self, c):
+        return (c.date_modification - c.date_creation).total_seconds() > 1
+
+    def get_peut_modifier(self, c):
+        request = self.context.get("request")
+        return bool(
+            request
+            and c.auteur_id == request.user.id
+            and not c.masque
+            and brief_ouvert_aux_commentaires(c.assignation.brief)
+        )
+
+    def validate_texte(self, texte):
+        texte = texte.strip()
+        if not texte:
+            raise serializers.ValidationError("Le commentaire est vide.")
+        if len(texte) > LONGUEUR_MAX_COMMENTAIRE:
+            raise serializers.ValidationError(
+                f"{LONGUEUR_MAX_COMMENTAIRE} caractères au maximum."
+            )
+        return texte
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+
+        if self.instance is not None:
+            # Modification : seul le texte change
+            attrs = {"texte": attrs["texte"]} if "texte" in attrs else {}
+            if not brief_ouvert_aux_commentaires(self.instance.assignation.brief):
+                raise serializers.ValidationError("Ce brief est fermé : les commentaires sont en lecture seule.")
+            if self.instance.masque:
+                raise serializers.ValidationError("Un commentaire masqué par le formateur ne se modifie plus.")
+            return attrs
+
+        assignation = attrs["assignation"]
+        brief = assignation.brief
+        if brief.promotion.formation.tenant_id != self.context["tenant_id"]:
+            raise serializers.ValidationError({"assignation": "Rendu introuvable."})
+        if not brief_ouvert_aux_commentaires(brief):
+            raise serializers.ValidationError("Ce brief est fermé : les commentaires sont en lecture seule.")
+        if not a_depose_sur(user, brief):
+            raise serializers.ValidationError(
+                "Déposez d'abord votre travail pour commenter celui des autres."
+            )
+        if not assignation.livrables.exists():
+            raise serializers.ValidationError({"assignation": "Ce rendu n'a pas encore de dépôt."})
+
+        parent = attrs.get("parent")
+        if parent is None:
+            if est_vise_par(user, assignation):
+                raise serializers.ValidationError(
+                    "Vous ne commentez pas votre propre rendu : répondez aux commentaires reçus."
+                )
+        else:
+            if parent.assignation_id != assignation.id:
+                raise serializers.ValidationError({"parent": "Ce commentaire porte sur un autre rendu."})
+            if parent.parent_id is not None:
+                raise serializers.ValidationError({"parent": "On répond à un commentaire, pas à une réponse."})
+            if parent.masque:
+                raise serializers.ValidationError({"parent": "Ce commentaire a été masqué."})
+        return attrs

@@ -5,6 +5,7 @@ from .views import (
     AssignationViewSet,
     BriefViewSet,
     CategorieBriefViewSet,
+    CommentairePairViewSet,
     EvaluationViewSet,
     FichierLivrableViewSet,
     LivrableViewSet,
@@ -35,6 +36,7 @@ router.register(
 
 router.register("evaluations", EvaluationViewSet, basename="evaluation")
 router.register("progression", ProgressionViewSet, basename="progression")
+router.register("commentaires", CommentairePairViewSet, basename="commentaire")
 
 urlpatterns = [
     path(

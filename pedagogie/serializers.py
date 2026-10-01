@@ -543,7 +543,7 @@ class InscriptionPromotionSerializer(serializers.ModelSerializer):
                 {"promotion": "La promotion sélectionnée n'appartient pas à cet organisme."}
             )
 
-        # 2. Vérification de l'apprenant : utilisateur actif + MembreTenant rôle APPRENANT actif dans ce tenant
+        # 2. Vérification de l'apprenant : membre APPRENANT actif de ce tenant (compte activé ou non)
         if apprenant and tenant_id:
             from accounts.models import MembreTenant
             if not MembreTenant.objects.filter(

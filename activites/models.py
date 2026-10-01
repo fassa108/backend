@@ -515,3 +515,54 @@ class CompetenceValidee(models.Model):
 
     def __str__(self):
         return f"{self.apprenant} : {self.competence_niveau}"
+
+
+# ─── Feedback entre pairs ─────────────────────────────────────────────────────
+
+LONGUEUR_MAX_COMMENTAIRE = 2000
+
+
+class CommentairePair(models.Model):
+    """
+    Commentaire d'un apprenant sur le rendu (assignation) d'un pair, ou
+    réponse à un commentaire (un seul niveau).
+
+    Seuls les apprenants qui ont déposé sur le brief commentent ; l'auteur
+    modifie ou supprime le sien ; un formateur de la promotion peut le
+    masquer. Brief archivé ou promotion clôturée : lecture seule.
+    """
+
+    assignation = models.ForeignKey(
+        Assignation,
+        on_delete=models.CASCADE,
+        related_name="commentaires",
+    )
+    auteur = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="commentaires_pairs",
+    )
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="reponses",
+    )
+    texte = models.TextField(max_length=LONGUEUR_MAX_COMMENTAIRE)
+    masque = models.BooleanField(default=False)
+    masque_par = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="commentaires_masques",
+    )
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["date_creation", "id"]
+
+    def __str__(self):
+        return f"Commentaire de {self.auteur} sur {self.assignation}"
