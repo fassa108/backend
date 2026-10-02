@@ -484,8 +484,10 @@ class ModuleViewSet(ReferentielViewSet):
 
     def perform_destroy(self, instance):
         _refuser_suppression_si(
-            instance.competences.exists() or instance.briefs.exists(),
-            "Ce module a des compétences ou est utilisé par des briefs.",
+            instance.competences.exists()
+            or instance.briefs.exists()
+            or instance.supports_revision.exists(),
+            "Ce module a des compétences, ou est utilisé par des briefs ou des quiz et fiches de révision.",
         )
         instance.delete()
 

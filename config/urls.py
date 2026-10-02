@@ -47,4 +47,8 @@ urlpatterns = [
         "api/",
         include("activites.urls")
         ),
+    path(
+        "api/",
+        include("revision.urls"),
+    ),
 ]

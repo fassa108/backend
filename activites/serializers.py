@@ -568,6 +568,7 @@ class LivrableSerializer(serializers.ModelSerializer):
     """
 
     brief = serializers.IntegerField(source="assignation.brief_id", read_only=True)
+    brief_titre = serializers.CharField(source="assignation.brief.titre", read_only=True)
     deposant_nom = serializers.SerializerMethodField()
     # Qui est visé par l'assignation (apprenant ou groupe)
     cible = serializers.SerializerMethodField()
@@ -580,6 +581,7 @@ class LivrableSerializer(serializers.ModelSerializer):
             "id",
             "assignation",
             "brief",
+            "brief_titre",
             "cible",
             "numero",
             "deposant",

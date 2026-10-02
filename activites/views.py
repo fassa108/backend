@@ -505,7 +505,7 @@ class LivrableViewSet(viewsets.ModelViewSet):
     - Admin organisme : lecture de tous les dépôts du tenant.
     - Admin SaaS : aucun accès.
 
-    Filtres : ?brief=, ?assignation=.
+    Filtres : ?brief=, ?assignation=, ?module=.
     """
 
     serializer_class = LivrableSerializer
@@ -539,6 +539,9 @@ class LivrableViewSet(viewsets.ModelViewSet):
         assignation_id = _param_entier(self.request, "assignation")
         if assignation_id is not None:
             qs = qs.filter(assignation_id=assignation_id)
+        module_id = _param_entier(self.request, "module")
+        if module_id is not None:
+            qs = qs.filter(assignation__brief__module_id=module_id)
         return _livrables_visibles(self.request.user, tenant_id, qs)
 
     def get_serializer_context(self):
