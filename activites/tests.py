@@ -1785,3 +1785,17 @@ class ReferentielUtiliseParUnBriefTests(ActivitesBaseTestCase):
     def test_niveau_de_competence_libre_retirable(self):
         res = self.client.delete(f"{self.base}/competence-niveaux/{self.cn_module_2.id}/")
         self.assertEqual(res.status_code, status.HTTP_204_NO_CONTENT)
+
+
+class FiltreLivrablesParModuleTests(ActivitesBaseTestCase):
+    def test_filtre_par_module_et_titre_du_brief(self):
+        brief = self.creer_brief()
+        autre = self.creer_brief()
+        autre.module = self.module_2
+        autre.save()
+        livrable = self.deposer(Assignation.objects.create(brief=brief, apprenant=self.apprenant))
+        self.deposer(Assignation.objects.create(brief=autre, apprenant=self.apprenant))
+
+        res = self.client.get(self.url("livrable"), {"module": self.module.id})
+        self.assertEqual(self.ids(res), [livrable.id])
+        self.assertEqual(res.data[0]["brief_titre"], brief.titre)
