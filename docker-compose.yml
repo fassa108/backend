@@ -70,11 +70,13 @@ services:
       - db
       - redis
       - gotenberg
+      - ia
 
-    # « apercus » : seul chemin vers Gotenberg
+    # « apercus » : seul chemin vers Gotenberg ; « ia » : seul chemin vers le service IA
     networks:
       - default
       - apercus
+      - ia
 
 
   # Conversion des fichiers Office (docx, pptx) en PDF pour leur aperçu.
@@ -100,10 +102,32 @@ services:
     restart: unless-stopped
 
 
+  # Service IA (génération de quiz), dépôt voisin eduhub_fastapi.
+  # Joignable seulement par Celery, via le réseau interne « ia » ; aucun port
+  # publié ; pas d'accès à la base ni à Redis. « ia_sortie » ne sert qu'à
+  # joindre l'API Gemini. Les appels exigent le jeton partagé (X-Service-Token).
+  ia:
+    build:
+      context: ../eduhub_fastapi
+      dockerfile: Dockerfile
+
+    env_file:
+      - ../eduhub_fastapi/.env
+
+    networks:
+      - ia
+      - ia_sortie
+
+    restart: unless-stopped
+
+
 networks:
   default:
   apercus:
     internal: true
+  ia:
+    internal: true
+  ia_sortie:
 
 
 volumes:
