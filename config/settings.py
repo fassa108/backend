@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'tenants',
     'pedagogie',
     'activites',
+    'revision',
 ]
 
 MIDDLEWARE = [
@@ -225,6 +226,11 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
 # téléchargeables, sans aperçu.
 GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://gotenberg:3000")
 APERCU_OFFICE_ACTIF = os.getenv("APERCU_OFFICE_ACTIF", "1") == "1" and "test" not in sys.argv
+
+# Service IA (eduhub_fastapi) : génération des quiz et fiches de révision,
+# appelé par Celery sur un réseau interne, avec un jeton partagé.
+IA_URL = os.getenv("IA_URL", "http://ia:8000")
+IA_SERVICE_TOKEN = os.getenv("IA_SERVICE_TOKEN", "")
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
