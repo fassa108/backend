@@ -549,6 +549,23 @@ class RessourceTests(ActivitesBaseTestCase):
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("10 Mo", str(res.data["fichier"]))
 
+    @override_settings(TAILLE_MAX_FICHIER_MO=1)
+    def test_taille_maximale_reglable(self):
+        gros = CONTENU_VALIDE["pdf"] + b"x" * (1024 * 1024)
+        res = self.client.post(self.url("ressource"), {"titre": "Gros", "fichier": fichier_test("gros.pdf", gros)})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("1 Mo", str(res.data["fichier"]))
+
+    @override_settings(TAILLE_MAX_FICHIER_MO=25)
+    def test_limites_fichiers_exposees(self):
+        res = self.client.get("/api/limites-fichiers/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data, {"taille_max_fichier_mo": 25})
+
+        self.client.force_authenticate(user=None)
+        res = self.client.get("/api/limites-fichiers/")
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
     def test_url_et_fichier_simultanes_refuses(self):
         fichier = fichier_test("doc.pdf")
         res = self.client.post(self.url("ressource"),

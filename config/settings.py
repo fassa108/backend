@@ -159,6 +159,11 @@ STATIC_URL = 'static/'
 # qui vérifie les droits (routes « telecharger »).
 MEDIA_ROOT = BASE_DIR / "media"
 
+# Taille maximale d'un fichier déposé (ressource, livrable, source de révision).
+# Seul réglage à changer : le frontend la lit via /api/limites-fichiers/ et
+# docker-compose la transmet au service IA.
+TAILLE_MAX_FICHIER_MO = int(os.getenv("TAILLE_MAX_FICHIER_MO", "10"))
+
 
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration

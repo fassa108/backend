@@ -7,10 +7,8 @@ On vérifie donc aussi le contenu réel (signature du format).
 
 import zipfile
 
+from django.conf import settings
 from rest_framework import serializers
-
-# Taille maximale d'un fichier déposé
-TAILLE_MAX_FICHIER = 10 * 1024 * 1024  # 10 Mo
 
 # Documents Office : archive ZIP contenant ce dossier
 DOSSIER_OFFICE = {
@@ -63,8 +61,10 @@ def valider_fichier(fichier):
     Vérifie la taille et le contenu réel d'un fichier dont l'extension a
     déjà été acceptée (pdf, docx, pptx, txt). Lève une ValidationError DRF.
     """
-    if fichier.size > TAILLE_MAX_FICHIER:
-        raise serializers.ValidationError("Le fichier ne doit pas dépasser 10 Mo.")
+    # Lue à chaque appel (taille maximale : settings.TAILLE_MAX_FICHIER_MO)
+    taille_max_mo = settings.TAILLE_MAX_FICHIER_MO
+    if fichier.size > taille_max_mo * 1024 * 1024:
+        raise serializers.ValidationError(f"Le fichier ne doit pas dépasser {taille_max_mo} Mo.")
 
     ext = fichier.name.rsplit(".", 1)[-1].lower() if "." in fichier.name else ""
 

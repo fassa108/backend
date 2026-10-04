@@ -114,6 +114,11 @@ services:
     env_file:
       - ../eduhub_fastapi/.env
 
+    # Même limite de taille que Django (TAILLE_MAX_FICHIER_MO du .env du
+    # backend) : un fichier accepté au dépôt l'est aussi à la génération.
+    environment:
+      TAILLE_MAX_MO: ${TAILLE_MAX_FICHIER_MO:-10}
+
     networks:
       - ia
       - ia_sortie

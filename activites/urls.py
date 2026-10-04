@@ -8,6 +8,7 @@ from .views import (
     CommentairePairViewSet,
     EvaluationViewSet,
     FichierLivrableViewSet,
+    LimitesFichiersView,
     LivrableViewSet,
     ProgressionViewSet,
     RessourceViewSet,
@@ -39,6 +40,11 @@ router.register("progression", ProgressionViewSet, basename="progression")
 router.register("commentaires", CommentairePairViewSet, basename="commentaire")
 
 urlpatterns = [
+    path(
+        "limites-fichiers/",
+        LimitesFichiersView.as_view(),
+        name="limites-fichiers",
+    ),
     path(
         "tenants/<int:tenant_id>/",
         include(router.urls),

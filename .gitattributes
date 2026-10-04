@@ -1,0 +1,3 @@
+# Scripts exécutés dans les conteneurs Linux : toujours en LF, même sous
+# Windows (un CRLF casse le shebang : « exec /entrypoint.sh: no such file »).
+*.sh text eol=lf

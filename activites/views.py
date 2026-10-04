@@ -1,5 +1,6 @@
 import os
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Max, Prefetch, Q
 from django.http import FileResponse
@@ -8,6 +9,7 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, InscriptionPromotion, Promotion
@@ -112,6 +114,18 @@ def _refus_par_defaut(view):
     if view.request.method.lower() not in view.http_method_names:
         return [IsMembreOrganisme()]
     return [Refus()]
+
+
+# ─── Limites des fichiers ─────────────────────────────────────────────────────
+
+class LimitesFichiersView(APIView):
+    """
+    Limites des fichiers déposés, lues par le frontend pour ses contrôles
+    et ses textes d'aide : le réglage reste à un seul endroit (settings).
+    """
+
+    def get(self, request):
+        return Response({"taille_max_fichier_mo": settings.TAILLE_MAX_FICHIER_MO})
 
 
 # ─── Ressources ───────────────────────────────────────────────────────────────
