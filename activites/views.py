@@ -31,7 +31,7 @@ from .models import (
     Livrable,
     Ressource,
 )
-from . import progression
+from . import progression, tableau_de_bord
 from .apercus import demander_apercu, reponse_consultation
 from .notifications import (
     notifier_assignations,
@@ -872,3 +872,33 @@ class CommentairePairViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def demasquer(self, request, tenant_id=None, pk=None):
         return self._changer_masque(False)
+
+
+# ─── Tableaux de bord ─────────────────────────────────────────────────────────
+# Une route par rôle, qui calcule tout en une fois (activites/tableau_de_bord.py).
+
+class TableauDeBordFormateurView(APIView):
+    """Rendus à évaluer, échéances, suivi des briefs, apprenants à suivre."""
+
+    permission_classes = [IsFormateurOrganisme]
+
+    def get(self, request, tenant_id):
+        return Response(tableau_de_bord.tableau_de_bord_formateur(request.user, tenant_id))
+
+
+class TableauDeBordAdminView(APIView):
+    """Indicateurs de l'organisme, promotions, activité récente, points d'attention."""
+
+    permission_classes = [IsAdminOrganisme]
+
+    def get(self, request, tenant_id):
+        return Response(tableau_de_bord.tableau_de_bord_admin(tenant_id))
+
+
+class TableauDeBordApprenantView(APIView):
+    """Briefs à rendre, quiz à faire, progression, retours récents."""
+
+    permission_classes = [EstApprenantOrganisme]
+
+    def get(self, request, tenant_id):
+        return Response(tableau_de_bord.tableau_de_bord_apprenant(request.user, tenant_id))
