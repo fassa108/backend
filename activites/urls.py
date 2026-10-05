@@ -12,6 +12,9 @@ from .views import (
     LivrableViewSet,
     ProgressionViewSet,
     RessourceViewSet,
+    TableauDeBordAdminView,
+    TableauDeBordApprenantView,
+    TableauDeBordFormateurView,
 )
 
 router = DefaultRouter()
@@ -44,6 +47,21 @@ urlpatterns = [
         "limites-fichiers/",
         LimitesFichiersView.as_view(),
         name="limites-fichiers",
+    ),
+    path(
+        "tenants/<int:tenant_id>/tableau-de-bord/formateur/",
+        TableauDeBordFormateurView.as_view(),
+        name="tableau-de-bord-formateur",
+    ),
+    path(
+        "tenants/<int:tenant_id>/tableau-de-bord/admin/",
+        TableauDeBordAdminView.as_view(),
+        name="tableau-de-bord-admin",
+    ),
+    path(
+        "tenants/<int:tenant_id>/tableau-de-bord/apprenant/",
+        TableauDeBordApprenantView.as_view(),
+        name="tableau-de-bord-apprenant",
     ),
     path(
         "tenants/<int:tenant_id>/",

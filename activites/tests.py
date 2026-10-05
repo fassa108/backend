@@ -1816,3 +1816,154 @@ class FiltreLivrablesParModuleTests(ActivitesBaseTestCase):
         res = self.client.get(self.url("livrable"), {"module": self.module.id})
         self.assertEqual(self.ids(res), [livrable.id])
         self.assertEqual(res.data[0]["brief_titre"], brief.titre)
+
+
+# ─── Tableaux de bord ─────────────────────────────────────────────────────────
+
+class TableauDeBordTests(ActivitesBaseTestCase):
+    """
+    Brief échu (rendu par « apprenant », pas par « apprenant_b ») et brief
+    à venir (pas encore rendu), dans la promotion du formateur.
+    """
+
+    def setUp(self):
+        super().setUp()
+        maintenant = timezone.now()
+        self.echu = self.brief_nomme(
+            "Brief échu", cree_par=self.formateur,
+            date_debut=maintenant - timedelta(days=10), date_limite=maintenant - timedelta(days=2),
+        )
+        self.a_venir = self.brief_nomme("Brief à venir", cree_par=self.formateur)
+        for brief in (self.echu, self.a_venir):
+            brief.competence_niveaux.set([self.cn])
+        self.rendu = Assignation.objects.create(brief=self.echu, apprenant=self.apprenant)
+        self.manquant = Assignation.objects.create(brief=self.echu, apprenant=self.apprenant_b)
+        Assignation.objects.create(brief=self.a_venir, apprenant=self.apprenant)
+        self.deposer(self.rendu)
+
+    def brief_nomme(self, titre, **extra):
+        brief = self.creer_brief(**extra)
+        brief.titre = titre
+        brief.save(update_fields=["titre"])
+        return brief
+
+    def get(self, role, utilisateur):
+        self.client.force_authenticate(user=utilisateur)
+        return self.client.get(
+            reverse(f"tableau-de-bord-{role}", kwargs={"tenant_id": self.tenant.id})
+        )
+
+    def evaluer(self, assignation, acquis=True):
+        evaluation = Evaluation.objects.create(assignation=assignation, evaluateur=self.formateur)
+        evaluation.competences.create(competence_niveau=self.cn, acquis=acquis)
+        if acquis:
+            CompetenceValidee.objects.create(
+                apprenant=assignation.apprenant, competence_niveau=self.cn, evaluation=evaluation
+            )
+
+    # Formateur
+
+    def test_formateur_rendus_a_evaluer_et_retards(self):
+        res = self.get("formateur", self.formateur)
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["indicateurs"]["a_evaluer"], 1)
+        self.assertEqual(res.data["indicateurs"]["apprenants"], 2)
+        self.assertEqual(res.data["indicateurs"]["taux_rendu"], 50)
+        self.assertEqual(res.data["a_evaluer"][0]["assignation"], self.rendu.id)
+        self.assertEqual(
+            [(a["id"], a["briefs_non_rendus"]) for a in res.data["apprenants_a_suivre"]],
+            [(self.apprenant_b.id, 1)],
+        )
+        echeances = {e["titre"]: (e["rendus"], e["attendus"]) for e in res.data["echeances"]}
+        self.assertEqual(echeances, {"Brief échu": (1, 2), "Brief à venir": (0, 1)})
+
+    def test_formateur_evaluation_puis_nouveau_depot(self):
+        self.evaluer(self.rendu)
+        res = self.get("formateur", self.formateur)
+        self.assertEqual(res.data["indicateurs"]["a_evaluer"], 0)
+        suivi = {s["titre"]: s for s in res.data["suivi_briefs"]}
+        self.assertEqual(suivi["Brief échu"]["VALIDE"], 1)
+        self.assertEqual(suivi["Brief échu"]["NON_RENDU"], 1)
+        # Référentiel de 2 compétences : 50 % pour « apprenant », 0 % pour « apprenant_b »
+        self.assertEqual(res.data["indicateurs"]["competences_pct"], 25)
+
+        # Nouveau dépôt après l'évaluation : à réévaluer
+        self.deposer(self.rendu)
+        res = self.get("formateur", self.formateur)
+        self.assertEqual(res.data["indicateurs"]["a_evaluer"], 1)
+
+    def test_formateur_ne_voit_que_ses_promotions(self):
+        res = self.get("formateur", self.formateur_2)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["indicateurs"]["a_evaluer"], 0)
+        self.assertEqual(res.data["promotions"], [])
+        self.assertEqual(res.data["suivi_briefs"], [])
+
+    def test_brouillon_ignore(self):
+        brouillon = self.brief_nomme("Brouillon", statut=Brief.Statut.BROUILLON)
+        Assignation.objects.create(brief=brouillon, apprenant=self.apprenant)
+        res = self.get("formateur", self.formateur)
+        self.assertNotIn("Brouillon", [s["titre"] for s in res.data["suivi_briefs"]])
+
+    # Admin organisme
+
+    def test_admin_indicateurs_et_points_d_attention(self):
+        invite = self.membre("invite@test.com", MembreTenant.Role.APPRENANT)
+        invite.actif = False
+        invite.save(update_fields=["actif"])
+
+        res = self.get("admin", self.admin)
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["indicateurs"]["promotions_actives"], 2)
+        self.assertEqual(res.data["indicateurs"]["apprenants"], 4)
+        self.assertEqual(res.data["indicateurs"]["depots_7_jours"], 1)
+        self.assertEqual(res.data["attention"]["invitations_en_attente"], 1)
+        self.assertEqual(
+            res.data["attention"]["promotions_sans_formateur"],
+            [{"id": self.promotion_2.id, "nom": self.promotion_2.nom}],
+        )
+        promotion = next(p for p in res.data["promotions"] if p["id"] == self.promotion.id)
+        self.assertEqual((promotion["nb_apprenants"], promotion["taux_rendu"], promotion["a_evaluer"]), (2, 50, 1))
+        self.assertEqual(len(res.data["activite"]), 14)
+        self.assertEqual(res.data["activite"][-1]["depots"], 1)
+
+    # Apprenant
+
+    def test_apprenant_a_rendre_et_attente(self):
+        res = self.get("apprenant", self.apprenant)
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        self.assertEqual(res.data["promotion"]["id"], self.promotion.id)
+        self.assertEqual([b["titre"] for b in res.data["a_rendre"]], ["Brief à venir"])
+        self.assertEqual(res.data["indicateurs"]["a_rendre"], 1)
+        self.assertEqual(res.data["indicateurs"]["en_retard"], 0)
+        self.assertEqual(res.data["indicateurs"]["en_attente_evaluation"], 1)
+
+    def test_apprenant_en_retard_et_evaluation_recente(self):
+        res = self.get("apprenant", self.apprenant_b)
+        self.assertEqual(res.data["indicateurs"]["en_retard"], 1)
+        self.assertTrue(res.data["a_rendre"][0]["en_retard"])
+
+        self.evaluer(self.rendu)
+        res = self.get("apprenant", self.apprenant)
+        self.assertEqual(res.data["indicateurs"]["en_attente_evaluation"], 0)
+        self.assertEqual(res.data["progression"]["competences_validees"], 1)
+        self.assertTrue(res.data["evaluations_recentes"][0]["valide"])
+
+    def test_apprenant_sans_promotion(self):
+        res = self.get("apprenant", self.apprenant_hors_promo)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertIsNone(res.data["promotion"])
+
+    def test_chaque_route_reservee_a_son_role(self):
+        refus = [
+            ("formateur", self.apprenant), ("formateur", self.admin),
+            ("admin", self.formateur), ("admin", self.apprenant),
+            ("apprenant", self.formateur), ("apprenant", self.admin),
+            ("admin", self.admin_saas),
+        ]
+        for role, utilisateur in refus:
+            self.assertEqual(self.get(role, utilisateur).status_code, status.HTTP_403_FORBIDDEN, (role, utilisateur))
+
+    def test_autre_organisme_refuse(self):
+        admin_b = self.membre("admin_b@test.com", MembreTenant.Role.ADMINISTRATEUR, tenant=self.tenant_2)
+        self.assertEqual(self.get("admin", admin_b).status_code, status.HTTP_403_FORBIDDEN)
