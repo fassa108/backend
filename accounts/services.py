@@ -72,6 +72,19 @@ class AccountService:
             role=role,
         )
 
+        token = AccountService.envoyer_invitation(utilisateur)
+
+        return utilisateur, token
+
+
+    @staticmethod
+    @transaction.atomic
+    def envoyer_invitation(utilisateur):
+        """
+        Génère un nouveau lien d'activation et l'envoie par email.
+        Sert aussi à relancer un compte jamais activé.
+        """
+
         # Le token précédent ne doit plus pouvoir être utilisé
         # lorsqu'une nouvelle invitation est générée.
         AccountActivationToken.objects.filter(
@@ -79,10 +92,9 @@ class AccountService:
             utilise=False,
         ).update(utilise=True)
 
-        # Le lien d'activation reste valable 2 heures.
         token = AccountActivationToken.objects.create(
             utilisateur=utilisateur,
-            date_expiration=timezone.now() + timedelta(hours=2),
+            date_expiration=timezone.now() + timedelta(hours=settings.DUREE_LIEN_ACTIVATION_HEURES),
         )
 
         activation_url = (
@@ -97,7 +109,7 @@ class AccountService:
             )
         )
 
-        return utilisateur, token
+        return token
 
 
     @staticmethod

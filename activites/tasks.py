@@ -8,66 +8,21 @@ Tâches de fond des activités (Celery).
 
 import json
 import logging
-from html import escape
 
 import requests
 from celery import shared_task
 from django.apps import apps
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.core.mail import EmailMultiAlternatives
+
+from config.emails import envoyer
 
 logger = logging.getLogger(__name__)
 
 
-def _mise_en_page(titre, lignes, libelle_bouton, url):
-    """HTML simple aux couleurs d'EduHub (les textes sont échappés)."""
-    paragraphes = "".join(
-        f'<p style="margin:0 0 12px;font-size:15px;line-height:1.6;color:#3f3f46;">{escape(l)}</p>'
-        for l in lignes
-    )
-    return f"""
-    <html>
-      <body style="margin:0;padding:0;background:#f5f7fa;font-family:Arial,Helvetica,sans-serif;">
-        <div style="max-width:600px;margin:40px auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
-          <div style="padding:24px;text-align:center;background:#242424;">
-            <h1 style="margin:0;color:#ffffff;font-size:24px;">EduHub</h1>
-          </div>
-          <div style="padding:32px;">
-            <h2 style="margin:0 0 20px;font-size:20px;color:#111827;">{escape(titre)}</h2>
-            {paragraphes}
-            <div style="margin-top:28px;text-align:center;">
-              <a href="{escape(url, quote=True)}" style="display:inline-block;padding:12px 24px;background:#6366f1;color:#ffffff;text-decoration:none;border-radius:8px;font-weight:bold;">
-                {escape(libelle_bouton)}
-              </a>
-            </div>
-          </div>
-          <div style="padding:16px;text-align:center;border-top:1px solid #eeeeee;">
-            <p style="margin:0;font-size:12px;color:#888888;">Cet email a été envoyé automatiquement par EduHub.</p>
-          </div>
-        </div>
-      </body>
-    </html>
-    """
-
-
-def _envoyer(destinataires, sujet, titre, lignes, libelle_bouton, url):
-    html = _mise_en_page(titre, lignes, libelle_bouton, url)
-    texte = "\n\n".join([titre, *lignes, f"{libelle_bouton} : {url}"])
-    for email in destinataires:
-        message = EmailMultiAlternatives(
-            subject=sujet,
-            body=texte,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            to=[email],
-        )
-        message.attach_alternative(html, "text/html")
-        message.send()
-
-
 @shared_task
 def envoyer_email_assignation(destinataires, titre_brief, date_limite, url):
-    _envoyer(
+    envoyer(
         destinataires,
         sujet=f"Nouveau brief : {titre_brief}",
         titre="Un nouveau brief vous est assigné",
@@ -86,7 +41,7 @@ def envoyer_email_soumission(destinataires, deposant, cible, titre_brief, numero
     ]
     if en_retard:
         lignes.append("Ce dépôt a été fait après la date limite.")
-    _envoyer(
+    envoyer(
         destinataires,
         sujet=f"Nouveau dépôt : {titre_brief}",
         titre="Nouveau dépôt de livrable",
@@ -102,7 +57,7 @@ def envoyer_email_evaluation(destinataires, titre_brief, evaluateur, nb_acquises
     if nb_visees:
         lignes.append(f"Compétences acquises : {nb_acquises} sur {nb_visees}.")
     lignes.append("Retrouvez le détail et les commentaires dans votre activité.")
-    _envoyer(
+    envoyer(
         destinataires,
         sujet=f"Évaluation : {titre_brief}",
         titre="Votre rendu a été évalué",
@@ -118,7 +73,7 @@ def envoyer_email_commentaire(destinataires, auteur, titre_brief, reponse, url):
         lignes = [f"{auteur} a répondu à un commentaire sur le brief « {titre_brief} »."]
     else:
         lignes = [f"{auteur} a commenté votre rendu du brief « {titre_brief} »."]
-    _envoyer(
+    envoyer(
         destinataires,
         sujet=f"Nouveau commentaire : {titre_brief}",
         titre="Nouveau commentaire",

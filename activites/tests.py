@@ -28,7 +28,7 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import timedelta
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -194,6 +194,10 @@ class ActivitesBaseTestCase(APITestCase):
     def ids(self, res):
         return sorted(x["id"] for x in res.data)
 
+    def dans(self, jours):
+        """Date ISO relative à maintenant (les briefs ne commencent pas dans le passé)."""
+        return (timezone.now() + timedelta(days=jours)).isoformat()
+
     def payload_brief(self, **extra):
         return {
             "promotion": self.promotion.id,
@@ -203,8 +207,8 @@ class ActivitesBaseTestCase(APITestCase):
             "contexte": "<p>Une boulangerie veut un site.</p>",
             "modalites_evaluation": "<p>Revue de code</p>",
             "livrables_attendus": "<ul><li>Lien du dépôt</li></ul>",
-            "date_debut": "2026-09-01T08:00:00Z",
-            "date_limite": "2026-09-30T18:00:00Z",
+            "date_debut": self.dans(1),
+            "date_limite": self.dans(30),
             "competence_niveaux": [self.cn.id],
             **extra,
         }
@@ -319,7 +323,7 @@ class BriefCreationTests(ActivitesBaseTestCase):
 
     def test_dates_invalides_refusees(self):
         res = self.client.post(self.url("brief"), self.payload_brief(
-            date_debut="2026-09-30T08:00:00Z", date_limite="2026-09-01T18:00:00Z"), format="json")
+            date_debut=self.dans(30), date_limite=self.dans(1)), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_promotion_non_affectee_refusee(self):
@@ -352,7 +356,7 @@ class BriefModificationTests(ActivitesBaseTestCase):
     def test_fige_apres_le_premier_livrable(self):
         self.deposer(self.assignation)
         res = self.client.patch(self.url("brief", self.brief.id),
-                                {"date_limite": "2026-10-30T18:00:00Z"}, format="json")
+                                {"date_limite": self.dans(40)}, format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(self.client.get(self.url("brief", self.brief.id)).data["modifiable"])
 
@@ -388,6 +392,56 @@ class BriefModificationTests(ActivitesBaseTestCase):
         self.client.force_authenticate(user=self.formateur_2)
         res = self.client.patch(self.url("brief", self.brief.id), {"titre": "X"}, format="json")
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_pas_de_retour_en_brouillon_apres_livrable(self):
+        self.deposer(self.assignation)
+        res = self.client.patch(self.url("brief", self.brief.id), {"statut": "BROUILLON"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("statut", res.data)
+
+    def test_retour_en_brouillon_sans_livrable(self):
+        res = self.client.patch(self.url("brief", self.brief.id), {"statut": "BROUILLON"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+    def test_publication_refusee_si_date_limite_passee(self):
+        brouillon = self.creer_brief(
+            statut=Brief.Statut.BROUILLON,
+            date_debut=timezone.now() - timedelta(days=10),
+            date_limite=timezone.now() - timedelta(days=1),
+        )
+        res = self.client.patch(self.url("brief", brouillon.id), {"statut": "PUBLIE"}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("date_limite", res.data)
+
+    def test_date_limite_strictement_apres_le_debut(self):
+        meme = self.dans(1)
+        res = self.client.post(self.url("brief"), self.payload_brief(date_debut=meme, date_limite=meme), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("date_limite", res.data)
+
+    def test_dates_dans_la_promotion(self):
+        self.promotion.date_debut = timezone.localdate() + timedelta(days=10)
+        self.promotion.date_fin = timezone.localdate() + timedelta(days=20)
+        self.promotion.save()
+        avant = self.client.post(self.url("brief"), self.payload_brief(date_debut=self.dans(2)), format="json")
+        self.assertEqual(avant.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("date_debut", avant.data)
+        apres = self.client.post(self.url("brief"), self.payload_brief(date_debut=self.dans(11), date_limite=self.dans(30)), format="json")
+        self.assertEqual(apres.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("date_limite", apres.data)
+
+    def test_date_de_debut_pas_dans_le_passe(self):
+        res = self.client.post(self.url("brief"), self.payload_brief(date_debut=self.dans(-1)), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("date_debut", res.data)
+
+        # Brief déjà commencé (hier) : modifiable tant que sa date de début ne change pas
+        res = self.client.patch(self.url("brief", self.brief.id), {
+            "titre": "Nouveau titre", "date_debut": self.brief.date_debut.isoformat(),
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_200_OK, res.data)
+        res = self.client.patch(self.url("brief", self.brief.id), {"date_debut": self.dans(-3)}, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
     def test_action_non_prevue_refusee(self):
         # PUT n'est pas exposé ; toute action non listée est refusée

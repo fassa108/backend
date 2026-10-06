@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework.exceptions import ValidationError
 
 from .models import AccountActivationToken
@@ -16,7 +17,8 @@ class ActivationTokenService:
             activation_token = AccountActivationToken.objects.select_related(
                 "utilisateur"
             ).get(token=token)
-        except AccountActivationToken.DoesNotExist:
+        # Jeton mal formé (lien tronqué) : même réponse qu'un jeton inconnu
+        except (AccountActivationToken.DoesNotExist, DjangoValidationError):
             raise ValidationError(
                 "Le lien d'activation est invalide."
             )

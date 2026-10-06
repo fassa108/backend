@@ -72,4 +72,12 @@ urlpatterns = [
         }),
         name="membre-detail",
     ),
+
+    path(
+        "tenants/<int:tenant_id>/membres/<int:pk>/renvoyer-invitation/",
+        MembreTenantViewSet.as_view({
+            "post": "renvoyer_invitation",
+        }),
+        name="membre-renvoyer-invitation",
+    ),
 ]

@@ -128,6 +128,10 @@ AUTH_PASSWORD_VALIDATORS = [
 # comme annoncé dans l'email.
 PASSWORD_RESET_TIMEOUT = 2 * 60 * 60
 
+# Le lien d'activation (invitation) reste valable plus longtemps :
+# il est souvent ouvert plusieurs jours après l'envoi.
+DUREE_LIEN_ACTIVATION_HEURES = 72
+
 # Tests : hachage rapide (PBKDF2 ralentit fortement la suite).
 if "test" in sys.argv:
     PASSWORD_HASHERS = [
@@ -195,6 +199,9 @@ REST_FRAMEWORK = {
         "activation": "10/hour",
         "password_reset": "5/hour",
         "password_reset_confirm": "10/hour",
+        "demande_inscription": "5/hour",
+        "paiement": "10/hour",
+        "renvoi_invitation": "5/hour",
     },
 }
 
@@ -224,6 +231,16 @@ ANYMAIL = {
 }
 
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
+
+# Abonnement mensuel d'un organisme, payé (en simulation) à l'inscription.
+PRIX_ABONNEMENT_FCFA = int(os.getenv("PRIX_ABONNEMENT_FCFA", "25000"))
+
+# Logo des emails : une image hébergée, joignable depuis internet
+# (les messageries bloquent les images intégrées au message).
+EMAIL_LOGO_URL = os.getenv(
+    "EMAIL_LOGO_URL",
+    "https://raw.githubusercontent.com/fassa108/synapse_frontend/develop/src/assets/logo-eduhub.png",
+)
 
 # Aperçu des fichiers Office (docx, pptx) : conversion en PDF par Gotenberg,
 # un conteneur isolé (sans accès réseau sortant) appelé par Celery au dépôt.
