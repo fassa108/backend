@@ -1,8 +1,11 @@
+import re
+
+from django.conf import settings
 from rest_framework import serializers
 
 from accounts.models import MembreTenant, Utilisateur
 
-from .models import Tenant
+from .models import DemandeInscription, Paiement, Tenant
 
 
 TENANT_FIELDS = [
@@ -184,3 +187,127 @@ class IndicateursGlobauxSerializer(serializers.Serializer):
     nb_utilisateurs = serializers.IntegerField()
     nb_formations = serializers.IntegerField()
     nb_promotions = serializers.IntegerField()
+
+
+# ─── Inscriptions d'organismes ───────────────────────────────────────────────
+
+def valider_telephone(valeur):
+    """
+    Chiffres, espaces et + - . ( ) uniquement, avec 7 à 15 chiffres
+    (formats nationaux et internationaux).
+    """
+    chiffres = re.sub(r"\D", "", valeur)
+    if not re.fullmatch(r"[\d\s+().-]+", valeur) or not 7 <= len(chiffres) <= 15:
+        raise serializers.ValidationError(
+            "Saisissez un numéro valide : chiffres, espaces et + - . ( ), 7 chiffres minimum."
+        )
+    return valeur
+
+
+class DemandeInscriptionCreationSerializer(serializers.ModelSerializer):
+    """
+    Formulaire public « S'inscrire ».
+
+    Refuse un nom déjà pris par un organisme et l'adresse d'un
+    administrateur de la plateforme. Une demande non payée ne bloque rien :
+    le demandeur peut recommencer.
+    """
+
+    class Meta:
+        model = DemandeInscription
+        fields = [
+            "nom_organisme",
+            "responsable_prenom",
+            "responsable_nom",
+            "email",
+            "telephone",
+            "message",
+        ]
+
+    def validate_nom_organisme(self, value):
+        if len(value) < 2:
+            raise serializers.ValidationError(
+                "Le nom doit contenir au moins 2 caractères."
+            )
+        if Tenant.objects.filter(nom__iexact=value).exists():
+            raise serializers.ValidationError(
+                "Un organisme portant ce nom existe déjà."
+            )
+        return value
+
+    def validate_email(self, value):
+        value = value.strip().lower()
+        if Utilisateur.objects.filter(email__iexact=value, est_admin_saas=True).exists():
+            raise serializers.ValidationError(
+                "Cette adresse ne peut pas administrer un organisme."
+            )
+        return value
+
+    def validate_telephone(self, value):
+        return valider_telephone(value) if value else value
+
+
+class InscriptionAPayerSerializer(serializers.ModelSerializer):
+    """Page de paiement (publique, accessible par la référence secrète)."""
+
+    montant = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DemandeInscription
+        fields = ["nom_organisme", "email", "statut", "montant"]
+        read_only_fields = fields
+
+    def get_montant(self, obj):
+        return obj.paiement.montant if obj.statut == DemandeInscription.Statut.PAYEE else settings.PRIX_ABONNEMENT_FCFA
+
+
+class PaiementSerializer(serializers.ModelSerializer):
+    """
+    Paiement simulé par mobile money. Le numéro doit être un mobile
+    sénégalais : 9 chiffres commençant par 70, 75, 76, 77 ou 78,
+    précédé ou non de +221 / 00221.
+    """
+
+    moyen_libelle = serializers.CharField(source="get_moyen_display", read_only=True)
+
+    class Meta:
+        model = Paiement
+        fields = ["moyen", "moyen_libelle", "telephone", "montant", "reference_transaction", "date_paiement"]
+        read_only_fields = ["montant", "reference_transaction", "date_paiement"]
+
+    def validate_telephone(self, value):
+        compact = re.sub(r"[\s.-]", "", value)
+        if not re.fullmatch(r"(\+221|00221)?7[05678]\d{7}", compact):
+            raise serializers.ValidationError(
+                "Saisissez un numéro mobile sénégalais valide, par exemple 77 123 45 67."
+            )
+        return compact
+
+
+class DemandeInscriptionSerializer(serializers.ModelSerializer):
+    """Lecture d'une inscription par l'admin SaaS."""
+
+    statut_libelle = serializers.CharField(source="get_statut_display", read_only=True)
+    paiement = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DemandeInscription
+        fields = [
+            "id",
+            "nom_organisme",
+            "responsable_prenom",
+            "responsable_nom",
+            "email",
+            "telephone",
+            "message",
+            "statut",
+            "statut_libelle",
+            "tenant",
+            "paiement",
+            "date_creation",
+        ]
+        read_only_fields = fields
+
+    def get_paiement(self, obj):
+        paiement = getattr(obj, "paiement", None)
+        return PaiementSerializer(paiement).data if paiement else None

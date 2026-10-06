@@ -1,23 +1,31 @@
+from django.conf import settings
 from django.db.models import Count, Prefetch, Q
+from django.shortcuts import get_object_or_404
 from drf_spectacular.utils import extend_schema
-from rest_framework import status, viewsets
+from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 
 from accounts.models import MembreTenant, Utilisateur
 from pedagogie.models import Formation, Promotion
 
-from .models import Tenant
+from .models import DemandeInscription, Tenant
 from .permissions import IsAdminSaaS, IsAdminOrganisme
 from .serializers import (
+    DemandeInscriptionCreationSerializer,
+    DemandeInscriptionSerializer,
     IndicateursGlobauxSerializer,
+    InscriptionAPayerSerializer,
+    PaiementSerializer,
     TenantCreationSerializer,
     TenantDetailSerializer,
     TenantSerializer,
     TenantStatutSerializer,
 )
-from .services import TenantService
+from .services import DemandeInscriptionService, TenantService
 
 
 def _compte_membres(role):
@@ -141,3 +149,77 @@ class TenantViewSet(viewsets.ModelViewSet):
         }
 
         return Response(IndicateursGlobauxSerializer(data).data)
+
+
+class DemandeInscriptionViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    """
+    Inscriptions d'organismes.
+
+    - Public : dépôt du formulaire, puis page de paiement (simulé),
+      accessible par la référence secrète renvoyée au dépôt.
+    - Admin SaaS : historique des inscriptions (filtrable par statut).
+    """
+
+    ACTIONS_PUBLIQUES = ("create", "paiement")
+
+    def get_queryset(self):
+        queryset = DemandeInscription.objects.select_related("paiement")
+        statut = self.request.query_params.get("statut")
+        if statut:
+            queryset = queryset.filter(statut=statut)
+        return queryset
+
+    def get_permissions(self):
+        if self.action in self.ACTIONS_PUBLIQUES:
+            return [AllowAny()]
+        return [IsAdminSaaS()]
+
+    def get_throttles(self):
+        # Débit limité sur les écritures publiques (dépôt et paiement)
+        if self.action == "create":
+            self.throttle_scope = "demande_inscription"
+            return [ScopedRateThrottle()]
+        if self.action == "paiement" and self.request.method == "POST":
+            self.throttle_scope = "paiement"
+            return [ScopedRateThrottle()]
+        return super().get_throttles()
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return DemandeInscriptionCreationSerializer
+        if self.action == "paiement":
+            return PaiementSerializer
+        return DemandeInscriptionSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        demande = serializer.save()
+        # Seule la référence est renvoyée : elle ouvre la page de paiement.
+        return Response(
+            {"reference": demande.reference, "montant": settings.PRIX_ABONNEMENT_FCFA},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(methods=["GET"], responses=InscriptionAPayerSerializer)
+    @extend_schema(methods=["POST"], request=PaiementSerializer, responses=PaiementSerializer)
+    @action(
+        detail=False,
+        methods=["get", "post"],
+        url_path=r"paiement/(?P<reference>[0-9a-f-]{36})",
+    )
+    def paiement(self, request, reference=None):
+        demande = get_object_or_404(DemandeInscription, reference=reference)
+
+        if request.method == "GET":
+            return Response(InscriptionAPayerSerializer(demande).data)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        demande = DemandeInscriptionService.payer(reference, **serializer.validated_data)
+        return Response(PaiementSerializer(demande.paiement).data, status=status.HTTP_201_CREATED)
