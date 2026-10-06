@@ -356,9 +356,59 @@ class BriefSerializer(serializers.ModelSerializer):
         date_debut = attrs.get("date_debut", getattr(instance, "date_debut", None))
         date_limite = attrs.get("date_limite", getattr(instance, "date_limite", None))
 
-        if date_debut and date_limite and date_limite < date_debut:
+        if date_debut and date_limite and date_limite <= date_debut:
             raise serializers.ValidationError({
-                "date_limite": "La date limite doit être postérieure ou égale à la date de début."
+                "date_limite": "La date limite doit être postérieure à la date de début."
+            })
+
+        # Pas de brief qui commence dans le passé (au jour près). En modification,
+        # seulement si la date change : un brief déjà commencé reste modifiable.
+        if (
+            "date_debut" in attrs and date_debut
+            and timezone.localdate(date_debut) < timezone.localdate()
+            and not (instance and timezone.localdate(date_debut) == timezone.localdate(instance.date_debut))
+        ):
+            raise serializers.ValidationError({
+                "date_debut": "La date de début ne peut pas être avant aujourd'hui."
+            })
+
+        # Le brief se déroule pendant la promotion (vérifié quand les dates changent).
+        if "date_debut" in attrs and date_debut and timezone.localdate(date_debut) < promotion.date_debut:
+            raise serializers.ValidationError({
+                "date_debut": (
+                    "Le brief ne peut pas commencer avant le début de la promotion "
+                    f"({promotion.date_debut:%d/%m/%Y})."
+                )
+            })
+        if (
+            "date_limite" in attrs and date_limite and promotion.date_fin
+            and timezone.localdate(date_limite) > promotion.date_fin
+        ):
+            raise serializers.ValidationError({
+                "date_limite": (
+                    "La date limite ne peut pas dépasser la fin de la promotion "
+                    f"({promotion.date_fin:%d/%m/%Y})."
+                )
+            })
+
+        # Statut : un brief déjà rendu ne redevient pas brouillon (il disparaîtrait
+        # pour les apprenants, avec leurs livrables) ; on ne publie pas un brief échu.
+        statut = attrs.get("statut", getattr(instance, "statut", Brief.Statut.BROUILLON))
+        ancien_statut = getattr(instance, "statut", None)
+        if (
+            instance and statut == Brief.Statut.BROUILLON and ancien_statut != Brief.Statut.BROUILLON
+            and brief_a_des_livrables(instance)
+        ):
+            raise serializers.ValidationError({
+                "statut": "Des livrables ont été déposés : ce brief ne peut plus repasser en brouillon."
+            })
+        if (
+            statut == Brief.Statut.PUBLIE
+            and ancien_statut in (None, Brief.Statut.BROUILLON)
+            and date_limite and date_limite <= timezone.now()
+        ):
+            raise serializers.ValidationError({
+                "date_limite": "La date limite est déjà passée : choisissez une date future pour publier ce brief."
             })
 
         if "titre" in attrs:
