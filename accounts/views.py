@@ -2,7 +2,7 @@ from collections import defaultdict
 
 from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.throttling import ScopedRateThrottle, SimpleRateThrottle
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
@@ -25,6 +25,16 @@ from pedagogie.models import FormateurPromotion, InscriptionPromotion
 from tenants.models import Tenant
 
 from .permissions import CanManageMembers
+
+
+class RenvoiInvitationThrottle(SimpleRateThrottle):
+    """Limite les renvois d'invitation par membre, quel que soit l'admin."""
+
+    scope = "renvoi_invitation"
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {"scope": self.scope, "ident": view.kwargs.get("pk")}
+
 
 @extend_schema(request=ActivationSerializer)
 class ActivationView(APIView):
@@ -260,6 +270,10 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
                 tenant=tenant,
                 role=data["role"]
             )
+            # Compte jamais activé : l'ancien lien a pu expirer.
+            invitation_envoyee = not utilisateur.actif
+            if invitation_envoyee:
+                AccountService.envoyer_invitation(utilisateur)
         else:
             utilisateur, token = AccountService.inviter_utilisateur(
                 nom=data["nom"],
@@ -268,20 +282,48 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
                 tenant=tenant,
                 role=data["role"]
             )
-
-            # L'envoi du mail sera déclenché ici
-            # par la tâche Celery existante.
+            invitation_envoyee = True
 
             membre = MembreTenant.objects.get(
                 utilisateur=utilisateur,
                 tenant=tenant
             )
 
-        response_serializer = MembreTenantSerializer(membre)
+        # invitation_envoyee : l'interface dit « invitation envoyée »
+        # ou « ajouté à l'organisme ».
+        return Response(
+            {
+                **MembreTenantSerializer(membre).data,
+                "invitation_envoyee": invitation_envoyee,
+            },
+            status=status.HTTP_201_CREATED
+        )
+
+    def get_throttles(self):
+        if self.action == "renvoyer_invitation":
+            return [RenvoiInvitationThrottle()]
+        return super().get_throttles()
+
+    def renvoyer_invitation(self, request, tenant_id, pk=None):
+        """
+        Nouveau lien d'activation pour un membre dont le compte
+        n'est pas encore activé (le précédent devient inutilisable).
+        """
+        membre = get_object_or_404(
+            self.get_queryset(),
+            pk=pk
+        )
+
+        if membre.utilisateur.actif:
+            return Response(
+                {"detail": "Ce compte est déjà activé."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        AccountService.envoyer_invitation(membre.utilisateur)
 
         return Response(
-            response_serializer.data,
-            status=status.HTTP_201_CREATED
+            {"detail": f"Invitation renvoyée à {membre.utilisateur.email}."}
         )
 
     def partial_update(self, request, tenant_id, pk=None):

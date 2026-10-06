@@ -319,7 +319,12 @@ class AjouterMembreSerializer(serializers.Serializer):
     )
 
     def validate_email(self, value):
-        return value.strip().lower()
+        value = value.strip().lower()
+        if Utilisateur.objects.filter(email__iexact=value, est_admin_saas=True).exists():
+            raise serializers.ValidationError(
+                "Cette adresse ne peut pas être membre d'un organisme."
+            )
+        return value
 
     def validate(self, attrs):
         email = attrs["email"]
@@ -337,15 +342,14 @@ class AjouterMembreSerializer(serializers.Serializer):
             })
 
         # Si le compte n'existe pas, nom et prénom sont obligatoires
+        # (les deux erreurs sont renvoyées ensemble).
         if not utilisateur_existant:
-            if not attrs.get("nom"):
-                raise serializers.ValidationError({
-                    "nom": "Le nom est obligatoire pour un nouvel utilisateur."
-                })
-
-            if not attrs.get("prenom"):
-                raise serializers.ValidationError({
-                    "prenom": "Le prénom est obligatoire pour un nouvel utilisateur."
-                })
+            erreurs = {}
+            if not attrs.get("prenom", "").strip():
+                erreurs["prenom"] = "Le prénom est obligatoire pour un nouvel utilisateur."
+            if not attrs.get("nom", "").strip():
+                erreurs["nom"] = "Le nom est obligatoire pour un nouvel utilisateur."
+            if erreurs:
+                raise serializers.ValidationError(erreurs)
 
         return attrs

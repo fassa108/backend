@@ -267,6 +267,95 @@ class AjoutMembreTests(AccountsBaseTestCase):
         self.assertEqual(r.status_code, status.HTTP_201_CREATED)
         self.assertEqual(r.data["role"], "ADMINISTRATEUR")
 
+    def test_prenom_et_nom_manquants_signales_ensemble(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.post(self.url_membres, {"email": "nouveau@test.com", "role": "APPRENANT"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("prenom", r.data)
+        self.assertIn("nom", r.data)
+
+    def test_adresse_admin_saas_refusee(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.post(self.url_membres, {"email": "SAAS@test.com", "role": "FORMATEUR"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("email", r.data)
+        self.assertFalse(MembreTenant.objects.filter(utilisateur=self.admin_saas).exists())
+
+    @patch("accounts.services.envoyer_email_activation.delay")
+    def test_invitation_envoyee_selon_le_compte(self, delay):
+        autre = Tenant.objects.create(nom="Organisme Beta")
+        self.creer_membre("actif@test.com", MembreTenant.Role.APPRENANT, tenant=autre)
+        inactif = self.creer_utilisateur("inactif@test.com", actif=False)
+        AccountActivationToken.objects.create(utilisateur=inactif, date_expiration=timezone.now())
+
+        self.client.force_authenticate(self.admin)
+        with self.captureOnCommitCallbacks(execute=True):
+            nouveau = self.client.post(self.url_membres, {
+                "email": "nouveau@test.com", "nom": "N", "prenom": "P", "role": "APPRENANT",
+            })
+            existant = self.client.post(self.url_membres, {"email": "actif@test.com", "role": "APPRENANT"})
+            jamais_active = self.client.post(self.url_membres, {"email": "inactif@test.com", "role": "FORMATEUR"})
+
+        self.assertTrue(nouveau.data["invitation_envoyee"])
+        self.assertFalse(existant.data["invitation_envoyee"])
+        self.assertTrue(jamais_active.data["invitation_envoyee"])
+        self.assertEqual(
+            [c.args[0] for c in delay.call_args_list], ["nouveau@test.com", "inactif@test.com"],
+        )
+        self.assertEqual(AccountActivationToken.objects.filter(utilisateur=inactif, utilise=False).count(), 1)
+
+
+@patch("accounts.services.envoyer_email_activation.delay")
+class RenvoiInvitationTests(AccountsBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.invite = self.creer_utilisateur("invite@test.com", actif=False)
+        MembreTenant.objects.create(utilisateur=self.invite, tenant=self.tenant, role=MembreTenant.Role.APPRENANT)
+        self.ancien = AccountActivationToken.objects.create(
+            utilisateur=self.invite, date_expiration=timezone.now() - timedelta(hours=1),
+        )
+
+    def url(self, utilisateur):
+        return f"{self.url_membres}{self.membre(utilisateur).id}/renvoyer-invitation/"
+
+    def renvoyer(self, utilisateur):
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(self.url(utilisateur))
+
+    def test_nouveau_lien_et_ancien_invalide(self, delay):
+        self.client.force_authenticate(self.admin)
+        r = self.renvoyer(self.invite)
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        delay.assert_called_once()
+        self.assertEqual(delay.call_args.args[0], "invite@test.com")
+        self.ancien.refresh_from_db()
+        self.assertTrue(self.ancien.utilise)
+        nouveau = AccountActivationToken.objects.get(utilisateur=self.invite, utilise=False)
+        self.assertGreater(nouveau.date_expiration, timezone.now())
+
+    def test_compte_deja_active_refuse(self, delay):
+        self.client.force_authenticate(self.admin)
+        r = self.renvoyer(self.apprenant)
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        delay.assert_not_called()
+
+    def test_reserve_a_l_admin_de_l_organisme(self, delay):
+        self.client.force_authenticate(self.formateur)
+        self.assertEqual(self.renvoyer(self.invite).status_code, status.HTTP_403_FORBIDDEN)
+
+        autre = Tenant.objects.create(nom="Organisme Beta")
+        admin_beta = self.creer_membre("admin.beta@test.com", MembreTenant.Role.ADMINISTRATEUR, tenant=autre)
+        self.client.force_authenticate(admin_beta)
+        r = self.client.post(f"/api/accounts/tenants/{autre.id}/membres/{self.membre(self.invite).id}/renvoyer-invitation/")
+        self.assertEqual(r.status_code, status.HTTP_404_NOT_FOUND)
+        delay.assert_not_called()
+
+    def test_limite_par_membre(self, delay):
+        self.client.force_authenticate(self.admin)
+        for _ in range(5):
+            self.assertEqual(self.renvoyer(self.invite).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.renvoyer(self.invite).status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
 
 class ModificationMembreTests(AccountsBaseTestCase):
     def setUp(self):

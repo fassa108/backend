@@ -201,6 +201,7 @@ REST_FRAMEWORK = {
         "password_reset_confirm": "10/hour",
         "demande_inscription": "5/hour",
         "paiement": "10/hour",
+        "renvoi_invitation": "5/hour",
     },
 }
 
