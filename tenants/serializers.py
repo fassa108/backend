@@ -1,6 +1,8 @@
 import re
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import URLValidator
 from rest_framework import serializers
 
 from accounts.models import MembreTenant, Utilisateur
@@ -23,6 +25,38 @@ TENANT_FIELDS = [
 ]
 
 
+def valider_telephone(valeur):
+    """
+    Chiffres, espaces et + - . ( ) uniquement, avec 7 à 15 chiffres
+    (formats nationaux et internationaux).
+    """
+    chiffres = re.sub(r"\D", "", valeur)
+    if not re.fullmatch(r"[\d\s+().-]+", valeur) or not 7 <= len(chiffres) <= 15:
+        raise serializers.ValidationError(
+            "Saisissez un numéro valide : chiffres, espaces et + - . ( ), 7 chiffres minimum."
+        )
+    return valeur
+
+
+def normaliser_site_web(valeur):
+    """
+    « www.organisme.sn » devient « https://www.organisme.sn » :
+    le schéma est ajouté s'il manque, puis l'adresse est vérifiée.
+    """
+    valeur = valeur.strip()
+    if not valeur:
+        return valeur
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", valeur, re.IGNORECASE):
+        valeur = f"https://{valeur}"
+    try:
+        URLValidator(schemes=["http", "https"])(valeur)
+    except DjangoValidationError:
+        raise serializers.ValidationError(
+            "Saisissez une adresse valide, par exemple www.organisme.sn."
+        )
+    return valeur
+
+
 class TenantSerializer(serializers.ModelSerializer):
     """
     Serializer principal du modèle Tenant.
@@ -30,7 +64,11 @@ class TenantSerializer(serializers.ModelSerializer):
     Utilisé par l'admin d'organisme pour modifier les informations
     de son organisme. Le statut n'est modifiable que par l'admin SaaS
     (voir TenantStatutSerializer).
+
+    Le site web peut être saisi sans « https:// » : il est ajouté.
     """
+
+    site_web = serializers.CharField(max_length=200, required=False, allow_blank=True)
 
     class Meta:
         model = Tenant
@@ -62,7 +100,19 @@ class TenantSerializer(serializers.ModelSerializer):
                 "Un organisme portant ce nom existe déjà."
             )
 
-        return value.strip()
+        value = value.strip()
+        if len(value) < 2:
+            raise serializers.ValidationError(
+                "Le nom doit contenir au moins 2 caractères."
+            )
+        return value
+
+    def validate_telephone(self, value):
+        value = value.strip()
+        return valider_telephone(value) if value else value
+
+    def validate_site_web(self, value):
+        return normaliser_site_web(value)
 
 
 class TenantStatutSerializer(serializers.ModelSerializer):
@@ -107,7 +157,12 @@ class TenantCreationSerializer(TenantSerializer):
         ]
 
     def validate_admin_email(self, value):
-        return value.strip().lower()
+        value = value.strip().lower()
+        if Utilisateur.objects.filter(email__iexact=value, est_admin_saas=True).exists():
+            raise serializers.ValidationError(
+                "Cette adresse ne peut pas administrer un organisme."
+            )
+        return value
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -117,15 +172,14 @@ class TenantCreationSerializer(TenantSerializer):
         ).exists()
 
         if not existe:
-            if not attrs.get("admin_nom"):
-                raise serializers.ValidationError({
-                    "admin_nom": "Le nom est obligatoire pour un nouvel utilisateur."
-                })
-
-            if not attrs.get("admin_prenom"):
-                raise serializers.ValidationError({
-                    "admin_prenom": "Le prénom est obligatoire pour un nouvel utilisateur."
-                })
+            # Les deux erreurs sont renvoyées ensemble.
+            erreurs = {}
+            if not attrs.get("admin_prenom", "").strip():
+                erreurs["admin_prenom"] = "Le prénom est obligatoire pour un nouvel utilisateur."
+            if not attrs.get("admin_nom", "").strip():
+                erreurs["admin_nom"] = "Le nom est obligatoire pour un nouvel utilisateur."
+            if erreurs:
+                raise serializers.ValidationError(erreurs)
 
         return attrs
 
@@ -190,19 +244,6 @@ class IndicateursGlobauxSerializer(serializers.Serializer):
 
 
 # ─── Inscriptions d'organismes ───────────────────────────────────────────────
-
-def valider_telephone(valeur):
-    """
-    Chiffres, espaces et + - . ( ) uniquement, avec 7 à 15 chiffres
-    (formats nationaux et internationaux).
-    """
-    chiffres = re.sub(r"\D", "", valeur)
-    if not re.fullmatch(r"[\d\s+().-]+", valeur) or not 7 <= len(chiffres) <= 15:
-        raise serializers.ValidationError(
-            "Saisissez un numéro valide : chiffres, espaces et + - . ( ), 7 chiffres minimum."
-        )
-    return valeur
-
 
 class DemandeInscriptionCreationSerializer(serializers.ModelSerializer):
     """

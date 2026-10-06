@@ -25,7 +25,8 @@ class TenantService:
         """
         Crée un organisme et son premier administrateur.
 
-        - Compte existant : il devient administrateur de l'organisme.
+        - Compte existant : il devient administrateur de l'organisme ;
+          s'il n'a jamais été activé, il reçoit un nouveau lien d'activation.
         - Nouveau compte : il est créé inactif et reçoit une invitation.
 
         L'opération est atomique : si l'ajout de l'administrateur
@@ -44,6 +45,10 @@ class TenantService:
                 tenant=tenant,
                 role=MembreTenant.Role.ADMINISTRATEUR,
             )
+            # Un compte inactif n'a jamais été activé : l'ancien lien
+            # a pu expirer, on en envoie un nouveau.
+            if not utilisateur.actif:
+                AccountService.envoyer_invitation(utilisateur)
         else:
             AccountService.inviter_utilisateur(
                 nom=admin_nom,
@@ -123,7 +128,8 @@ class DemandeInscriptionService:
         demande.statut = DemandeInscription.Statut.PAYEE
         demande.save(update_fields=["tenant", "statut"])
 
-        if existant:
+        # Un compte jamais activé reçoit déjà un lien d'activation.
+        if existant and existant.actif:
             transaction.on_commit(
                 lambda: envoyer_email_organisme_cree.delay(demande.email, demande.nom_organisme)
             )

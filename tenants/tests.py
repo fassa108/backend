@@ -17,10 +17,11 @@ from unittest.mock import patch
 from django.core import mail
 from django.core.cache import cache
 from django.test import override_settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from accounts.models import MembreTenant, Utilisateur
+from accounts.models import AccountActivationToken, MembreTenant, Utilisateur
 from pedagogie.models import Formation, Promotion
 from .models import DemandeInscription, Paiement, Tenant
 from .serializers import PaiementSerializer
@@ -111,6 +112,66 @@ class CreationTenantTests(TenantsBaseTestCase):
         r = self.client.post(self.url, {"nom": "Organisme Gamma", "admin_email": "admin@test.com"})
         self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_prenom_et_nom_manquants_signales_ensemble(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        r = self.client.post(self.url, {"nom": "Organisme Gamma", "admin_email": "x@gamma.test"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("admin_prenom", r.data)
+        self.assertIn("admin_nom", r.data)
+
+    def test_adresse_admin_saas_refusee(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        r = self.client.post(self.url, {"nom": "Organisme Gamma", "admin_email": "SAAS@test.com"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("admin_email", r.data)
+        self.assertFalse(Tenant.objects.filter(nom="Organisme Gamma").exists())
+
+    def test_compte_jamais_active_recoit_un_nouveau_lien(self, delay):
+        inactif = Utilisateur.objects.create_user(email="inactif@test.com", nom="Sy", prenom="Ali")
+        AccountActivationToken.objects.create(utilisateur=inactif, date_expiration=timezone.now())
+
+        self.client.force_authenticate(self.admin_saas)
+        with self.captureOnCommitCallbacks(execute=True):
+            r = self.client.post(self.url, {"nom": "Organisme Gamma", "admin_email": "inactif@test.com"})
+
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED)
+        delay.assert_called_once()
+        self.assertEqual(delay.call_args.args[0], "inactif@test.com")
+        tokens = AccountActivationToken.objects.filter(utilisateur=inactif)
+        self.assertEqual(tokens.count(), 2)
+        self.assertEqual(tokens.filter(utilise=False).count(), 1)
+
+    def test_site_web_sans_schema_complete(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        r = self.client.post(self.url, {
+            "nom": "Organisme Gamma", "admin_email": "admin.beta@test.com", "site_web": " www.gamma.sn ",
+        })
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(r.data["site_web"], "https://www.gamma.sn")
+
+    def test_site_web_invalide(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        for valeur in ("pas une adresse", "ftp://gamma.sn", "gamma"):
+            r = self.client.post(self.url, {
+                "nom": "Organisme Gamma", "admin_email": "admin.beta@test.com", "site_web": valeur,
+            })
+            self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST, valeur)
+            self.assertIn("site_web", r.data)
+
+    def test_telephone_verifie(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        r = self.client.post(self.url, {
+            "nom": "Organisme Gamma", "admin_email": "admin.beta@test.com", "telephone": "abc123",
+        })
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("telephone", r.data)
+
+    def test_nom_trop_court(self, delay):
+        self.client.force_authenticate(self.admin_saas)
+        r = self.client.post(self.url, {"nom": " G ", "admin_email": "admin.beta@test.com"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("nom", r.data)
+
 
 class CodeTenantTests(TenantsBaseTestCase):
     def test_code_translittere(self):
@@ -196,6 +257,18 @@ class ModificationTenantTests(TenantsBaseTestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.tenant.refresh_from_db()
         self.assertEqual(self.tenant.telephone, "+221 33 000 00 00")
+
+    def test_admin_organisme_modification_verifiee(self):
+        self.client.force_authenticate(self.admin)
+        r = self.client.patch(self.detail(self.tenant), {"nom": "organisme beta", "telephone": "12"})
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("nom", r.data)
+        self.assertIn("telephone", r.data)
+
+        r = self.client.patch(self.detail(self.tenant), {"nom": "Organisme Alpha Plus", "site_web": "alpha.sn"})
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.tenant.refresh_from_db()
+        self.assertEqual((self.tenant.nom, self.tenant.site_web), ("Organisme Alpha Plus", "https://alpha.sn"))
 
     def test_admin_organisme_ne_modifie_pas_le_statut(self):
         self.client.force_authenticate(self.admin)
@@ -407,6 +480,13 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         ).exists())
         activation.assert_not_called()
         cree.assert_called_once_with("admin.beta@test.com", "Organisme Gamma")
+
+    def test_paiement_avec_compte_jamais_active(self, activation, cree, nouvel):
+        Utilisateur.objects.create_user(email="inactif@test.com", nom="Sy", prenom="Ali")
+        d = self.demande(email="inactif@test.com")
+        self.assertEqual(self.payer(d).status_code, status.HTTP_201_CREATED)
+        activation.assert_called_once()
+        cree.assert_not_called()
 
     def test_numero_mobile_senegalais_obligatoire(self, *mocks):
         d = self.demande()
