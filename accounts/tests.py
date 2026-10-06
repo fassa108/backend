@@ -166,6 +166,23 @@ class ActivationTests(AccountsBaseTestCase):
         self.invite.refresh_from_db()
         self.assertTrue(self.invite.actif)
 
+    def test_jeton_mal_forme_400(self):
+        # Lien tronqué : refus propre, pas d'erreur serveur
+        r = self.client.post(self.url, {
+            "token": "pas-un-uuid", "password": MOT_DE_PASSE_SOLIDE, "password_confirm": MOT_DE_PASSE_SOLIDE,
+        })
+        self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(r.data, ["Le lien d'activation est invalide."])
+
+    def test_lien_d_invitation_valable_72_heures(self):
+        self.client.force_authenticate(self.admin)
+        with self.captureOnCommitCallbacks(), patch("accounts.services.envoyer_email_activation.delay"):
+            self.client.post(self.url_membres, {"email": "nouveau@test.com", "nom": "N", "prenom": "P", "role": "APPRENANT"})
+        jeton = AccountActivationToken.objects.get(utilisateur__email="nouveau@test.com")
+        duree = jeton.date_expiration - timezone.now()
+        self.assertGreater(duree, timedelta(hours=71, minutes=59))
+        self.assertLessEqual(duree, timedelta(hours=72))
+
 
 # ─── Réinitialisation du mot de passe ─────────────────────────────────────────
 

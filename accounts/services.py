@@ -79,10 +79,9 @@ class AccountService:
             utilise=False,
         ).update(utilise=True)
 
-        # Le lien d'activation reste valable 2 heures.
         token = AccountActivationToken.objects.create(
             utilisateur=utilisateur,
-            date_expiration=timezone.now() + timedelta(hours=2),
+            date_expiration=timezone.now() + timedelta(hours=settings.DUREE_LIEN_ACTIVATION_HEURES),
         )
 
         activation_url = (

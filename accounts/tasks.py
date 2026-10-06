@@ -1,4 +1,5 @@
 from celery import shared_task
+from django.conf import settings
 
 from config.emails import envoyer
 
@@ -35,6 +36,6 @@ def envoyer_email_activation(email, activation_url):
         ],
         libelle_bouton="Activer mon compte",
         url=activation_url,
-        note="Ce lien est valable pendant <strong>2 heures</strong>.",
+        note=f"Ce lien est valable pendant <strong>{settings.DUREE_LIEN_ACTIVATION_HEURES} heures</strong>.",
         lien_secours=True,
     )

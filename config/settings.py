@@ -128,6 +128,10 @@ AUTH_PASSWORD_VALIDATORS = [
 # comme annoncé dans l'email.
 PASSWORD_RESET_TIMEOUT = 2 * 60 * 60
 
+# Le lien d'activation (invitation) reste valable plus longtemps :
+# il est souvent ouvert plusieurs jours après l'envoi.
+DUREE_LIEN_ACTIVATION_HEURES = 72
+
 # Tests : hachage rapide (PBKDF2 ralentit fortement la suite).
 if "test" in sys.argv:
     PASSWORD_HASHERS = [
