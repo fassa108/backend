@@ -225,6 +225,13 @@ ANYMAIL = {
 
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
 
+# Logo des emails : une image hébergée, joignable depuis internet
+# (les messageries bloquent les images intégrées au message).
+EMAIL_LOGO_URL = os.getenv(
+    "EMAIL_LOGO_URL",
+    "https://raw.githubusercontent.com/fassa108/synapse_frontend/develop/src/assets/logo-eduhub.png",
+)
+
 # Aperçu des fichiers Office (docx, pptx) : conversion en PDF par Gotenberg,
 # un conteneur isolé (sans accès réseau sortant) appelé par Celery au dépôt.
 # APERCU_OFFICE_ACTIF=0 coupe la conversion : ces fichiers restent

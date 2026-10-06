@@ -8,22 +8,27 @@ Couvre :
 - Gestion des membres (doublon, admin SaaS exclu, dernier admin,
   changement de rôle)
 - Limitation de débit
+- Gabarit des emails (logo, bouton, échappement)
 """
 
 from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.conf import settings
+from django.core import mail
 from django.core.cache import cache
 from django.db import IntegrityError
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from config.emails import BLEU, envoyer, mise_en_page
 from pedagogie.models import FormateurPromotion, Formation, InscriptionPromotion, Promotion
 from tenants.models import Tenant
 from .models import AccountActivationToken, MembreTenant, Utilisateur
+from .tasks import envoyer_email_activation
 
 
 MOT_DE_PASSE_SOLIDE = "Tr3s-Solide-Passe!"
@@ -405,3 +410,36 @@ class PromotionsEnCoursTests(AccountsBaseTestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertFalse(r.data["actif"])
         self.assertEqual(len(r.data["promotions_en_cours"]), 2)
+
+
+# ─── Gabarit des emails ──────────────────────────────────────────────────────
+
+@override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    EMAIL_LOGO_URL="https://exemple.test/logo.png",
+)
+class GabaritEmailTests(SimpleTestCase):
+
+    def test_logo_et_bouton_bleu(self):
+        html = mise_en_page("Titre", ["Ligne"], "Voir", "https://eduhub.test/x")
+        self.assertIn('src="https://exemple.test/logo.png"', html)
+        self.assertIn('alt="EduHub"', html)
+        self.assertIn(f"background:{BLEU}", html)
+
+    def test_textes_echappes(self):
+        html = mise_en_page("<b>Titre</b>", ["<script>x</script>"], "Voir", "https://eduhub.test/?a=1&b=2")
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;b&gt;Titre&lt;/b&gt;", html)
+        self.assertIn('href="https://eduhub.test/?a=1&amp;b=2"', html)
+
+    def test_un_email_par_destinataire(self):
+        envoyer(["a@test.com", "b@test.com"], "Sujet", "Titre", ["Ligne"], "Voir", "https://eduhub.test/x")
+        self.assertEqual([m.to for m in mail.outbox], [["a@test.com"], ["b@test.com"]])
+        self.assertIn("Voir : https://eduhub.test/x", mail.outbox[0].body)
+
+    def test_activation_avec_lien_de_secours(self):
+        envoyer_email_activation("awa@test.com", "https://eduhub.test/activate-account/abc")
+        html = mail.outbox[0].alternatives[0][0]
+        self.assertEqual(mail.outbox[0].subject, "Activez votre compte EduHub")
+        self.assertIn("Si le bouton ne fonctionne pas", html)
+        self.assertIn("https://eduhub.test/activate-account/abc", html)
