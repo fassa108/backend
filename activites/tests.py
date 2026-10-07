@@ -1425,6 +1425,7 @@ class EvaluationTests(ActivitesBaseTestCase):
 
     def test_validation_definitive(self, email):
         self.evaluer(acquis=(True, False))
+        self.deposer(self.assignation)
         res = self.evaluer(acquis=(False, True))
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("définitif", str(res.data["competences"]))
@@ -1432,6 +1433,48 @@ class EvaluationTests(ActivitesBaseTestCase):
         self.assertEqual(self.evaluer(acquis=(True, True)).status_code, status.HTTP_201_CREATED)
         self.assertEqual(self.assignation.evaluations.count(), 2)
         self.assertEqual(CompetenceValidee.objects.filter(apprenant=self.apprenant).count(), 2)
+
+    def test_reevaluation_seulement_apres_un_nouveau_depot(self, email):
+        self.assertEqual(self.evaluer(acquis=(True, False)).status_code, status.HTTP_201_CREATED)
+        res = self.evaluer(acquis=(True, True))
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("nouveau dépôt", str(res.data["assignation"]))
+
+        # Nouveau dépôt : seule la compétence non acquise est à évaluer,
+        # la compétence acquise est reprise automatiquement
+        self.deposer(self.assignation)
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(self.url("evaluation"), {
+            "assignation": self.assignation.id,
+            "competences": [{"competence_niveau": self.cn2.id, "acquis": True}],
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual({l["competence_niveau"]: l["acquis"] for l in res.data["competences"]},
+                         {self.cn.id: True, self.cn2.id: True})
+
+    def test_competence_restante_obligatoire(self, email):
+        self.evaluer(acquis=(True, False))
+        self.deposer(self.assignation)
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(self.url("evaluation"), {
+            "assignation": self.assignation.id,
+            "competences": [{"competence_niveau": self.cn.id, "acquis": True}],
+        }, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("competences", res.data)
+
+    def test_rendu_valide_ferme(self, email):
+        self.evaluer(acquis=(True, True))
+        self.deposer(self.assignation)  # en base, hors API
+        res = self.evaluer(acquis=(True, True))
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("validé", str(res.data["assignation"]))
+
+        # Dépôt par l'API refusé
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.post(self.url("livrable"), {"assignation": self.assignation.id, "liens": ["https://x.test"]})
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("validé", str(res.data["assignation"]))
 
     def test_competence_validee_ailleurs_le_reste(self, email):
         self.evaluer(acquis=(True, False))
@@ -1569,6 +1612,10 @@ class ProgressionTests(ActivitesBaseTestCase):
         self.assertEqual(data["resume"]["briefs_valides"], 0)
         etat = {b["id"]: b for b in data["briefs"]}[self.brief.id]
         self.assertEqual((etat["statut"], etat["nb_acquises"], etat["nb_visees"]), ("NON_VALIDE", 1, 2))
+
+        # Nouveau dépôt : à réévaluer
+        self.deposer(self.assignation)
+        self.assertEqual({b["id"]: b["statut"] for b in self.moi().data["briefs"]}[self.brief.id], "A_EVALUER")
 
         self.evaluer((True, True))
         data = self.moi().data

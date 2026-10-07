@@ -19,7 +19,7 @@ class StatutBrief:
     VALIDE = "VALIDE"          # toutes les compétences visées acquises
     NON_VALIDE = "NON_VALIDE"  # évalué, au moins une compétence non acquise
     EVALUE = "EVALUE"          # évalué, brief sans compétence visée
-    A_EVALUER = "A_EVALUER"    # rendu, pas encore évalué
+    A_EVALUER = "A_EVALUER"    # rendu, pas encore évalué (ou redéposé depuis l'évaluation)
     NON_RENDU = "NON_RENDU"    # ni dépôt ni évaluation
 
 
@@ -65,7 +65,10 @@ def _etat_brief(assignation):
         acquises = set()
     else:
         acquises = {l.competence_niveau_id for l in derniere.competences.all() if l.acquis}
-        if not visees:
+        if assignation.livrables.filter(date_depot__gt=derniere.date_creation).exists():
+            # Nouveau dépôt depuis l'évaluation : à réévaluer
+            statut = StatutBrief.A_EVALUER
+        elif not visees:
             statut = StatutBrief.EVALUE
         else:
             statut = StatutBrief.VALIDE if visees <= acquises else StatutBrief.NON_VALIDE
