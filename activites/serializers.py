@@ -721,6 +721,11 @@ class DepotSerializer(serializers.Serializer):
             })
         # Après la date limite : accepté, le retard est calculé (en_retard).
 
+        if rendu_valide(assignation):
+            raise serializers.ValidationError({
+                "assignation": "Ce rendu est validé : il n'est plus possible de déposer."
+            })
+
         fichiers, liens = attrs["fichiers"], attrs["liens"]
         total = len(fichiers) + len(liens)
         if total == 0:
@@ -771,6 +776,22 @@ class DepotSerializer(serializers.Serializer):
 
 # ─── Évaluations ──────────────────────────────────────────────────────────────
 
+def rendu_valide(assignation):
+    """
+    Le rendu est terminé : sa dernière évaluation a acquis toutes les
+    compétences visées (ou le brief n'en vise aucune). Plus de dépôt ni
+    de réévaluation.
+    """
+    derniere = assignation.evaluations.first()
+    if derniere is None:
+        return False
+    visees = set(assignation.brief.competence_niveaux.values_list("id", flat=True))
+    acquises = set(
+        derniere.competences.filter(acquis=True).values_list("competence_niveau_id", flat=True)
+    )
+    return visees <= acquises
+
+
 class EvaluationCompetenceSerializer(serializers.ModelSerializer):
     competence_nom = serializers.CharField(source="competence_niveau.competence.nom", read_only=True)
     niveau_nom = serializers.CharField(source="competence_niveau.niveau.nom", read_only=True)
@@ -791,8 +812,11 @@ class EvaluationSerializer(serializers.ModelSerializer):
       créateur n'y est plus affecté ;
     - brief publié ou archivé, promotion ouverte ;
     - sans dépôt, rien ne peut être acquis ;
+    - réévaluation : seulement après un nouveau dépôt, et pas pour un rendu
+      validé (tout acquis) ;
     - une compétence acquise lors de la précédente évaluation de ce rendu ne
-      peut pas redevenir non acquise (une validation est définitive).
+      peut pas redevenir non acquise (une validation est définitive) : elle
+      peut être omise, elle est reprise comme acquise.
     """
 
     competences = EvaluationCompetenceSerializer(many=True, required=False)
@@ -845,18 +869,25 @@ class EvaluationSerializer(serializers.ModelSerializer):
         lignes = attrs.get("competences", [])
         visees = set(brief.competence_niveaux.values_list("id", flat=True))
         fournies = [l["competence_niveau"].id for l in lignes]
-        if len(fournies) != len(set(fournies)) or set(fournies) != visees:
-            raise serializers.ValidationError(
-                {"competences": "Évaluez chacune des compétences visées par le brief, une seule fois."}
-            )
 
         if not assignation.livrables.exists() and any(l["acquis"] for l in lignes):
             raise serializers.ValidationError(
                 {"competences": "Aucun dépôt pour ce rendu : les compétences ne peuvent pas être acquises."}
             )
 
+        # Réévaluation : seulement un nouveau dépôt, et seulement ce qui n'est
+        # pas encore acquis (une validation est définitive).
         precedente = assignation.evaluations.first()
+        deja_acquises = set()
         if precedente:
+            if rendu_valide(assignation):
+                raise serializers.ValidationError(
+                    {"assignation": "Ce rendu est validé : il ne se réévalue plus."}
+                )
+            if not assignation.livrables.filter(date_depot__gt=precedente.date_creation).exists():
+                raise serializers.ValidationError(
+                    {"assignation": "Aucun nouveau dépôt depuis la dernière évaluation : rien à réévaluer."}
+                )
             deja_acquises = set(
                 precedente.competences.filter(acquis=True).values_list("competence_niveau_id", flat=True)
             )
@@ -869,6 +900,23 @@ class EvaluationSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"competences": f"Déjà acquis lors de la précédente évaluation, c'est définitif : {noms}."}
                 )
+
+        # Chaque compétence restant à évaluer, une fois ; les déjà acquises
+        # peuvent être omises (reprises ci-dessous).
+        a_evaluer = visees - deja_acquises
+        if (
+            len(fournies) != len(set(fournies))
+            or not set(fournies) <= visees
+            or not a_evaluer <= set(fournies)
+        ):
+            raise serializers.ValidationError(
+                {"competences": "Évaluez chacune des compétences restant à acquérir, une seule fois."}
+            )
+        manquantes = deja_acquises - set(fournies)
+        attrs["competences"] = lignes + [
+            {"competence_niveau": cn, "acquis": True}
+            for cn in CompetenceNiveau.objects.filter(id__in=manquantes)
+        ]
 
         attrs["commentaire"] = attrs.get("commentaire", "").strip()
         return attrs
