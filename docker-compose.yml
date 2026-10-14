@@ -79,6 +79,30 @@ services:
       - ia
 
 
+  # Planification des tâches (CELERY_BEAT_SCHEDULE) : envoie chaque tâche
+  # au worker « celery » à l'heure prévue. Le fichier d'état reste dans le
+  # conteneur (/tmp), pas dans le dépôt monté.
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    command: uv run celery -A config beat --loglevel=info --schedule /tmp/celerybeat-schedule
+
+    volumes:
+      - ./:/app
+
+    env_file:
+      - .env
+
+    environment:
+      RUN_MIGRATIONS: "0"
+      RUN_CREATE_SUPERUSER: "0"
+
+    depends_on:
+      - redis
+
+
   # Conversion des fichiers Office (docx, pptx) en PDF pour leur aperçu.
   # Isolé : réseau interne sans accès à internet, joignable seulement par
   # Celery ; aucun port publié ; pas d'accès à la base ni aux secrets.
