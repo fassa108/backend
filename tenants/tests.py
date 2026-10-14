@@ -22,6 +22,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from accounts.models import AccountActivationToken, MembreTenant, Utilisateur
+from notifications.models import Notification
 from pedagogie.models import Formation, Promotion
 from .models import DemandeInscription, Paiement, Tenant
 from .serializers import PaiementSerializer
@@ -470,6 +471,17 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         activation.assert_called_once()
         cree.assert_not_called()
         nouvel.assert_called_once_with(["saas@test.com"], "Organisme Gamma", "Fatou Ba", 25000)
+
+    def test_paiement_notifie_le_responsable_et_l_admin_saas(self, *mocks):
+        d = self.demande()
+        self.payer(d)
+        d.refresh_from_db()
+        bienvenue = Notification.objects.get(utilisateur__email="fatou.ba@gamma.test")
+        self.assertEqual((bienvenue.tenant, bienvenue.lien), (d.tenant, "/dashboard/admin"))
+        saas = Notification.objects.get(utilisateur=self.admin_saas)
+        self.assertEqual(saas.titre, "Nouvel organisme : Organisme Gamma")
+        self.assertIsNone(saas.tenant)
+        self.assertEqual(saas.lien, f"/admin/organismes/{d.tenant.id}")
 
     def test_paiement_avec_compte_existant(self, activation, cree, nouvel):
         d = self.demande(email="admin.beta@test.com")

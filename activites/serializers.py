@@ -8,6 +8,7 @@ from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion, GroupeMembre
 
 from .apercus import demander_apercu
+from .notifications import notifier_competences_validees
 from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
 from .models import (
@@ -930,11 +931,15 @@ class EvaluationSerializer(serializers.ModelSerializer):
         )
         # Compétences acquises : validées pour chaque apprenant concerné
         acquises = [l["competence_niveau"] for l in lignes if l["acquis"]]
+        tenant_id = evaluation.assignation.brief.promotion.formation.tenant_id
         for apprenant in apprenants_de_l_assignation(evaluation.assignation):
-            for cn in acquises:
-                CompetenceValidee.objects.get_or_create(
+            nouvelles = [
+                cn for cn in acquises
+                if CompetenceValidee.objects.get_or_create(
                     apprenant=apprenant, competence_niveau=cn, defaults={"evaluation": evaluation}
-                )
+                )[1]
+            ]
+            notifier_competences_validees(apprenant, nouvelles, tenant_id)
         return evaluation
 
 

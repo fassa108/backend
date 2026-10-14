@@ -40,6 +40,7 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from accounts.models import MembreTenant
+from notifications.models import Notification
 from pedagogie.models import (
     Competence,
     CompetenceNiveau,
@@ -1391,6 +1392,21 @@ class EvaluationTests(ActivitesBaseTestCase):
             [self.cn.id],
         )
 
+    def test_evaluation_et_competence_validee_notifiees(self, email):
+        with self.captureOnCommitCallbacks(execute=True):
+            self.evaluer()
+        evaluation = Notification.objects.get(utilisateur=self.apprenant, type=Notification.Type.EVALUATION)
+        self.assertIn("1 compétence(s) acquise(s) sur 2", evaluation.message)
+        competence = Notification.objects.get(utilisateur=self.apprenant, type=Notification.Type.COMPETENCE)
+        self.assertEqual(competence.titre, "Compétence validée")
+        self.assertEqual(competence.message, "Développer une API (Imiter)")
+        self.assertEqual((competence.tenant, competence.lien), (self.tenant, "/ma-progression"))
+
+    def test_competence_deja_validee_pas_renotifiee(self, email):
+        CompetenceValidee.objects.create(apprenant=self.apprenant, competence_niveau=self.cn)
+        self.evaluer()
+        self.assertFalse(Notification.objects.filter(type=Notification.Type.COMPETENCE).exists())
+
     def test_autre_formateur_de_la_promotion_refuse(self, email):
         self.assertEqual(self.evaluer(utilisateur=self.formateur_3).status_code, status.HTTP_403_FORBIDDEN)
 
@@ -1696,6 +1712,19 @@ class CommentairePairTests(ActivitesBaseTestCase):
         self.assertEqual(res.data["auteur_nom"], "Prenom Nom")
         self.assertTrue(res.data["peut_modifier"])
 
+    def test_reponse_notifie_l_auteur_d_origine_pas_le_repondant(self, email):
+        c = self.commenter(self.apprenant, self.a_b).data["id"]
+        self.assertEqual(
+            list(Notification.objects.values_list("utilisateur", "titre")),
+            [(self.apprenant_b.id, "Nouveau commentaire")],
+        )
+        Notification.objects.all().delete()
+        self.commenter(self.apprenant_b, self.a_b, "Merci !", parent=c)
+        self.assertEqual(
+            list(Notification.objects.values_list("utilisateur", "titre")),
+            [(self.apprenant.id, "Réponse à un commentaire")],
+        )
+
     def test_sans_depot_pas_de_commentaire(self, email):
         res = self.commenter(self.apprenant_c, self.a_b)
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
@@ -1866,6 +1895,21 @@ class NotificationTests(ActivitesBaseTestCase):
         self.assertCountEqual(args[0], [self.formateur.email, self.formateur_2.email])
         self.assertEqual(args[4], 1)      # numéro du dépôt
         self.assertFalse(args[6])         # pas en retard
+
+    def test_notifications_de_l_application(self, _assignation, _soumission):
+        brief = self.creer_brief()
+        self.assigner(brief, groupe=self.groupe.id)
+        notifs = Notification.objects.filter(type=Notification.Type.ASSIGNATION)
+        self.assertCountEqual([n.utilisateur for n in notifs], [self.apprenant, self.apprenant_b])
+        self.assertEqual((notifs[0].tenant, notifs[0].lien), (self.tenant, f"/activites/{brief.id}"))
+
+        assignation = Assignation.objects.get(brief=brief)
+        self.client.force_authenticate(user=self.apprenant)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(self.url("livrable"), {"assignation": assignation.id, "liens": ["https://x.test"]})
+        depot = Notification.objects.get(type=Notification.Type.DEPOT)
+        self.assertEqual((depot.utilisateur, depot.lien), (self.formateur, f"/briefs/{brief.id}"))
+        self.assertIn("pour le groupe Groupe A", depot.message)
 
     def test_depot_refuse_sans_email(self, _assignation, email_soumission):
         assignation = Assignation.objects.create(brief=self.creer_brief(), apprenant=self.apprenant)
