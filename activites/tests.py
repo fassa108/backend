@@ -28,10 +28,11 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.urls import reverse
@@ -2414,3 +2415,132 @@ class ProgressionDecrochageTests(DecrochageBaseTestCase):
         self.client.force_authenticate(user=self.apprenant_b)
         res = self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
         self.assertNotIn("decrochage", res.data)
+
+
+# ─── Rappels d'échéance ───────────────────────────────────────────────────────
+
+@patch("activites.tasks.envoyer_email_rappel.apply_async")
+class RappelsTests(ActivitesBaseTestCase):
+    def brief_ouvert(self, ecoule_h, restant_h, statut=Brief.Statut.PUBLIE):
+        """Brief ouvert depuis « ecoule_h » heures, échéance dans « restant_h » heures."""
+        maintenant = timezone.now()
+        return self.creer_brief(
+            statut=statut,
+            date_debut=maintenant - timedelta(hours=ecoule_h),
+            date_limite=maintenant + timedelta(hours=restant_h),
+        )
+
+    def rappels(self):
+        from .rappels import envoyer_rappels
+        return envoyer_rappels()
+
+    def test_rappel_a_70_pourcent_du_delai(self, email):
+        avant = self.brief_ouvert(60, 40)  # 60 % écoulé
+        apres = self.brief_ouvert(72, 28)  # 72 % écoulé
+        for brief in (avant, apres):
+            Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.assertEqual(self.rappels(), 1)
+        n = Notification.objects.get()
+        self.assertEqual((n.type, n.lien), (Notification.Type.RAPPEL, f"/activites/{apres.id}"))
+        self.assertEqual(n.titre, f"Rappel : {apres.titre}")
+        self.assertEqual(email.call_count, 1)
+        # Une seule fois
+        self.assertEqual(self.rappels(), 0)
+
+    def test_brief_court(self, email):
+        # Brief de 8 h : rappel dès 5 h 36 écoulées
+        Assignation.objects.create(brief=self.brief_ouvert(6, 2), apprenant=self.apprenant)
+        self.assertEqual(self.rappels(), 1)
+
+    def test_rappel_de_retard(self, email):
+        echu = self.brief_ouvert(50, -2)
+        ancien = self.brief_ouvert(100, -30)  # hors de la fenêtre de 24 h
+        for brief in (echu, ancien):
+            Assignation.objects.create(brief=brief, apprenant=self.apprenant)
+        self.assertEqual(self.rappels(), 1)
+        self.assertEqual(Notification.objects.get().titre, f"Échéance dépassée : {echu.titre}")
+        self.assertEqual(email.call_args.args[0][2], "RETARD")
+
+    def test_pas_de_rappel_si_rendu_brouillon_ou_promotion_cloturee(self, email):
+        rendu = Assignation.objects.create(brief=self.brief_ouvert(80, 20), apprenant=self.apprenant)
+        self.deposer(rendu)
+        Assignation.objects.create(
+            brief=self.brief_ouvert(80, 20, statut=Brief.Statut.BROUILLON), apprenant=self.apprenant
+        )
+        cloturee = self.brief_ouvert(80, 20)
+        cloturee.promotion = self.promotion_2
+        cloturee.save()
+        Promotion.objects.filter(pk=self.promotion_2.pk).update(actif=False)
+        InscriptionPromotion.objects.create(promotion=self.promotion_2, apprenant=self.apprenant_hors_promo)
+        Assignation.objects.create(brief=cloturee, apprenant=self.apprenant_hors_promo)
+        self.assertEqual(self.rappels(), 0)
+
+    def test_groupe_membres_actifs_seulement(self, email):
+        groupe = Groupe.objects.create(promotion=self.promotion, nom="Groupe A")
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant)
+        GroupeMembre.objects.create(groupe=groupe, apprenant=self.apprenant_b, actif=False)
+        Assignation.objects.create(brief=self.brief_ouvert(80, 20), groupe=groupe)
+        self.assertEqual(self.rappels(), 1)
+        self.assertEqual(Notification.objects.get().utilisateur, self.apprenant)
+
+    def test_apprenant_desinscrit_pas_relance(self, email):
+        Assignation.objects.create(brief=self.brief_ouvert(80, 20), apprenant=self.apprenant)
+        InscriptionPromotion.objects.filter(apprenant=self.apprenant).update(actif=False)
+        self.assertEqual(self.rappels(), 0)
+
+
+class MomentEmailTests(ActivitesBaseTestCase):
+    def a(self, jour, heure):
+        return timezone.make_aware(datetime(2026, 10, jour, heure, 0))
+
+    def test_journee_tout_de_suite(self):
+        from .rappels import RAPPEL, moment_email
+        self.assertIsNone(moment_email(self.a(15, 10), self.a(15, 18), RAPPEL))
+
+    def test_nuit_decale_au_matin(self):
+        from .rappels import RAPPEL, RETARD, moment_email
+        self.assertEqual(moment_email(self.a(15, 3), self.a(15, 18), RAPPEL), self.a(15, 7))
+        self.assertEqual(moment_email(self.a(15, 23), self.a(17, 18), RAPPEL), self.a(16, 7))
+        self.assertEqual(moment_email(self.a(15, 3), self.a(15, 1), RETARD), self.a(15, 7))
+
+    def test_rappel_urgent_part_la_nuit(self):
+        from .rappels import RAPPEL, moment_email
+        # Échéance à 8 h : avant 7 h + 2 h de marge
+        self.assertIsNone(moment_email(self.a(15, 3), self.a(15, 8), RAPPEL))
+
+
+class EmailRappelTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        maintenant = timezone.now()
+        self.brief = self.creer_brief(
+            date_debut=maintenant - timedelta(hours=80), date_limite=maintenant + timedelta(hours=20)
+        )
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+
+    def envoyer(self, type_rappel="RAPPEL"):
+        from .tasks import envoyer_email_rappel
+        envoyer_email_rappel(self.assignation.id, self.apprenant.id, type_rappel)
+
+    def test_email_envoye(self):
+        self.envoyer()
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.apprenant.email])
+        self.assertEqual(mail.outbox[0].subject, f"Rappel : {self.brief.titre}")
+
+    def test_depot_entre_temps_pas_d_email(self):
+        self.deposer(self.assignation)
+        self.envoyer()
+        self.assertEqual(mail.outbox, [])
+
+    def test_echeance_passee_entre_temps_pas_de_rappel(self):
+        Brief.objects.filter(pk=self.brief.pk).update(date_limite=timezone.now() - timedelta(hours=1))
+        self.envoyer()
+        self.assertEqual(mail.outbox, [])
+        self.envoyer("RETARD")
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_brief_repasse_en_brouillon_pas_d_email(self):
+        Brief.objects.filter(pk=self.brief.pk).update(statut=Brief.Statut.BROUILLON)
+        self.envoyer()
+        self.assertEqual(mail.outbox, [])

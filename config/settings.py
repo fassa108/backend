@@ -228,6 +228,10 @@ CELERY_RESULT_BACKEND = "redis://redis:6379/1"
 # Tâches planifiées (service celery-beat) ; heures dans TIME_ZONE.
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULE = {
+    "rappels-briefs-horaire": {
+        "task": "notifications.tasks.envoyer_rappels",
+        "schedule": crontab(minute=0),
+    },
     "verifier-alertes-quotidien": {
         "task": "notifications.tasks.verifier_alertes",
         "schedule": crontab(hour=7, minute=0),

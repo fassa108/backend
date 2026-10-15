@@ -206,3 +206,49 @@ def generer_analyse_accompagnement(self, pk):
         return terminer(AnalyseAccompagnement.Statut.ECHEC, erreur=MESSAGE_ECHEC_ANALYSE)
 
     terminer(AnalyseAccompagnement.Statut.PRETE, contenu=reponse.json())
+
+
+# ─── Rappels d'échéance (rappels.py) ─────────────────────────────────────────
+
+@shared_task
+def envoyer_email_rappel(assignation_id, apprenant_id, type_rappel):
+    """
+    Email de rappel d'un brief, revérifié au moment de l'envoi (il a pu être
+    décalé au matin) : rien si l'apprenant a déposé entre-temps, si le brief
+    ou la promotion ont changé, ou si l'échéance d'un rappel est passée.
+    """
+    from django.utils import timezone
+
+    from .models import Assignation
+    from .rappels import RAPPEL, a_relancer, apprenants_a_relancer
+
+    assignation = (
+        Assignation.objects.select_related("brief__promotion", "apprenant", "groupe")
+        .filter(pk=assignation_id)
+        .first()
+    )
+    if assignation is None or not a_relancer(assignation, type_rappel, timezone.now()):
+        return
+    apprenant = next((a for a in apprenants_a_relancer(assignation) if a.id == apprenant_id), None)
+    if apprenant is None:
+        return
+
+    brief = assignation.brief
+    echeance = timezone.localtime(brief.date_limite).strftime("%d/%m/%Y à %H:%M")
+    if type_rappel == RAPPEL:
+        sujet, titre = f"Rappel : {brief.titre}", "Pensez à déposer votre travail"
+        lignes = [f"Brief : {brief.titre}", f"À rendre avant le {echeance}."]
+    else:
+        sujet, titre = f"Échéance dépassée : {brief.titre}", "Votre travail n'a pas encore été déposé"
+        lignes = [
+            f"Brief : {brief.titre}",
+            f"L'échéance était le {echeance}. Déposez votre travail dès que possible.",
+        ]
+    envoyer(
+        [apprenant.email],
+        sujet=sujet,
+        titre=titre,
+        lignes=lignes,
+        libelle_bouton="Voir le brief",
+        url=f"{settings.FRONTEND_URL}/activites/{brief.id}",
+    )
