@@ -2544,3 +2544,101 @@ class EmailRappelTests(ActivitesBaseTestCase):
         Brief.objects.filter(pk=self.brief.pk).update(statut=Brief.Statut.BROUILLON)
         self.envoyer()
         self.assertEqual(mail.outbox, [])
+
+
+# ─── Activité du formateur ────────────────────────────────────────────────────
+
+class DatePublicationBriefTests(ActivitesBaseTestCase):
+    def test_remplie_a_la_publication_puis_conservee(self):
+        brief = self.creer_brief(statut=Brief.Statut.BROUILLON)
+        self.assertIsNone(brief.date_publication)
+        brief.statut = Brief.Statut.PUBLIE
+        brief.save(update_fields=["statut"])
+        brief.refresh_from_db()
+        premiere = brief.date_publication
+        self.assertIsNotNone(premiere)
+        brief.statut = Brief.Statut.ARCHIVE
+        brief.save()
+        brief.statut = Brief.Statut.PUBLIE
+        brief.save()
+        brief.refresh_from_db()
+        self.assertEqual(brief.date_publication, premiere)
+
+    def test_publication_par_l_api(self):
+        brief = self.creer_brief(statut=Brief.Statut.BROUILLON, cree_par=self.formateur)
+        self.client.patch(self.url("brief", brief.id), {"statut": "PUBLIE"}, format="json")
+        brief.refresh_from_db()
+        self.assertIsNotNone(brief.date_publication)
+
+
+class ActiviteFormateurTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.maintenant = timezone.now()
+        self.brief = self.creer_brief(cree_par=self.formateur)
+        self.assignation = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant)
+
+    def il_y_a(self, **delta):
+        return self.maintenant - timedelta(**delta)
+
+    def evaluation(self, depot_il_y_a_h, evaluee_il_y_a_h, commentaire="", assignation=None):
+        if assignation is None:
+            self.nb_eleves = getattr(self, "nb_eleves", 0) + 1
+            eleve = self.membre(f"eleve{self.nb_eleves}@test.com", MembreTenant.Role.APPRENANT)
+            assignation = Assignation.objects.create(brief=self.brief, apprenant=eleve)
+        depot = self.deposer(assignation)
+        Livrable.objects.filter(pk=depot.pk).update(date_depot=self.il_y_a(hours=depot_il_y_a_h))
+        e = Evaluation.objects.create(assignation=assignation, evaluateur=self.formateur, commentaire=commentaire)
+        Evaluation.objects.filter(pk=e.pk).update(date_creation=self.il_y_a(hours=evaluee_il_y_a_h))
+        return e
+
+    def activite(self, utilisateur=None):
+        self.client.force_authenticate(user=utilisateur or self.formateur)
+        return self.client.get(reverse("activite-formateur", kwargs={"tenant_id": self.tenant.id}))
+
+    def test_actions_comptees_et_fil(self):
+        Ressource.objects.create(tenant=self.tenant, formateur=self.formateur, titre="Guide CSS", url="https://x.test")
+        self.evaluation(30, 6, commentaire="Bien")
+        res = self.activite()
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(res.data["periode"]["actions"], {"BRIEF": 1, "EVALUATION": 1, "RESSOURCE": 1, "REVISION": 0})
+        self.assertEqual(res.data["total_annee"], 3)
+        self.assertEqual(len(res.data["grille"]), 365)
+        self.assertEqual(sum(j["actions"] for j in res.data["grille"]), 3)
+        self.assertIn("Rendu évalué : Prenom Nom, Créer une API REST", [a["libelle"] for a in res.data["fil"]])
+
+    def test_delai_de_correction_et_commentaires(self):
+        self.evaluation(30, 6, commentaire="Bien")         # 24 h
+        self.evaluation(60, 48, commentaire="   ")          # 12 h, sans commentaire
+        periode = self.activite().data["periode"]
+        self.assertEqual(periode["delai_moyen_correction_h"], 18.0)
+        self.assertEqual(periode["feedback_pct"], 50)
+
+    def test_periode_precedente(self):
+        self.evaluation(24 * 40 + 5, 24 * 40)
+        res = self.activite().data
+        self.assertEqual(res["periode"]["evaluations"], 0)
+        self.assertEqual(res["periode_precedente"]["evaluations"], 1)
+        self.assertIsNone(res["periode"]["delai_moyen_correction_h"])
+
+    def test_brouillon_et_autre_formateur_non_comptes(self):
+        self.creer_brief(statut=Brief.Statut.BROUILLON, cree_par=self.formateur)
+        FormateurPromotion.objects.create(formateur=self.formateur_2, promotion=self.promotion)
+        self.creer_brief(cree_par=self.formateur_2)
+        self.assertEqual(self.activite().data["periode"]["actions"]["BRIEF"], 1)
+
+    def test_rendus_en_attente_depuis_plus_de_3_jours(self):
+        ancien = self.deposer(self.assignation)
+        Livrable.objects.filter(pk=ancien.pk).update(date_depot=self.il_y_a(days=4))
+        recent = Assignation.objects.create(brief=self.brief, apprenant=self.apprenant_b)
+        self.deposer(recent, self.apprenant_b)
+        self.assertEqual(self.activite().data["rendus_en_attente"], 1)
+
+    def test_semaines_actives(self):
+        Brief.objects.filter(pk=self.brief.pk).update(date_publication=self.il_y_a(weeks=3))
+        self.evaluation(30, 6)
+        self.assertEqual(self.activite().data["semaines_actives"], 2)
+
+    def test_reserve_au_formateur(self):
+        for u in (self.admin, self.apprenant):
+            self.assertEqual(self.activite(u).status_code, status.HTTP_403_FORBIDDEN, u.email)

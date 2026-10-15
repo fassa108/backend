@@ -33,7 +33,7 @@ from .models import (
     Livrable,
     Ressource,
 )
-from . import decrochage, progression, tableau_de_bord
+from . import activite_formateur, decrochage, progression, tableau_de_bord
 from .tasks import generer_analyse_accompagnement
 from .apercus import demander_apercu, reponse_consultation
 from .notifications import (
@@ -1019,3 +1019,12 @@ class TableauDeBordApprenantView(APIView):
 
     def get(self, request, tenant_id):
         return Response(tableau_de_bord.tableau_de_bord_apprenant(request.user, tenant_id))
+
+
+class ActiviteFormateurView(APIView):
+    """Mon activité : la propre activité du formateur connecté (jamais celle d'un autre)."""
+
+    permission_classes = [IsFormateurOrganisme]
+
+    def get(self, request, tenant_id):
+        return Response(activite_formateur.activite(request.user, tenant_id))
