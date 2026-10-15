@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    ActiviteFormateurView,
     AnalyseAccompagnementViewSet,
     AssignationViewSet,
     BriefViewSet,
@@ -54,6 +55,11 @@ urlpatterns = [
         "tenants/<int:tenant_id>/tableau-de-bord/formateur/",
         TableauDeBordFormateurView.as_view(),
         name="tableau-de-bord-formateur",
+    ),
+    path(
+        "tenants/<int:tenant_id>/tableau-de-bord/formateur/activite/",
+        ActiviteFormateurView.as_view(),
+        name="activite-formateur",
     ),
     path(
         "tenants/<int:tenant_id>/tableau-de-bord/admin/",
