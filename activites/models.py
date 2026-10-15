@@ -5,6 +5,7 @@ from django.conf import settings
 from django.core.validators import FileExtensionValidator
 from django.db import models
 from django.db.models import Q
+from django.utils import timezone
 
 from pedagogie.models import (
     CompetenceNiveau,
@@ -254,6 +255,9 @@ class Brief(models.Model):
         blank=True,
     )
 
+    # Première publication (activité du formateur) ; vide pour un brouillon
+    date_publication = models.DateTimeField(null=True, blank=True)
+
     date_creation = models.DateTimeField(auto_now_add=True)
     date_modification = models.DateTimeField(auto_now=True)
 
@@ -268,6 +272,13 @@ class Brief(models.Model):
 
     def __str__(self):
         return self.titre
+
+    def save(self, *args, **kwargs):
+        if self.statut == self.Statut.PUBLIE and self.date_publication is None:
+            self.date_publication = timezone.now()
+            if kwargs.get("update_fields") is not None:
+                kwargs["update_fields"] = {*kwargs["update_fields"], "date_publication"}
+        super().save(*args, **kwargs)
 
 
 class Assignation(models.Model):
