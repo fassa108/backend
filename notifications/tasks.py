@@ -1,8 +1,6 @@
 """
-Tâche quotidienne lancée par Celery beat (CELERY_BEAT_SCHEDULE).
-
-Les règles d'alerte et de rappel viendront s'ajouter ici ; pour l'instant
-elle fait le ménage des notifications lues anciennes.
+Tâche quotidienne lancée par Celery beat (CELERY_BEAT_SCHEDULE) :
+les alertes recalculées chaque jour, puis le ménage des notifications lues.
 """
 
 from celery import shared_task
@@ -12,4 +10,9 @@ from .services import purger_notifications_lues
 
 @shared_task
 def verifier_alertes():
-    return {"purgees": purger_notifications_lues()}
+    from activites.decrochage import alerter_formateurs
+
+    return {
+        "decrochage": alerter_formateurs(),
+        "purgees": purger_notifications_lues(),
+    }

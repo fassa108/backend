@@ -1,12 +1,16 @@
 from collections import defaultdict
+from datetime import timedelta
+
+from django.db.models import Q
+from django.utils import timezone
 
 from rest_framework import status, viewsets
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.throttling import ScopedRateThrottle, SimpleRateThrottle
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView
-from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+from rest_framework_simplejwt.tokens import RefreshToken, UntypedToken
 from rest_framework_simplejwt.exceptions import TokenError
 from drf_spectacular.utils import extend_schema
 from django.shortcuts import get_object_or_404
@@ -95,6 +99,28 @@ class ConnexionView(TokenObtainPairView):
     serializer_class = ConnexionJWTSerializer
     throttle_classes = [ScopedRateThrottle]
     throttle_scope = "connexion"
+
+
+class RafraichissementView(TokenRefreshView):
+    """
+    Rafraîchissement du jeton : met aussi à jour la dernière connexion (au
+    plus une fois par heure), sinon un utilisateur qui reste connecté
+    paraîtrait absent.
+    """
+
+    def post(self, request, *args, **kwargs):
+        reponse = super().post(request, *args, **kwargs)
+        if reponse.status_code != 200:
+            return reponse
+        jeton = reponse.data.get("refresh") or request.data.get("refresh")
+        try:
+            utilisateur_id = UntypedToken(jeton)["user_id"]
+        except (TokenError, KeyError, TypeError):
+            return reponse
+        Utilisateur.objects.filter(pk=utilisateur_id).filter(
+            Q(last_login__isnull=True) | Q(last_login__lt=timezone.now() - timedelta(hours=1))
+        ).update(last_login=timezone.now())
+        return reponse
 
 
 
@@ -340,4 +366,4 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        return Response(serializer.data)
+        return Response(serializer.data)

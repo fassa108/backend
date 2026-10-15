@@ -183,6 +183,10 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
 
     "AUTH_HEADER_TYPES": ("Bearer",),
+
+    # Dernière connexion (signal d'absence du décrochage) ; aussi mise à
+    # jour au rafraîchissement du jeton (accounts.views.RafraichissementView).
+    "UPDATE_LAST_LOGIN": True,
 }
 
 

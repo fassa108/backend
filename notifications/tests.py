@@ -165,7 +165,7 @@ class TacheQuotidienneTests(NotificationsBaseTestCase):
 
     def test_tache_et_commande(self):
         self.lue_il_y_a(90)
-        self.assertEqual(verifier_alertes(), {"purgees": 1})
+        self.assertEqual(verifier_alertes(), {"decrochage": 0, "purgees": 1})
         sortie = StringIO()
         call_command("verifier_alertes", stdout=sortie)
         self.assertIn("Vérification terminée", sortie.getvalue())
