@@ -139,3 +139,70 @@ def generer_apercu(self, modele, pk):
     objet.apercu.save("apercu.pdf", ContentFile(reponse.content), save=False)
     objet.apercu_statut = StatutApercu.PRET
     objet.save(update_fields=["apercu", "apercu_statut"])
+
+
+# ─── Analyse IA d'accompagnement ─────────────────────────────────────────────
+
+MESSAGE_ECHEC_ANALYSE = "L'analyse a échoué. Réessayez dans quelques minutes."
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def generer_analyse_accompagnement(self, pk):
+    """
+    Envoie la situation de l'apprenant (anonymisée) au service IA, enregistre
+    l'analyse et prévient le formateur qui l'a demandée. Service injoignable :
+    trois nouvelles tentatives, puis échec.
+    """
+    from notifications.models import Notification
+    from notifications.services import notifier
+
+    from .decrochage import situation
+    from .models import AnalyseAccompagnement
+
+    analyse = AnalyseAccompagnement.objects.select_related("apprenant", "promotion__formation").filter(
+        pk=pk, statut=AnalyseAccompagnement.Statut.EN_COURS
+    ).first()
+    # Supprimée entre-temps, ou déjà traitée
+    if analyse is None:
+        return
+
+    demande, signale = situation(analyse.apprenant, analyse.promotion)
+    analyse.niveau = signale["niveau"] if signale else ""
+    analyse.signaux = signale["signaux"] if signale else []
+
+    def terminer(statut, contenu=None, erreur=""):
+        analyse.statut = statut
+        analyse.contenu = contenu
+        analyse.erreur = erreur
+        analyse.save()
+        if analyse.demandee_par_id:
+            a = analyse.apprenant
+            prete = statut == AnalyseAccompagnement.Statut.PRETE
+            notifier(
+                [analyse.demandee_par_id],
+                Notification.Type.IA,
+                f"Analyse IA {'prête' if prete else 'en échec'} : {a.prenom} {a.nom}",
+                "Diagnostic, suggestions et plan d'accompagnement." if prete else erreur,
+                f"/progression/{a.id}",
+                tenant=analyse.promotion.formation.tenant_id,
+            )
+
+    try:
+        reponse = requests.post(
+            f"{settings.IA_URL}/generate/accompagnement",
+            json=demande,
+            headers={"X-Service-Token": settings.IA_SERVICE_TOKEN},
+            # Le LLM peut être lent (nouvelles tentatives côté service IA)
+            timeout=(5, 300),
+        )
+    except requests.RequestException as erreur:
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=erreur)
+        logger.warning("Service IA injoignable pour l'analyse #%s : %s", pk, erreur)
+        return terminer(AnalyseAccompagnement.Statut.ECHEC, erreur=MESSAGE_ECHEC_ANALYSE)
+
+    if reponse.status_code != 200:
+        logger.warning("Analyse #%s refusée par le service IA : %s %s", pk, reponse.status_code, reponse.text[:300])
+        return terminer(AnalyseAccompagnement.Statut.ECHEC, erreur=MESSAGE_ECHEC_ANALYSE)
+
+    terminer(AnalyseAccompagnement.Statut.PRETE, contenu=reponse.json())

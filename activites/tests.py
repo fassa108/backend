@@ -57,6 +57,7 @@ from pedagogie.services import InscriptionService
 from tenants.models import Tenant
 
 from .models import (
+    AnalyseAccompagnement,
     Assignation,
     Brief,
     CategorieBrief,
@@ -2015,10 +2016,8 @@ class TableauDeBordTests(ActivitesBaseTestCase):
         self.assertEqual(res.data["indicateurs"]["apprenants"], 2)
         self.assertEqual(res.data["indicateurs"]["taux_rendu"], 50)
         self.assertEqual(res.data["a_evaluer"][0]["assignation"], self.rendu.id)
-        self.assertEqual(
-            [(a["id"], a["briefs_non_rendus"]) for a in res.data["apprenants_a_suivre"]],
-            [(self.apprenant_b.id, 1)],
-        )
+        # Un seul retard, inscription récente : pas encore signalé (voir DecrochageTests)
+        self.assertEqual(res.data["apprenants_a_suivre"], [])
         echeances = {e["titre"]: (e["rendus"], e["attendus"]) for e in res.data["echeances"]}
         self.assertEqual(echeances, {"Brief échu": (1, 2), "Brief à venir": (0, 1)})
 
@@ -2112,3 +2111,306 @@ class TableauDeBordTests(ActivitesBaseTestCase):
     def test_autre_organisme_refuse(self):
         admin_b = self.membre("admin_b@test.com", MembreTenant.Role.ADMINISTRATEUR, tenant=self.tenant_2)
         self.assertEqual(self.get("admin", admin_b).status_code, status.HTTP_403_FORBIDDEN)
+
+
+# ─── Décrochage ───────────────────────────────────────────────────────────────
+
+class DecrochageBaseTestCase(ActivitesBaseTestCase):
+    """
+    Deux briefs échus, ouverts il y a 30 jours : « apprenant » a tout rendu,
+    « apprenant_b » rien. Inscriptions anciennes, connexions récentes.
+    """
+
+    def setUp(self):
+        super().setUp()
+        maintenant = timezone.now()
+        InscriptionPromotion.objects.filter(promotion=self.promotion).update(
+            date_inscription=maintenant - timedelta(days=30)
+        )
+        User.objects.filter(pk__in=[self.apprenant.pk, self.apprenant_b.pk]).update(last_login=maintenant)
+        self.briefs = []
+        for jours in (20, 18):
+            brief = self.creer_brief(
+                cree_par=self.formateur,
+                date_debut=maintenant - timedelta(days=30),
+                date_limite=maintenant - timedelta(days=jours),
+            )
+            brief.competence_niveaux.set([self.cn])
+            self.briefs.append(brief)
+            self.deposer(Assignation.objects.create(brief=brief, apprenant=self.apprenant))
+            Assignation.objects.create(brief=brief, apprenant=self.apprenant_b)
+
+
+class DecrochageTests(DecrochageBaseTestCase):
+    def detecter(self):
+        from .decrochage import detecter
+        return {s["apprenant"].id: s for s in detecter([Promotion.objects.get(pk=self.promotion.pk)])}
+
+    def codes(self, signale):
+        return [s["code"] for s in signale["signaux"]]
+
+    def test_retards_et_inactivite_a_risque(self):
+        signales = self.detecter()
+        self.assertEqual(list(signales), [self.apprenant_b.id])
+        b = signales[self.apprenant_b.id]
+        self.assertEqual(b["niveau"], "A_RISQUE")
+        self.assertEqual(self.codes(b), ["RETARDS", "INACTIVITE"])
+        self.assertEqual(b["signaux"][0]["court"], "2 retards")
+        self.assertEqual(b["signaux"][1]["valeur"], 30)
+
+    def test_un_seul_signal_a_surveiller(self):
+        User.objects.filter(pk=self.apprenant.pk).update(last_login=timezone.now() - timedelta(days=12))
+        a = self.detecter()[self.apprenant.id]
+        self.assertEqual((a["niveau"], self.codes(a)), ("A_SURVEILLER", ["ABSENCE"]))
+        self.assertIn("12 jours", a["signaux"][0]["libelle"])
+
+    def test_jamais_connecte(self):
+        User.objects.filter(pk=self.apprenant.pk).update(last_login=None)
+        signal = self.detecter()[self.apprenant.id]["signaux"][0]
+        self.assertIn("Jamais connecté", signal["libelle"])
+
+    def test_inscription_recente_jamais_signalee(self):
+        InscriptionPromotion.objects.filter(apprenant=self.apprenant_b).update(date_inscription=timezone.now())
+        self.assertEqual(self.detecter(), {})
+
+    def test_promotion_cloturee_ignoree(self):
+        Promotion.objects.filter(pk=self.promotion.pk).update(actif=False)
+        self.assertEqual(self.detecter(), {})
+
+    def test_progression_faible_par_rapport_a_la_promotion(self):
+        # « apprenant » a tout validé (100 %), « apprenant_b » rien : moyenne 50 %
+        for cn in (self.cn, self.cn_module_2):
+            CompetenceValidee.objects.create(apprenant=self.apprenant, competence_niveau=cn)
+        self.assertIn("PROGRESSION", self.codes(self.detecter()[self.apprenant_b.id]))
+
+    def test_alertes_aux_formateurs_une_fois_par_semaine(self):
+        from .decrochage import alerter_formateurs
+
+        self.assertEqual(alerter_formateurs(), 1)
+        alerte = Notification.objects.get(type=Notification.Type.ALERTE)
+        self.assertEqual(alerte.utilisateur, self.formateur)
+        self.assertEqual(alerte.titre, "Prenom Nom : à risque de décrochage")
+        self.assertEqual((alerte.lien, alerte.tenant), (f"/progression/{self.apprenant_b.id}", self.tenant))
+        self.assertIn("2 briefs échus non rendus", alerte.message)
+        self.assertEqual(alerter_formateurs(), 0)
+
+    def test_passage_a_risque_realerte_mais_pas_l_inverse(self):
+        from .decrochage import alerter_formateurs
+
+        rendu_b = Assignation.objects.get(brief=self.briefs[0], apprenant=self.apprenant_b)
+        # Un seul retard, dépôt récent : à surveiller
+        self.deposer(rendu_b, self.apprenant_b)
+        User.objects.filter(pk=self.apprenant_b.pk).update(last_login=timezone.now() - timedelta(days=12))
+        self.assertEqual(alerter_formateurs(), 1)
+        self.assertIn("à surveiller", Notification.objects.get().titre)
+
+        # Plus de dépôt : à risque, nouvelle alerte
+        Livrable.objects.filter(deposant=self.apprenant_b).delete()
+        self.assertEqual(alerter_formateurs(), 1)
+
+        # De nouveau à surveiller la même semaine : pas de nouvelle alerte
+        self.deposer(rendu_b, self.apprenant_b)
+        self.assertEqual(alerter_formateurs(), 0)
+
+    def test_tableaux_de_bord(self):
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.get(reverse("tableau-de-bord-formateur", kwargs={"tenant_id": self.tenant.id}))
+        a_suivre = res.data["apprenants_a_suivre"]
+        self.assertEqual([(a["id"], a["niveau"], a["briefs_non_rendus"]) for a in a_suivre],
+                         [(self.apprenant_b.id, "A_RISQUE", 2)])
+        self.assertEqual(len(a_suivre[0]["signaux"]), 2)
+
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get(reverse("tableau-de-bord-admin", kwargs={"tenant_id": self.tenant.id}))
+        promo = next(p for p in res.data["promotions"] if p["id"] == self.promotion.id)
+        self.assertEqual(promo["a_risque"], 1)
+        self.assertEqual(res.data["attention"]["apprenants_a_risque"], 1)
+
+    def test_situation_envoyee_a_l_ia(self):
+        from .decrochage import situation
+
+        Evaluation.objects.create(
+            assignation=Assignation.objects.get(brief=self.briefs[0], apprenant=self.apprenant),
+            evaluateur=self.formateur, commentaire="Commentaire pour un autre apprenant",
+        )
+        self.briefs[0].description = "<p>Créer une <b>API</b> &amp; la documenter</p>"
+        self.briefs[0].save()
+        demande, signale = situation(self.apprenant_b, self.promotion)
+        self.assertEqual(signale["niveau"], "A_RISQUE")
+        self.assertEqual(demande["signaux"], ["2 briefs échus non rendus", "Aucun dépôt depuis 30 jours"])
+        self.assertEqual([b["statut"] for b in demande["briefs"]], ["en_retard", "en_retard"])
+        self.assertEqual(demande["briefs"][0]["description"], "Créer une API & la documenter")
+        self.assertEqual(demande["competences_non_acquises"], [{
+            "competence": "Développer une API", "niveau": "Imiter",
+            "description": "Reproduire une API existante", "brief": "Créer une API REST",
+        }])
+        self.assertEqual(demande["commentaires_formateur"], [])
+        # Anonymisée : ni nom ni email
+        self.assertNotIn(self.apprenant_b.email, str(demande))
+
+    def test_competence_d_un_brief_non_echu_pas_envoyee(self):
+        from .decrochage import situation
+
+        a_venir = self.creer_brief(cree_par=self.formateur)
+        a_venir.competence_niveaux.set([self.cn_module_2])
+        Assignation.objects.create(brief=a_venir, apprenant=self.apprenant_b)
+        demande, _ = situation(self.apprenant_b, self.promotion)
+        self.assertNotIn("Modéliser", str(demande["competences_non_acquises"]))
+        self.assertIn("en_cours", [b["statut"] for b in demande["briefs"]])
+
+
+class DerniereConnexionTests(ActivitesBaseTestCase):
+    def test_rafraichissement_met_a_jour_la_derniere_connexion(self):
+        from rest_framework_simplejwt.tokens import RefreshToken
+
+        ancienne = timezone.now() - timedelta(days=5)
+        User.objects.filter(pk=self.apprenant.pk).update(last_login=ancienne)
+        self.client.force_authenticate(user=None)
+        res = self.client.post("/api/accounts/refresh/", {"refresh": str(RefreshToken.for_user(self.apprenant))})
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.apprenant.refresh_from_db()
+        self.assertGreater(self.apprenant.last_login, ancienne)
+
+    def test_jeton_invalide_sans_effet(self):
+        res = self.client.post("/api/accounts/refresh/", {"refresh": "invalide"})
+        self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+REPONSE_IA = {
+    "diagnostic": "Deux briefs en retard.",
+    "suggestions_formateur": [{"action": "Entretien", "detail": "Faire le point."}],
+    "plan_apprenant": {"message": "Vous pouvez y arriver.", "etapes": [{"titre": "Commencer", "detail": "Le HTML."}]},
+}
+
+
+@patch("activites.views.generer_analyse_accompagnement.delay")
+class AnalyseAccompagnementTests(DecrochageBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.base = f"/api/tenants/{self.tenant.id}/analyses-accompagnement/"
+
+    def demander(self, utilisateur=None, apprenant=None):
+        self.client.force_authenticate(user=utilisateur or self.formateur)
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.post(self.base, {
+                "apprenant": (apprenant or self.apprenant_b).id,
+                "promotion": self.promotion.id,
+            }, format="json")
+
+    def prete(self, analyse_id):
+        AnalyseAccompagnement.objects.filter(pk=analyse_id).update(statut="PRETE", contenu=REPONSE_IA)
+
+    def test_formateur_demande_une_analyse(self, generer):
+        res = self.demander()
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+        self.assertEqual((res.data["statut"], res.data["apprenant_nom"]), ("EN_COURS", "Prenom Nom"))
+        generer.assert_called_once_with(res.data["id"])
+
+    def test_admin_peut_demander(self, generer):
+        self.assertEqual(self.demander(self.admin).status_code, status.HTTP_201_CREATED)
+
+    def test_formateur_hors_promotion_et_apprenant_refuses(self, generer):
+        for u in (self.formateur_2, self.apprenant):
+            self.assertEqual(self.demander(u).status_code, status.HTTP_403_FORBIDDEN, u.email)
+        generer.assert_not_called()
+
+    def test_apprenant_hors_promotion(self, generer):
+        res = self.demander(apprenant=self.apprenant_hors_promo)
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_promotion_cloturee(self, generer):
+        Promotion.objects.filter(pk=self.promotion.pk).update(actif=False)
+        self.assertEqual(self.demander().status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_une_seule_analyse_en_cours(self, generer):
+        self.demander()
+        res = self.demander()
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("déjà en cours", str(res.data))
+
+    def test_partage_du_plan_a_l_apprenant(self, generer):
+        analyse_id = self.demander().data["id"]
+
+        self.client.force_authenticate(user=self.apprenant_b)
+        self.assertEqual(self.client.get(self.base).data, [])
+
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.post(f"{self.base}{analyse_id}/partager/")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)  # pas encore prête
+
+        self.prete(analyse_id)
+        res = self.client.post(f"{self.base}{analyse_id}/partager/")
+        self.assertTrue(res.data["partagee"])
+        notif = Notification.objects.get(utilisateur=self.apprenant_b)
+        self.assertEqual((notif.type, notif.lien), (Notification.Type.IA, "/ma-progression"))
+
+        self.client.force_authenticate(user=self.apprenant_b)
+        plans = self.client.get(self.base).data
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]["plan"], REPONSE_IA["plan_apprenant"])
+        for cache in ("contenu", "signaux", "niveau", "diagnostic"):
+            self.assertNotIn(cache, plans[0])
+        # L'apprenant ne voit pas les plans des autres
+        self.client.force_authenticate(user=self.apprenant)
+        self.assertEqual(self.client.get(self.base).data, [])
+
+    def test_apprenant_ne_partage_pas(self, generer):
+        analyse_id = self.demander().data["id"]
+        self.prete(analyse_id)
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.client.post(f"{self.base}{analyse_id}/partager/")
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(AnalyseAccompagnement.objects.get(pk=analyse_id).partagee)
+
+    def test_formateur_voit_les_analyses_de_ses_promotions(self, generer):
+        self.demander()
+        self.client.force_authenticate(user=self.formateur_2)
+        self.assertEqual(self.client.get(self.base).data, [])
+        self.client.force_authenticate(user=self.formateur)
+        res = self.client.get(self.base, {"apprenant": self.apprenant_b.id})
+        self.assertEqual(len(res.data), 1)
+
+
+@patch("activites.tasks.requests.post")
+class GenerationAnalyseTests(DecrochageBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        self.analyse = AnalyseAccompagnement.objects.create(
+            apprenant=self.apprenant_b, promotion=self.promotion, demandee_par=self.formateur
+        )
+
+    def test_analyse_prete_et_formateur_prevenu(self, post):
+        from .tasks import generer_analyse_accompagnement
+
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = REPONSE_IA
+        generer_analyse_accompagnement(self.analyse.pk)
+
+        self.analyse.refresh_from_db()
+        self.assertEqual((self.analyse.statut, self.analyse.contenu), ("PRETE", REPONSE_IA))
+        self.assertEqual(self.analyse.niveau, "A_RISQUE")
+        self.assertEqual(len(post.call_args.kwargs["json"]["signaux"]), 2)
+        notif = Notification.objects.get(utilisateur=self.formateur)
+        self.assertEqual((notif.type, notif.lien), (Notification.Type.IA, f"/progression/{self.apprenant_b.id}"))
+
+    def test_echec_du_service(self, post):
+        from .tasks import generer_analyse_accompagnement
+
+        post.return_value.status_code = 503
+        post.return_value.text = "LLM indisponible"
+        generer_analyse_accompagnement(self.analyse.pk)
+        self.analyse.refresh_from_db()
+        self.assertEqual(self.analyse.statut, "ECHEC")
+        self.assertIn("échoué", self.analyse.erreur)
+
+
+class ProgressionDecrochageTests(DecrochageBaseTestCase):
+    def test_signalement_visible_du_formateur_seulement(self):
+        res = self.client.get(self.url("progression", self.apprenant_b.id))
+        self.assertEqual(res.data["decrochage"]["niveau"], "A_RISQUE")
+        self.assertTrue(res.data["promotion"]["actif"])
+        self.assertIsNone(self.client.get(self.url("progression", self.apprenant.id)).data["decrochage"])
+
+        self.client.force_authenticate(user=self.apprenant_b)
+        res = self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
+        self.assertNotIn("decrochage", res.data)

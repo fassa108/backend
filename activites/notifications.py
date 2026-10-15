@@ -205,3 +205,15 @@ def notifier_competences_validees(apprenant, competence_niveaux, tenant_id):
         "/ma-progression",
         tenant=tenant_id,
     )
+
+
+def notifier_plan_partage(analyse, formateur):
+    """Plan d'accompagnement partagé : prévenir l'apprenant (pas d'email)."""
+    notifier(
+        [analyse.apprenant_id],
+        Notification.Type.IA,
+        "Un plan d'accompagnement vous est proposé",
+        f"{formateur.prenom} {formateur.nom} vous propose des étapes pour avancer.",
+        "/ma-progression",
+        tenant=analyse.promotion.formation.tenant_id,
+    )

@@ -566,3 +566,55 @@ class CommentairePair(models.Model):
 
     def __str__(self):
         return f"Commentaire de {self.auteur} sur {self.assignation}"
+
+
+# ─── Accompagnement des apprenants en difficulté ──────────────────────────────
+
+class AnalyseAccompagnement(models.Model):
+    """
+    Analyse IA de la situation d'un apprenant, demandée par un formateur de
+    la promotion (ou l'admin) : diagnostic, suggestions pour le formateur et
+    plan pour l'apprenant. Seul le plan peut être partagé à l'apprenant,
+    sur décision du formateur.
+
+    « signaux » et « niveau » gardent le signalement au moment de la demande.
+    """
+
+    class Statut(models.TextChoices):
+        EN_COURS = "EN_COURS", "En cours"
+        PRETE = "PRETE", "Prête"
+        ECHEC = "ECHEC", "Échec"
+
+    apprenant = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="analyses_accompagnement",
+    )
+    promotion = models.ForeignKey(
+        Promotion,
+        on_delete=models.CASCADE,
+        related_name="analyses_accompagnement",
+    )
+    demandee_par = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="analyses_demandees",
+    )
+    statut = models.CharField(max_length=10, choices=Statut.choices, default=Statut.EN_COURS)
+    niveau = models.CharField(max_length=20, blank=True)
+    signaux = models.JSONField(default=list, blank=True)
+    # {diagnostic, suggestions_formateur: [{action, detail}], plan_apprenant: {message, etapes}}
+    contenu = models.JSONField(null=True, blank=True)
+    erreur = models.CharField(max_length=255, blank=True)
+    partagee = models.BooleanField(default=False)
+    date_partage = models.DateTimeField(null=True, blank=True)
+    date_creation = models.DateTimeField(auto_now_add=True)
+    date_modification = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date_creation", "-id"]
+
+    def __str__(self):
+        return f"Analyse de {self.apprenant} ({self.get_statut_display()})"
