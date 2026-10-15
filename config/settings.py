@@ -13,6 +13,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 import sys
+from celery.schedules import crontab
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -56,6 +57,7 @@ INSTALLED_APPS = [
     'pedagogie',
     'activites',
     'revision',
+    'notifications',
 ]
 
 MIDDLEWARE = [
@@ -181,6 +183,10 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
 
     "AUTH_HEADER_TYPES": ("Bearer",),
+
+    # Dernière connexion (signal d'absence du décrochage) ; aussi mise à
+    # jour au rafraîchissement du jeton (accounts.views.RafraichissementView).
+    "UPDATE_LAST_LOGIN": True,
 }
 
 
@@ -218,6 +224,19 @@ AUTH_USER_MODEL = "accounts.Utilisateur"
 CELERY_BROKER_URL = "redis://redis:6379/0"
 
 CELERY_RESULT_BACKEND = "redis://redis:6379/1"
+
+# Tâches planifiées (service celery-beat) ; heures dans TIME_ZONE.
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_BEAT_SCHEDULE = {
+    "rappels-briefs-horaire": {
+        "task": "notifications.tasks.envoyer_rappels",
+        "schedule": crontab(minute=0),
+    },
+    "verifier-alertes-quotidien": {
+        "task": "notifications.tasks.verifier_alertes",
+        "schedule": crontab(hour=7, minute=0),
+    },
+}
 
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",

@@ -5,9 +5,10 @@ from django.db import transaction
 from django.db.models import Max, Prefetch, Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -22,6 +23,7 @@ from pedagogie.views import (
 from tenants.models import Tenant
 
 from .models import (
+    AnalyseAccompagnement,
     Assignation,
     Brief,
     CategorieBrief,
@@ -31,13 +33,15 @@ from .models import (
     Livrable,
     Ressource,
 )
-from . import progression, tableau_de_bord
+from . import decrochage, progression, tableau_de_bord
+from .tasks import generer_analyse_accompagnement
 from .apercus import demander_apercu, reponse_consultation
 from .notifications import (
     notifier_assignations,
     notifier_commentaire,
     notifier_depot,
     notifier_evaluation,
+    notifier_plan_partage,
     notifier_publication,
 )
 from .permissions import (
@@ -47,6 +51,8 @@ from .permissions import (
     IsMembreOrganisme,
 )
 from .serializers import (
+    AnalyseAccompagnementSerializer,
+    PlanPartageSerializer,
     AssignationSerializer,
     BriefSerializer,
     CategorieBriefSerializer,
@@ -745,7 +751,19 @@ class ProgressionViewSet(viewsets.ViewSet):
             autorisees = self._promotions_autorisees(tenant_id)
             if autorisees is not None and inscription.promotion_id not in autorisees:
                 raise NotFound("Apprenant introuvable.")
+            # Formateur et admin : signalement de décrochage en cours (jamais montré à l'apprenant)
+            return Response({**self._detail(inscription), "decrochage": self._decrochage(inscription)})
         return Response(self._detail(inscription))
+
+    def _decrochage(self, inscription):
+        signale = next(
+            (
+                s for s in decrochage.detecter([inscription.promotion])
+                if s["apprenant"].id == inscription.apprenant_id
+            ),
+            None,
+        )
+        return {"niveau": signale["niveau"], "signaux": signale["signaux"]} if signale else None
 
     @action(detail=False, methods=["get"])
     def moi(self, request, tenant_id=None):
@@ -758,7 +776,7 @@ class ProgressionViewSet(viewsets.ViewSet):
         a, p = inscription.apprenant, inscription.promotion
         return {
             "apprenant": {"id": a.id, "nom": f"{a.prenom} {a.nom}"},
-            "promotion": {"id": p.id, "nom": p.nom},
+            "promotion": {"id": p.id, "nom": p.nom, "actif": p.actif},
             **progression.detail(a, p),
         }
 
@@ -872,6 +890,105 @@ class CommentairePairViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def demasquer(self, request, tenant_id=None, pk=None):
         return self._changer_masque(False)
+
+
+# ─── Accompagnement des apprenants en difficulté ──────────────────────────────
+
+class AnalyseAccompagnementViewSet(viewsets.ModelViewSet):
+    """
+    Analyses IA de la situation d'un apprenant (decrochage.py, tasks.py).
+
+    - Formateur de la promotion, ou admin : demande (POST {apprenant,
+      promotion}), lit, partage le plan avec l'apprenant (partager).
+    - Apprenant : lit seulement les plans qui lui ont été partagés.
+
+    Promotion clôturée : plus de nouvelle analyse. Une seule analyse en cours
+    à la fois par apprenant et promotion. Filtres : ?apprenant=, ?promotion=.
+    """
+
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_permissions(self):
+        if self.action in (*ACTIONS_LECTURE, "create", "partager"):
+            return [IsMembreOrganisme()]
+        return _refus_par_defaut(self)
+
+    def _role(self):
+        return _role(self.request.user, self.kwargs["tenant_id"])
+
+    def get_serializer_class(self):
+        if self._role() == MembreTenant.Role.APPRENANT:
+            return PlanPartageSerializer
+        return AnalyseAccompagnementSerializer
+
+    def get_queryset(self):
+        tenant_id = self.kwargs["tenant_id"]
+        user = self.request.user
+        qs = AnalyseAccompagnement.objects.filter(
+            promotion__formation__tenant_id=tenant_id
+        ).select_related("apprenant", "promotion", "demandee_par")
+        for param in ("apprenant", "promotion"):
+            valeur = _param_entier(self.request, param)
+            if valeur is not None:
+                qs = qs.filter(**{f"{param}_id": valeur})
+
+        role = self._role()
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return qs
+        if role == MembreTenant.Role.FORMATEUR:
+            return qs.filter(promotion_id__in=_promotions_du_formateur(user, tenant_id))
+        return qs.filter(apprenant=user, partagee=True, statut=AnalyseAccompagnement.Statut.PRETE)
+
+    def _verifier_accompagnant(self, promotion_id):
+        role = self._role()
+        if role == MembreTenant.Role.ADMINISTRATEUR:
+            return
+        if role == MembreTenant.Role.FORMATEUR and _est_formateur_de_promotion(self.request.user, promotion_id):
+            return
+        raise PermissionDenied("Réservé aux formateurs de la promotion et à l'administrateur.")
+
+    def create(self, request, tenant_id=None):
+        apprenant_id = request.data.get("apprenant")
+        promotion_id = request.data.get("promotion")
+        try:
+            apprenant_id, promotion_id = int(apprenant_id), int(promotion_id)
+        except (TypeError, ValueError):
+            raise ValidationError({"detail": "Précisez l'apprenant et la promotion."})
+        self._verifier_accompagnant(promotion_id)
+
+        promotion = get_object_or_404(Promotion, pk=promotion_id, formation__tenant_id=tenant_id)
+        if not promotion.actif:
+            raise ValidationError({"detail": "Cette promotion est clôturée."})
+        inscription = (
+            InscriptionPromotion.objects.filter(promotion=promotion, apprenant_id=apprenant_id, actif=True)
+            .select_related("apprenant")
+            .first()
+        )
+        if inscription is None:
+            raise NotFound("Apprenant introuvable dans cette promotion.")
+        if AnalyseAccompagnement.objects.filter(
+            promotion=promotion, apprenant_id=apprenant_id, statut=AnalyseAccompagnement.Statut.EN_COURS
+        ).exists():
+            raise ValidationError({"detail": "Une analyse est déjà en cours pour cet apprenant."})
+
+        analyse = AnalyseAccompagnement.objects.create(
+            apprenant=inscription.apprenant, promotion=promotion, demandee_par=request.user
+        )
+        transaction.on_commit(lambda: generer_analyse_accompagnement.delay(analyse.pk))
+        return Response(AnalyseAccompagnementSerializer(analyse).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def partager(self, request, tenant_id=None, pk=None):
+        analyse = self.get_object()
+        self._verifier_accompagnant(analyse.promotion_id)
+        if analyse.statut != AnalyseAccompagnement.Statut.PRETE:
+            raise ValidationError({"detail": "Seule une analyse prête peut être partagée."})
+        if not analyse.partagee:
+            analyse.partagee = True
+            analyse.date_partage = timezone.now()
+            analyse.save(update_fields=["partagee", "date_partage", "date_modification"])
+            notifier_plan_partage(analyse, request.user)
+        return Response(AnalyseAccompagnementSerializer(analyse).data)
 
 
 # ─── Tableaux de bord ─────────────────────────────────────────────────────────

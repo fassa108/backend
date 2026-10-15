@@ -8,12 +8,14 @@ from accounts.models import MembreTenant
 from pedagogie.models import CompetenceNiveau, FormateurPromotion, GroupeMembre
 
 from .apercus import demander_apercu
+from .notifications import notifier_competences_validees
 from .texte_riche import est_vide, nettoyer_html
 from .validators import valider_fichier
 from .models import (
     EXTENSIONS_LIVRABLES,
     LONGUEUR_MAX_COMMENTAIRE,
     MAX_ELEMENTS_PAR_DEPOT,
+    AnalyseAccompagnement,
     Assignation,
     Brief,
     CategorieBrief,
@@ -930,11 +932,15 @@ class EvaluationSerializer(serializers.ModelSerializer):
         )
         # Compétences acquises : validées pour chaque apprenant concerné
         acquises = [l["competence_niveau"] for l in lignes if l["acquis"]]
+        tenant_id = evaluation.assignation.brief.promotion.formation.tenant_id
         for apprenant in apprenants_de_l_assignation(evaluation.assignation):
-            for cn in acquises:
-                CompetenceValidee.objects.get_or_create(
+            nouvelles = [
+                cn for cn in acquises
+                if CompetenceValidee.objects.get_or_create(
                     apprenant=apprenant, competence_niveau=cn, defaults={"evaluation": evaluation}
-                )
+                )[1]
+            ]
+            notifier_competences_validees(apprenant, nouvelles, tenant_id)
         return evaluation
 
 
@@ -1053,3 +1059,49 @@ class CommentairePairSerializer(serializers.ModelSerializer):
             if parent.masque:
                 raise serializers.ValidationError({"parent": "Ce commentaire a été masqué."})
         return attrs
+
+
+# ─── Accompagnement des apprenants en difficulté ──────────────────────────────
+
+def _nom_complet(utilisateur):
+    return f"{utilisateur.prenom} {utilisateur.nom}" if utilisateur else None
+
+
+class AnalyseAccompagnementSerializer(serializers.ModelSerializer):
+    """Analyse complète : formateurs de la promotion et admin."""
+
+    apprenant_nom = serializers.SerializerMethodField()
+    promotion_nom = serializers.CharField(source="promotion.nom", read_only=True)
+    demandee_par_nom = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AnalyseAccompagnement
+        fields = [
+            "id", "apprenant", "apprenant_nom", "promotion", "promotion_nom",
+            "demandee_par_nom", "statut", "niveau", "signaux", "contenu", "erreur",
+            "partagee", "date_partage", "date_creation",
+        ]
+        read_only_fields = [f for f in fields if f not in ("apprenant", "promotion")]
+
+    def get_apprenant_nom(self, obj):
+        return _nom_complet(obj.apprenant)
+
+    def get_demandee_par_nom(self, obj):
+        return _nom_complet(obj.demandee_par)
+
+
+class PlanPartageSerializer(serializers.ModelSerializer):
+    """Ce que voit l'apprenant : le plan seul, jamais le diagnostic ni les signaux."""
+
+    plan = serializers.SerializerMethodField()
+    formateur_nom = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AnalyseAccompagnement
+        fields = ["id", "promotion", "formateur_nom", "plan", "date_partage"]
+
+    def get_plan(self, obj):
+        return (obj.contenu or {}).get("plan_apprenant")
+
+    def get_formateur_nom(self, obj):
+        return _nom_complet(obj.demandee_par)

@@ -1,10 +1,9 @@
 from django.urls import path
 
-from rest_framework_simplejwt.views import TokenRefreshView
-
 from .views import (
     ActivationView,
     ConnexionView,
+    RafraichissementView,
     LogoutView,
     DemandeResetPasswordView,
     ResetPasswordView,
@@ -30,7 +29,7 @@ urlpatterns = [
 
     path(
         "refresh/",
-        TokenRefreshView.as_view(),
+        RafraichissementView.as_view(),
         name="refresh",
     ),
 
@@ -80,4 +79,4 @@ urlpatterns = [
         }),
         name="membre-renvoyer-invitation",
     ),
-]
+]

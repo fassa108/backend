@@ -51,4 +51,8 @@ urlpatterns = [
         "api/",
         include("revision.urls"),
     ),
+    path(
+        "api/",
+        include("notifications.urls"),
+    ),
 ]

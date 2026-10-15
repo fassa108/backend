@@ -272,21 +272,11 @@ def tableau_de_bord_formateur(user, tenant_id):
         if s["statut"] == Brief.Statut.PUBLIE and debut <= s["date_limite"] <= fin
     ]
 
-    a_suivre = []
+    # Apprenants signalés (décrochage), promotions ouvertes seulement
+    from .decrochage import detecter, resume
+
     par_id = {p.id: p for p in promotions}
-    for (promotion_id, apprenant_id), nb in analyse.retards(ouvertes).items():
-        apprenant = analyse.inscrits.get(promotion_id, {}).get(apprenant_id)
-        if apprenant is None:  # désinscrit depuis
-            continue
-        promotion = par_id[promotion_id]
-        a_suivre.append({
-            "id": apprenant.id,
-            "nom": _nom(apprenant),
-            "promotion": promotion.nom,
-            "briefs_non_rendus": nb,
-            "competences_pct": analyse.competences_pct(promotion, apprenant.id),
-        })
-    a_suivre.sort(key=lambda s: (-s["briefs_non_rendus"], s["competences_pct"], s["nom"]))
+    a_suivre = [resume(s) for s in detecter(promotions, maintenant, analyse)]
 
     return {
         "indicateurs": {
@@ -333,6 +323,13 @@ def tableau_de_bord_admin(tenant_id):
     )
     ouvertes = _promotions_ouvertes(promotions)
     analyse = _AnalysePromotions(promotions, maintenant)
+
+    from .decrochage import A_RISQUE, detecter
+
+    a_risque = {}
+    for s in detecter(promotions, maintenant, analyse):
+        if s["niveau"] == A_RISQUE:
+            a_risque[s["promotion"].id] = a_risque.get(s["promotion"].id, 0) + 1
 
     membres = MembreTenant.objects.filter(tenant_id=tenant_id, actif=True)
     depuis_7_jours = maintenant - timedelta(days=7)
@@ -403,6 +400,7 @@ def tableau_de_bord_admin(tenant_id):
                     1 for a, etat, _ in analyse.rendus
                     if etat == A_EVALUER and a.brief.promotion_id == p.id
                 ),
+                "a_risque": a_risque.get(p.id, 0),
             }
             for p in promotions
         ],
@@ -423,6 +421,7 @@ def tableau_de_bord_admin(tenant_id):
                 {"id": p.id, "nom": p.nom} for p in promotions if not p.nb_formateurs
             ],
             "rendus_en_attente_longue": attente_longue,
+            "apprenants_a_risque": sum(a_risque.values()),
         },
     }
 

@@ -6,6 +6,8 @@ from rest_framework.exceptions import ValidationError
 
 from accounts.models import MembreTenant, Utilisateur
 from accounts.services import AccountService
+from notifications.models import Notification
+from notifications.services import notifier
 
 from .models import DemandeInscription, Paiement, Tenant
 from .tasks import envoyer_email_nouvel_organisme, envoyer_email_organisme_cree
@@ -134,13 +136,26 @@ class DemandeInscriptionService:
                 lambda: envoyer_email_organisme_cree.delay(demande.email, demande.nom_organisme)
             )
 
-        emails_admins = list(
-            Utilisateur.objects
-            .filter(est_admin_saas=True, actif=True)
-            .values_list("email", flat=True)
+        notifier(
+            Utilisateur.objects.filter(email__iexact=demande.email),
+            Notification.Type.INSCRIPTION,
+            "Bienvenue sur EduHub",
+            f"Votre organisme « {demande.nom_organisme} » est prêt : commencez par créer une formation.",
+            "/dashboard/admin",
+            tenant=demande.tenant,
         )
+
+        admins = list(Utilisateur.objects.filter(est_admin_saas=True, actif=True))
+        emails_admins = [a.email for a in admins]
         if emails_admins:
             responsable = f"{demande.responsable_prenom} {demande.responsable_nom}"
+            notifier(
+                admins,
+                Notification.Type.INSCRIPTION,
+                f"Nouvel organisme : {demande.nom_organisme}",
+                f"Inscrit par {responsable}, paiement de {paiement.montant} FCFA reçu.",
+                f"/admin/organismes/{demande.tenant.id}",
+            )
             transaction.on_commit(
                 lambda: envoyer_email_nouvel_organisme.delay(
                     emails_admins, demande.nom_organisme, responsable, paiement.montant,

@@ -2,6 +2,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AnalyseAccompagnementViewSet,
     AssignationViewSet,
     BriefViewSet,
     CategorieBriefViewSet,
@@ -41,6 +42,7 @@ router.register(
 router.register("evaluations", EvaluationViewSet, basename="evaluation")
 router.register("progression", ProgressionViewSet, basename="progression")
 router.register("commentaires", CommentairePairViewSet, basename="commentaire")
+router.register("analyses-accompagnement", AnalyseAccompagnementViewSet, basename="analyse-accompagnement")
 
 urlpatterns = [
     path(
