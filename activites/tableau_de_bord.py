@@ -38,6 +38,7 @@ ETATS_RENDUS = (A_EVALUER, VALIDE, NON_VALIDE)
 NB_ELEMENTS_LISTE = 6
 NB_APPRENANTS_A_SUIVRE = 5
 NB_RECENTS = 3
+NB_COMPETENCES_FAIBLES = 5
 ECHEANCES_PASSEES_JOURS = 3
 ECHEANCES_A_VENIR_JOURS = 14
 JOURS_ACTIVITE = 14
@@ -305,6 +306,9 @@ def tableau_de_bord_formateur(user, tenant_id):
                 "actif": p.actif,
                 "nb_apprenants": len(analyse.inscrits.get(p.id, {})),
                 "competences_pct": analyse.competences_pct_promotion(p),
+                "evolution": (
+                    progression.evolution_promotion(p, analyse.inscrits.get(p.id, {}), maintenant) if p.actif else []
+                ),
             }
             for p in promotions
         ],
@@ -312,6 +316,81 @@ def tableau_de_bord_formateur(user, tenant_id):
 
 
 # ─── Admin organisme ──────────────────────────────────────────────────────────
+
+def _bilan_formations(promotions, analyse):
+    """Par formation (promotions ouvertes) : promotions, apprenants, compétences acquises, taux de rendu."""
+    par_formation = {}
+    for p in promotions:
+        par_formation.setdefault(p.formation_id, []).append(p)
+    return sorted(
+        (
+            {
+                "id": formation_id,
+                "nom": ps[0].formation.nom,
+                "promotions": len(ps),
+                "apprenants": sum(len(analyse.inscrits.get(p.id, {})) for p in ps),
+                "competences_pct": _moyenne([
+                    analyse.competences_pct(p, apprenant_id)
+                    for p in ps
+                    for apprenant_id in analyse.inscrits.get(p.id, {})
+                ]),
+                "taux_rendu": analyse.taux_rendu({p.id for p in ps}),
+            }
+            for formation_id, ps in par_formation.items()
+        ),
+        key=lambda f: f["nom"],
+    )
+
+
+def _competences_moins_acquises(analyse, maintenant):
+    """
+    Compétences visées par des briefs échus : part des apprenants concernés
+    (assignés, toujours inscrits) qui les ont validées, les plus faibles d'abord.
+    Les compétences pas encore travaillées n'y figurent pas.
+    """
+    concernes = {}  # competence_niveau_id → {apprenant_id}
+    for a, _, _ in analyse.rendus:
+        brief = a.brief
+        if brief.date_limite >= maintenant:
+            continue
+        inscrits = analyse.inscrits.get(brief.promotion_id, {})
+        if a.groupe_id:
+            apprenants = {m.apprenant_id for m in a.groupe.membres.all() if m.actif}
+        else:
+            apprenants = {a.apprenant_id}
+        apprenants &= set(inscrits)
+        for cn in brief.competence_niveaux.all():
+            concernes.setdefault(cn.id, set()).update(apprenants)
+
+    tous = set().union(*concernes.values()) if concernes else set()
+    validees = set(
+        CompetenceValidee.objects.filter(competence_niveau_id__in=concernes, apprenant_id__in=tous)
+        .values_list("competence_niveau_id", "apprenant_id")
+    )
+    lignes = sorted(
+        (
+            (cn_id, len(apprenants), _pourcentage(sum(1 for x in apprenants if (cn_id, x) in validees), len(apprenants)))
+            for cn_id, apprenants in concernes.items()
+            if apprenants
+        ),
+        key=lambda l: (l[2], -l[1]),
+    )[:NB_COMPETENCES_FAIBLES]
+    details = CompetenceNiveau.objects.select_related("competence__module__formation", "niveau").in_bulk(
+        [l[0] for l in lignes]
+    )
+    return [
+        {
+            "id": cn_id,
+            "competence": details[cn_id].competence.nom,
+            "niveau": details[cn_id].niveau.nom,
+            "module": details[cn_id].competence.module.nom,
+            "formation": details[cn_id].competence.module.formation.nom,
+            "apprenants": nb,
+            "pct": pct,
+        }
+        for cn_id, nb, pct in lignes
+    ]
+
 
 def tableau_de_bord_admin(tenant_id):
     maintenant = timezone.now()
@@ -401,9 +480,12 @@ def tableau_de_bord_admin(tenant_id):
                     if etat == A_EVALUER and a.brief.promotion_id == p.id
                 ),
                 "a_risque": a_risque.get(p.id, 0),
+                "evolution": progression.evolution_promotion(p, analyse.inscrits.get(p.id, {}), maintenant),
             }
             for p in promotions
         ],
+        "formations": _bilan_formations(promotions, analyse),
+        "competences_moins_acquises": _competences_moins_acquises(analyse, maintenant),
         "activite": activite,
         "attention": {
             "invitations_en_attente": invitations.count(),
@@ -531,6 +613,7 @@ def tableau_de_bord_apprenant(user, tenant_id):
             ),
         },
         "progression": progression.resume(user, promotion),
+        "evolution": progression.evolution(user, promotion, maintenant),
         "a_rendre": a_rendre[:NB_ELEMENTS_LISTE],
         "quiz_a_faire": quiz_a_faire,
         "evaluations_recentes": [resume_evaluation(e) for e in evaluations],
