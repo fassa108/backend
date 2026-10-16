@@ -751,8 +751,17 @@ class ProgressionViewSet(viewsets.ViewSet):
             autorisees = self._promotions_autorisees(tenant_id)
             if autorisees is not None and inscription.promotion_id not in autorisees:
                 raise NotFound("Apprenant introuvable.")
-            # Formateur et admin : signalement de décrochage en cours (jamais montré à l'apprenant)
-            return Response({**self._detail(inscription), "decrochage": self._decrochage(inscription)})
+            # Formateur et admin : signalement de décrochage en cours (jamais montré
+            # à l'apprenant) et courbe moyenne de la promotion, pour comparer
+            promotion = inscription.promotion
+            inscrits = InscriptionPromotion.objects.filter(
+                promotion=promotion, actif=True
+            ).values_list("apprenant_id", flat=True)
+            return Response({
+                **self._detail(inscription),
+                "decrochage": self._decrochage(inscription),
+                "evolution_promotion": progression.evolution_promotion(promotion, inscrits),
+            })
         return Response(self._detail(inscription))
 
     def _decrochage(self, inscription):

@@ -2642,3 +2642,94 @@ class ActiviteFormateurTests(ActivitesBaseTestCase):
     def test_reserve_au_formateur(self):
         for u in (self.admin, self.apprenant):
             self.assertEqual(self.activite(u).status_code, status.HTTP_403_FORBIDDEN, u.email)
+
+
+# ─── Évolution et vue d'ensemble ──────────────────────────────────────────────
+
+class EvolutionTests(ActivitesBaseTestCase):
+    """Promotion commencée il y a 3 semaines ; référentiel de 2 compétences."""
+
+    def setUp(self):
+        super().setUp()
+        aujourd_hui = timezone.localdate()
+        Promotion.objects.filter(pk=self.promotion.pk).update(date_debut=aujourd_hui - timedelta(weeks=3))
+        self.promo = Promotion.objects.get(pk=self.promotion.pk)
+
+    def valider(self, apprenant, cn, il_y_a_jours):
+        v = CompetenceValidee.objects.create(apprenant=apprenant, competence_niveau=cn)
+        CompetenceValidee.objects.filter(pk=v.pk).update(date_validation=timezone.now() - timedelta(days=il_y_a_jours))
+
+    def test_courbe_d_un_apprenant(self):
+        from .progression import evolution
+
+        self.valider(self.apprenant, self.cn, 10)
+        self.valider(self.apprenant, self.cn_module_2, 0)
+        points = evolution(self.apprenant, self.promo)
+        self.assertIn(len(points), (4, 5))  # semaines entamées depuis le début
+        self.assertEqual(points[0]["semaine"].weekday(), 0)  # chaque point est un lundi
+        self.assertEqual(points[0]["pct"], 0)
+        self.assertEqual((points[-1]["validees"], points[-1]["pct"]), (2, 100))
+        self.assertEqual([p["validees"] for p in points], sorted(p["validees"] for p in points))
+
+    def test_promotion_pas_commencee(self):
+        from .progression import evolution
+
+        Promotion.objects.filter(pk=self.promotion.pk).update(date_debut=timezone.localdate() + timedelta(days=10))
+        self.assertEqual(evolution(self.apprenant, Promotion.objects.get(pk=self.promotion.pk)), [])
+
+    def test_moyenne_de_la_promotion(self):
+        from .progression import evolution_promotion
+
+        self.valider(self.apprenant, self.cn, 0)  # 50 % pour l'un, 0 % pour l'autre
+        points = evolution_promotion(self.promo, [self.apprenant.id, self.apprenant_b.id])
+        self.assertEqual(points[-1]["pct"], 25)
+
+    def test_dans_les_api(self):
+        self.valider(self.apprenant, self.cn, 0)
+        res = self.client.get(self.url("progression", self.apprenant.id))
+        self.assertEqual(res.data["evolution"][-1]["pct"], 50)
+        self.assertEqual(res.data["evolution_promotion"][-1]["pct"], 25)
+
+        res = self.client.get(reverse("tableau-de-bord-formateur", kwargs={"tenant_id": self.tenant.id}))
+        promo = next(p for p in res.data["promotions"] if p["id"] == self.promotion.id)
+        self.assertEqual(promo["evolution"][-1]["pct"], 25)
+
+        self.client.force_authenticate(user=self.apprenant)
+        res = self.client.get(f"/api/tenants/{self.tenant.id}/progression/moi/")
+        self.assertEqual(res.data["evolution"][-1]["pct"], 50)
+        self.assertNotIn("evolution_promotion", res.data)
+
+
+class VueEnsembleAdminTests(ActivitesBaseTestCase):
+    def setUp(self):
+        super().setUp()
+        maintenant = timezone.now()
+        echu = self.creer_brief(date_debut=maintenant - timedelta(days=10), date_limite=maintenant - timedelta(days=2))
+        echu.competence_niveaux.set([self.cn, self.cn_module_2])
+        a_venir = self.creer_brief()
+        a_venir.competence_niveaux.set([self.cn_autre_formation])
+        for apprenant in (self.apprenant, self.apprenant_b):
+            Assignation.objects.create(brief=echu, apprenant=apprenant)
+            Assignation.objects.create(brief=a_venir, apprenant=apprenant)
+        # « Développer une API » acquise par les deux, « Modéliser » par un seul
+        for apprenant in (self.apprenant, self.apprenant_b):
+            CompetenceValidee.objects.create(apprenant=apprenant, competence_niveau=self.cn)
+        CompetenceValidee.objects.create(apprenant=self.apprenant, competence_niveau=self.cn_module_2)
+        self.client.force_authenticate(user=self.admin)
+        self.donnees = self.client.get(reverse("tableau-de-bord-admin", kwargs={"tenant_id": self.tenant.id})).data
+
+    def test_competences_les_moins_acquises(self):
+        faibles = self.donnees["competences_moins_acquises"]
+        self.assertEqual([(c["competence"], c["pct"], c["apprenants"]) for c in faibles],
+                         [("Modéliser", 50, 2), ("Développer une API", 100, 2)])
+        self.assertEqual(faibles[0]["module"], "Base de données")
+        # Compétence d'un brief pas encore échu : absente
+
+    def test_bilan_par_formation(self):
+        web = next(f for f in self.donnees["formations"] if f["nom"] == "Formation Web")
+        self.assertEqual((web["promotions"], web["apprenants"], web["competences_pct"]), (2, 2, 75))
+        self.assertEqual(web["taux_rendu"], 0)
+
+    def test_courbe_par_promotion(self):
+        promo = next(p for p in self.donnees["promotions"] if p["id"] == self.promotion.id)
+        self.assertIn("evolution", promo)

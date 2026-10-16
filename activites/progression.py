@@ -8,7 +8,10 @@ Progression d'un apprenant dans sa promotion.
   juge acquises toutes les compétences visées.
 """
 
+from datetime import datetime, time, timedelta
+
 from django.db.models import Prefetch, Q
+from django.utils import timezone
 
 from pedagogie.models import CompetenceNiveau, InscriptionPromotion
 
@@ -132,4 +135,71 @@ def detail(apprenant, promotion):
             {**m, "competences": list(m["competences"].values())} for m in modules.values()
         ],
         "briefs": etats,
+        "evolution": evolution(apprenant, promotion),
     }
+
+
+# ─── Évolution dans le temps (courbes) ────────────────────────────────────────
+
+NB_SEMAINES_MAX = 52
+
+
+def _fins_de_semaine(promotion, maintenant):
+    """
+    (lundi, fin) de chaque semaine depuis le début de la promotion jusqu'à
+    aujourd'hui (les NB_SEMAINES_MAX dernières) ; la semaine en cours finit
+    maintenant. Vide si la promotion n'a pas commencé.
+    """
+    aujourd_hui = timezone.localdate(maintenant)
+    lundi = promotion.date_debut - timedelta(days=promotion.date_debut.weekday())
+    semaines = []
+    while lundi <= aujourd_hui:
+        fin = timezone.make_aware(datetime.combine(lundi + timedelta(days=7), time.min))
+        semaines.append((lundi, min(fin, maintenant)))
+        lundi += timedelta(days=7)
+    return semaines[-NB_SEMAINES_MAX:]
+
+
+def evolution_apprenants(promotion, apprenant_ids, maintenant=None):
+    """
+    Semaine par semaine, compétences du référentiel validées (cumul) par
+    apprenant : (semaines, {apprenant_id: [nb, …]}, total du référentiel).
+    """
+    maintenant = maintenant or timezone.now()
+    semaines = _fins_de_semaine(promotion, maintenant)
+    referentiel = _referentiel(promotion)
+    dates = {}
+    for apprenant_id, date in CompetenceValidee.objects.filter(
+        apprenant_id__in=apprenant_ids, competence_niveau__in=referentiel
+    ).values_list("apprenant_id", "date_validation"):
+        dates.setdefault(apprenant_id, []).append(date)
+    cumuls = {
+        a: [sum(1 for d in dates.get(a, []) if d <= fin) for _, fin in semaines]
+        for a in apprenant_ids
+    }
+    return semaines, cumuls, referentiel.count()
+
+
+def _pct(valeur, total):
+    return round(100 * valeur / total) if total else 0
+
+
+def evolution(apprenant, promotion, maintenant=None):
+    """Courbe d'un apprenant : [{semaine, validees, pct}]."""
+    semaines, cumuls, total = evolution_apprenants(promotion, [apprenant.id], maintenant)
+    return [
+        {"semaine": lundi, "validees": n, "pct": _pct(n, total)}
+        for (lundi, _), n in zip(semaines, cumuls[apprenant.id])
+    ]
+
+
+def evolution_promotion(promotion, apprenant_ids, maintenant=None):
+    """Courbe moyenne d'une promotion : [{semaine, pct}] (moyenne des apprenants)."""
+    semaines, cumuls, total = evolution_apprenants(promotion, list(apprenant_ids), maintenant)
+    return [
+        {
+            "semaine": lundi,
+            "pct": round(sum(_pct(c[i], total) for c in cumuls.values()) / len(cumuls)) if cumuls else 0,
+        }
+        for i, (lundi, _) in enumerate(semaines)
+    ]
