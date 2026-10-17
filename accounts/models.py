@@ -4,7 +4,6 @@ from django.db.models.functions import Lower
 
 import uuid
 from django.utils import timezone
-from datetime import timedelta
 
 class UtilisateurManager(BaseUserManager):
     """

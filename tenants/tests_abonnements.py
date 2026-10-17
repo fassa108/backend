@@ -16,7 +16,6 @@ from django.utils import timezone
 from openpyxl import load_workbook
 from rest_framework import status
 
-from accounts.models import MembreTenant
 from notifications.models import Notification
 
 from .abonnements import abonnement_de, ajouter_un_mois, verifier_abonnements

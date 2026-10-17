@@ -16,7 +16,6 @@ Un apprenant inscrit depuis moins de DELAI_GRACE_JOURS jours n'est jamais signal
 """
 
 import html
-from datetime import timedelta
 
 from django.utils import timezone
 from django.utils.html import strip_tags

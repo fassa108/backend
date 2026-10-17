@@ -22,8 +22,8 @@ from rest_framework import status
 
 from accounts.models import MembreTenant
 from activites.models import Assignation, FichierLivrable, Ressource
-from activites.tests import CONTENU_VALIDE, ActivitesBaseTestCase, fichier_test
-from pedagogie.models import FormateurPromotion, InscriptionPromotion, Promotion
+from activites.tests import ActivitesBaseTestCase, fichier_test
+from pedagogie.models import FormateurPromotion, InscriptionPromotion
 
 from .models import FichierSource, Option, Question, SupportRevision, Tentative
 from .tasks import MESSAGE_GENERAL, generer_support

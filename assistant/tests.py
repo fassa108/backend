@@ -6,10 +6,8 @@ seulement, limites (longueur, une réponse à la fois, questions par jour),
 contexte envoyé au service IA (anonymisé), réponse et échec.
 """
 
-from datetime import timedelta
 from unittest.mock import patch
 
-from django.utils import timezone
 from rest_framework import status
 
 from activites.models import Assignation, Evaluation
