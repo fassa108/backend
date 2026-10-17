@@ -475,6 +475,26 @@ class InscriptionPromotionTests(PedagogieBaseTestCase):
         )
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
 
+    def test_inscription_groupee_avec_refus_individuels(self):
+        self.client.force_authenticate(user=self.admin_t1)
+        url = f"/api/tenants/{self.tenant_1.id}/promotions/{self.promo.id}/inscrire-apprenants/"
+        res = self.client.post(
+            url, {"apprenant_ids": [self.apprenant_t1.id, self.apprenant_inactif.id, self.formateur_t1.id, 999999]},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            sorted(i["apprenant"] for i in res.data["inscrits"]), sorted([self.apprenant_t1.id, self.apprenant_inactif.id])
+        )
+        self.assertEqual(
+            [e["message"] for e in res.data["erreurs"]],
+            ["L'utilisateur doit être un apprenant actif de cet organisme.", "Apprenant introuvable."],
+        )
+        # Déjà inscrit : refusé, sans erreur serveur
+        res = self.client.post(url, {"apprenant_ids": [self.apprenant_t1.id]}, format="json")
+        self.assertEqual(res.data["erreurs"][0]["message"], "L'apprenant est déjà inscrit dans cette promotion.")
+        self.assertEqual(self.client.post(url, {"apprenant_ids": []}, format="json").status_code, status.HTTP_400_BAD_REQUEST)
+
     def test_inscription_non_apprenant_refuse(self):
         self.client.force_authenticate(user=self.admin_t1)
         res = self.client.post(

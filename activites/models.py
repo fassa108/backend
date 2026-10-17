@@ -10,7 +10,6 @@ from django.utils import timezone
 from pedagogie.models import (
     CompetenceNiveau,
     Groupe,
-    InscriptionPromotion,
     Module,
     Promotion,
 )
