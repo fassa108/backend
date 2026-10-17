@@ -10,8 +10,9 @@ Couvre :
 - Génération du code
 """
 
+import hashlib
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import patch
 
 from django.core import mail
@@ -25,8 +26,9 @@ from accounts.models import AccountActivationToken, MembreTenant, Utilisateur
 from notifications.models import Notification
 from pedagogie.models import Formation, Promotion
 from .models import DemandeInscription, Paiement, Tenant
-from .serializers import PaiementSerializer
-from .tasks import envoyer_email_nouvel_organisme
+from . import paydunya
+from .paydunya import PayDunyaIndisponible
+from .tasks import envoyer_email_lien_paiement, envoyer_email_nouvel_organisme, envoyer_email_paiement_confirme
 
 
 class TenantsBaseTestCase(APITestCase):
@@ -345,9 +347,22 @@ class SuppressionTenantTests(TenantsBaseTestCase):
         self.assertEqual(r.status_code, status.HTTP_403_FORBIDDEN)
 
 
-# ─── Inscriptions d'organismes (dépôt + paiement simulé) ──────────────────────
+# ─── Inscriptions d'organismes (dépôt + paiement PayDunya) ────────────────────
+
+def facture_payee(status="completed", montant=25000, jeton="test_jeton"):
+    """Réponse de PayDunya à la confirmation d'une facture."""
+    return {
+        "response_code": "00",
+        "status": status,
+        "invoice": {"token": jeton, "total_amount": str(montant)},
+        "customer": {"name": "Fatou Ba", "phone": "+221780001122"},
+        "receipt_url": f"https://paydunya.com/receipt/{jeton}",
+    }
+
 
 @override_settings(PRIX_ABONNEMENT_FCFA=25000)
+@patch("tenants.views.envoyer_email_lien_paiement.delay")
+@patch("tenants.services.envoyer_email_paiement_confirme.delay")
 @patch("tenants.services.envoyer_email_nouvel_organisme.delay")
 @patch("tenants.services.envoyer_email_organisme_cree.delay")
 @patch("accounts.services.envoyer_email_activation.delay")
@@ -384,9 +399,25 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
     def url_paiement(self, demande):
         return f"{self.url_demandes}paiement/{demande.reference}/"
 
-    def payer(self, demande, moyen="WAVE", telephone="77 123 45 67"):
-        with self.captureOnCommitCallbacks(execute=True):
-            return self.client.post(self.url_paiement(demande), {"moyen": moyen, "telephone": telephone})
+    def initier(self, demande, jeton="test_jeton"):
+        """POST paiement/ : facture PayDunya simulée."""
+        url = f"https://app.paydunya.com/sandbox-checkout/invoice/{jeton}"
+        with patch("tenants.services.paydunya.creer_facture", return_value=(jeton, url)) as creer:
+            reponse = self.client.post(self.url_paiement(demande))
+        self.creer_facture = creer
+        return reponse
+
+    def confirmer(self, demande, jeton="test_jeton", facture=None):
+        """Retour de PayDunya : la facture est relue (simulée) chez PayDunya."""
+        with patch("tenants.services.paydunya.confirmer", return_value=facture or facture_payee()) as lire, \
+                self.captureOnCommitCallbacks(execute=True):
+            reponse = self.client.post(f"{self.url_paiement(demande)}confirmer/", {"token": jeton})
+        self.lire_facture = lire
+        return reponse
+
+    def payer(self, demande, jeton="test_jeton", facture=None):
+        self.initier(demande, jeton)
+        return self.confirmer(demande, jeton, facture)
 
     # Dépôt public
 
@@ -447,22 +478,46 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertEqual(r.data, {
             "nom_organisme": "Organisme Gamma", "email": "fatou.ba@gamma.test",
-            "statut": "EN_ATTENTE_PAIEMENT", "montant": 25000,
+            "statut": "EN_ATTENTE_PAIEMENT", "montant": 25000, "mode_test": True, "paiement": None,
         })
 
     def test_reference_inconnue(self, *mocks):
         r = self.client.get(f"{self.url_demandes}paiement/{uuid.uuid4()}/")
         self.assertEqual(r.status_code, status.HTTP_404_NOT_FOUND)
 
-    def test_paiement_cree_organisme_et_invite_le_responsable(self, activation, cree, nouvel):
-        d = self.demande(telephone="+221 33 800 00 00")
-        r = self.payer(d, moyen="ORANGE_MONEY", telephone="+221 78 000 11 22")
+    # Paiement PayDunya
+
+    @override_settings(FRONTEND_URL="https://eduhub.test", BACKEND_URL="https://api.eduhub.test")
+    def test_initier_cree_la_facture_et_renvoie_la_page_paydunya(self, *mocks):
+        d = self.demande(telephone="+221 77 000 00 00")
+        r = self.initier(d)
 
         self.assertEqual(r.status_code, status.HTTP_201_CREATED)
-        self.assertTrue(r.data["reference_transaction"].startswith("OM-"))
+        self.assertEqual(r.data["url"], "https://app.paydunya.com/sandbox-checkout/invoice/test_jeton")
+        paiement = Paiement.objects.get()
+        self.assertEqual((paiement.statut, paiement.reference_transaction, paiement.montant), ("EN_ATTENTE", "test_jeton", 25000))
+        facture = self.creer_facture.call_args.kwargs
+        self.assertEqual(facture["montant"], 25000)
+        self.assertEqual(facture["return_url"], f"https://eduhub.test/inscription/paiement/{d.reference}/retour")
+        self.assertEqual(facture["cancel_url"], f"https://eduhub.test/inscription/paiement/{d.reference}?annule=1")
+        self.assertEqual(facture["callback_url"], "https://api.eduhub.test/api/demandes-inscription/paydunya/ipn/")
+        self.assertEqual(facture["client"], {"name": "Fatou Ba", "email": "fatou.ba@gamma.test", "phone": "+221 77 000 00 00"})
+        # Rien n'est créé tant que PayDunya n'a pas confirmé
+        d.refresh_from_db()
+        self.assertEqual(d.statut, DemandeInscription.Statut.EN_ATTENTE_PAIEMENT)
+
+    def test_paiement_cree_organisme_et_invite_le_responsable(self, activation, cree, nouvel, *emails):
+        d = self.demande(telephone="+221 33 800 00 00")
+        r = self.payer(d)
+
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual((r.data["statut"], r.data["moyen_libelle"]), ("REUSSI", "PayDunya"))
+        self.lire_facture.assert_called_once_with("test_jeton")
         d.refresh_from_db()
         self.assertEqual(d.statut, DemandeInscription.Statut.PAYEE)
-        self.assertEqual((d.paiement.montant, d.paiement.moyen, d.paiement.telephone), (25000, "ORANGE_MONEY", "+221780001122"))
+        paiement = d.paiement_reussi
+        self.assertEqual((paiement.telephone, paiement.url_recu), ("+221780001122", "https://paydunya.com/receipt/test_jeton"))
+        self.assertIsNotNone(paiement.date_confirmation)
         self.assertEqual((d.tenant.nom, d.tenant.telephone), ("Organisme Gamma", "+221 33 800 00 00"))
         membre = MembreTenant.objects.get(tenant=d.tenant)
         self.assertEqual(membre.role, MembreTenant.Role.ADMINISTRATEUR)
@@ -471,6 +526,7 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         activation.assert_called_once()
         cree.assert_not_called()
         nouvel.assert_called_once_with(["saas@test.com"], "Organisme Gamma", "Fatou Ba", 25000)
+        self.assertEqual(self.client.get(self.url_paiement(d)).data["statut"], "PAYEE")
 
     def test_paiement_notifie_le_responsable_et_l_admin_saas(self, *mocks):
         d = self.demande()
@@ -483,9 +539,9 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         self.assertIsNone(saas.tenant)
         self.assertEqual(saas.lien, f"/admin/organismes/{d.tenant.id}")
 
-    def test_paiement_avec_compte_existant(self, activation, cree, nouvel):
+    def test_paiement_avec_compte_existant(self, activation, cree, nouvel, *emails):
         d = self.demande(email="admin.beta@test.com")
-        self.assertEqual(self.payer(d).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.payer(d).status_code, status.HTTP_200_OK)
         d.refresh_from_db()
         self.assertTrue(MembreTenant.objects.filter(
             tenant=d.tenant, utilisateur=self.admin_autre, role=MembreTenant.Role.ADMINISTRATEUR,
@@ -493,49 +549,150 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         activation.assert_not_called()
         cree.assert_called_once_with("admin.beta@test.com", "Organisme Gamma")
 
-    def test_paiement_avec_compte_jamais_active(self, activation, cree, nouvel):
+    def test_paiement_avec_compte_jamais_active(self, activation, cree, nouvel, *emails):
         Utilisateur.objects.create_user(email="inactif@test.com", nom="Sy", prenom="Ali")
         d = self.demande(email="inactif@test.com")
-        self.assertEqual(self.payer(d).status_code, status.HTTP_201_CREATED)
+        self.assertEqual(self.payer(d).status_code, status.HTTP_200_OK)
         activation.assert_called_once()
         cree.assert_not_called()
 
-    def test_numero_mobile_senegalais_obligatoire(self, *mocks):
+    def test_paiement_annule_puis_nouvelle_tentative(self, *mocks):
         d = self.demande()
-        for numero in ("", "33 800 00 00", "77 123 45", "+33 6 12 34 56 78"):
-            r = self.payer(d, telephone=numero)
-            self.assertIn("telephone", r.data, numero)
-        for numero in ("771234567", "+221 76 123 45 67", "00221 70.123.45.67"):
-            self.assertEqual(
-                PaiementSerializer(data={"moyen": "WAVE", "telephone": numero}).is_valid(), True, numero,
-            )
-        self.assertFalse(Paiement.objects.exists())
+        r = self.payer(d, facture=facture_payee(status="cancelled"))
+        self.assertEqual(r.data["statut"], "ANNULE")
+        d.refresh_from_db()
+        self.assertEqual(d.statut, DemandeInscription.Statut.EN_ATTENTE_PAIEMENT)
+        self.assertFalse(Tenant.objects.filter(nom="Organisme Gamma").exists())
 
-    def test_moyen_de_paiement_inconnu(self, *mocks):
-        r = self.payer(self.demande(), moyen="CARTE")
-        self.assertIn("moyen", r.data)
+        self.assertEqual(self.payer(d, jeton="test_jeton_2").data["statut"], "REUSSI")
+        self.assertEqual(list(d.paiements.values_list("statut", flat=True)), ["REUSSI", "ANNULE"])
+
+    def test_paiement_encore_en_attente(self, *mocks):
+        d = self.demande()
+        r = self.payer(d, facture=facture_payee(status="pending"))
+        self.assertEqual(r.data["statut"], "EN_ATTENTE")
+        self.assertFalse(Tenant.objects.filter(nom="Organisme Gamma").exists())
+
+    def test_montant_different_refuse(self, *mocks):
+        d = self.demande()
+        r = self.payer(d, facture=facture_payee(montant=100))
+        self.assertEqual(r.data["statut"], "ECHEC")
+        self.assertFalse(Tenant.objects.filter(nom="Organisme Gamma").exists())
+
+    def test_confirmation_en_double_un_seul_organisme(self, *mocks):
+        d = self.demande()
+        self.payer(d)
+        r = self.confirmer(d)
+        self.assertEqual(r.data["statut"], "REUSSI")
+        self.lire_facture.assert_not_called()  # déjà confirmé : PayDunya n'est pas relu
+        self.assertEqual(Tenant.objects.filter(nom="Organisme Gamma").count(), 1)
+
+    def test_jeton_d_une_autre_inscription(self, *mocks):
+        d = self.demande()
+        self.initier(d)
+        autre = self.demande(nom_organisme="Organisme Delta")
+        self.assertEqual(self.confirmer(autre).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.post(f"{self.url_paiement(d)}confirmer/", {}).status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_paydunya_indisponible(self, *mocks):
+        d = self.demande()
+        with patch("tenants.services.paydunya.creer_facture", side_effect=PayDunyaIndisponible("panne")):
+            r = self.client.post(self.url_paiement(d))
+        self.assertEqual(r.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertIn("indisponible", r.data["detail"])
+        self.assertFalse(Paiement.objects.exists())
 
     def test_paiement_une_seule_fois(self, *mocks):
         d = self.demande()
-        self.assertEqual(self.payer(d).status_code, status.HTTP_201_CREATED)
-        r = self.payer(d)
+        self.payer(d)
+        r = self.initier(d, jeton="test_jeton_2")
         self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(Paiement.objects.count(), 1)
-        self.assertEqual(self.client.get(self.url_paiement(d)).data["statut"], "PAYEE")
 
     def test_paiement_refuse_si_nom_pris_entre_temps(self, *mocks):
         d = self.demande(nom_organisme="ORGANISME ALPHA")
-        r = self.payer(d)
+        r = self.initier(d)
         self.assertEqual(r.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(Paiement.objects.exists())
-        d.refresh_from_db()
-        self.assertEqual(d.statut, DemandeInscription.Statut.EN_ATTENTE_PAIEMENT)
 
     def test_paiement_limite_en_debit(self, *mocks):
         d = self.demande()
-        for _ in range(10):
-            self.payer(d, telephone="12")
-        self.assertEqual(self.payer(d).status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        for i in range(10):
+            self.initier(d, jeton=f"test_jeton_{i}")
+        self.assertEqual(self.initier(d, jeton="test_jeton_x").status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    # Paiement interrompu : lien par email, page rouverte, reçu
+
+    def test_depot_envoie_le_lien_de_paiement(self, *mocks):
+        with patch("tenants.views.envoyer_email_lien_paiement.delay") as lien, \
+                self.captureOnCommitCallbacks(execute=True):
+            self.deposer()
+        d = DemandeInscription.objects.get()
+        lien.assert_called_once_with("fatou.ba@gamma.test", "Fatou", "Organisme Gamma", str(d.reference), 25000)
+
+    def test_recu_envoye_au_responsable(self, *mocks):
+        d = self.demande()
+        with patch("tenants.services.envoyer_email_paiement_confirme.delay") as recu:
+            self.payer(d)
+        recu.assert_called_once_with(
+            "fatou.ba@gamma.test", "Organisme Gamma", 25000, "test_jeton",
+            "https://paydunya.com/receipt/test_jeton", str(d.reference),
+        )
+
+    def test_page_rouverte_rattrape_un_paiement_interrompu(self, *mocks):
+        # Payé chez PayDunya, mais la page a été fermée avant le retour sur EduHub
+        d = self.demande()
+        self.initier(d)
+        with patch("tenants.services.paydunya.confirmer", return_value=facture_payee()), \
+                self.captureOnCommitCallbacks(execute=True):
+            r = self.client.get(self.url_paiement(d))
+        self.assertEqual(r.data["statut"], "PAYEE")
+        self.assertEqual(r.data["paiement"]["reference_transaction"], "test_jeton")
+        self.assertTrue(Tenant.objects.filter(nom="Organisme Gamma").exists())
+
+    def test_page_rouverte_paydunya_injoignable(self, *mocks):
+        d = self.demande()
+        self.initier(d)
+        with patch("tenants.services.paydunya.confirmer", side_effect=PayDunyaIndisponible("panne")):
+            r = self.client.get(self.url_paiement(d))
+        self.assertEqual((r.status_code, r.data["statut"]), (status.HTTP_200_OK, "EN_ATTENTE_PAIEMENT"))
+
+    def test_tentative_expiree_non_relue(self, *mocks):
+        d = self.demande()
+        self.initier(d)
+        Paiement.objects.update(date_paiement=timezone.now() - timedelta(hours=25))
+        with patch("tenants.services.paydunya.confirmer") as lire:
+            self.client.get(self.url_paiement(d))
+        lire.assert_not_called()
+
+    def test_tentatives_abandonnees_annulees_apres_le_paiement(self, *mocks):
+        d = self.demande()
+        self.initier(d, jeton="test_abandon")
+        self.payer(d, jeton="test_paye")
+        self.assertEqual(
+            dict(d.paiements.values_list("reference_transaction", "statut")),
+            {"test_abandon": "ANNULE", "test_paye": "REUSSI"},
+        )
+
+    # Callback de PayDunya (production)
+
+    @override_settings(PAYDUNYA_MASTER_KEY="cle-principale")
+    def test_callback_authentifie_confirme_le_paiement(self, *mocks):
+        d = self.demande()
+        self.initier(d)
+        url = f"{self.url_demandes}paydunya/ipn/"
+        with patch("tenants.services.paydunya.confirmer", return_value=facture_payee()), \
+                self.captureOnCommitCallbacks(execute=True):
+            refus = self.client.post(url, {"data[hash]": "faux", "data[invoice][token]": "test_jeton"})
+            r = self.client.post(url, {
+                "data[hash]": hashlib.sha512(b"cle-principale").hexdigest(),
+                "data[invoice][token]": "test_jeton",
+                "data[status]": "completed",
+            })
+        self.assertEqual(refus.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        d.refresh_from_db()
+        self.assertEqual(d.statut, DemandeInscription.Statut.PAYEE)
 
     # Historique réservé à l'admin SaaS
 
@@ -547,7 +704,8 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         self.client.force_authenticate(self.admin_saas)
         r = self.client.get(self.url_demandes)
         self.assertEqual(r.status_code, status.HTTP_200_OK)
-        self.assertEqual(r.data[0]["paiement"]["moyen_libelle"], "Wave")
+        self.assertEqual(r.data[0]["paiement"]["moyen_libelle"], "PayDunya")
+        self.assertEqual(r.data[0]["paiement"]["reference_transaction"], "test_jeton")
 
     def test_filtre_par_statut(self, *mocks):
         self.demande()
@@ -557,6 +715,51 @@ class InscriptionOrganismeTests(TenantsBaseTestCase):
         self.assertEqual([d["nom_organisme"] for d in r.data], ["Organisme Delta"])
 
 
+@override_settings(PAYDUNYA_MODE="test", PAYDUNYA_MASTER_KEY="m", PAYDUNYA_PRIVATE_KEY="p", PAYDUNYA_TOKEN="t")
+@patch("tenants.paydunya.requests.request")
+class ClientPayDunyaTests(APITestCase):
+    def reponse(self, requete, code=200, **donnees):
+        requete.return_value.status_code = code
+        requete.return_value.json.return_value = donnees
+
+    def test_creer_facture_en_sandbox(self, requete):
+        self.reponse(requete, response_code="00", response_text="https://paydunya.com/checkout/t1", token="t1")
+        jeton, url = paydunya.creer_facture(
+            montant=25000, description="Abonnement", client={"name": "A"},
+            return_url="r", cancel_url="c", callback_url="cb", custom_data={},
+        )
+        self.assertEqual((jeton, url), ("t1", "https://paydunya.com/checkout/t1"))
+        methode, adresse = requete.call_args.args
+        self.assertEqual((methode, adresse), ("POST", "https://app.paydunya.com/sandbox-api/v1/checkout-invoice/create"))
+        entetes = requete.call_args.kwargs["headers"]
+        self.assertEqual(
+            (entetes["PAYDUNYA-MASTER-KEY"], entetes["PAYDUNYA-PRIVATE-KEY"], entetes["PAYDUNYA-TOKEN"]), ("m", "p", "t"),
+        )
+        self.assertEqual(requete.call_args.kwargs["json"]["invoice"]["total_amount"], 25000)
+
+    @override_settings(PAYDUNYA_MODE="live")
+    def test_confirmer_en_production(self, requete):
+        self.reponse(requete, response_code="00", status="completed")
+        self.assertEqual(paydunya.confirmer("t1")["status"], "completed")
+        self.assertEqual(requete.call_args.args[1], "https://app.paydunya.com/api/v1/checkout-invoice/confirm/t1")
+
+    def test_refus_de_paydunya(self, requete):
+        self.reponse(requete, code=422, response_code="1001", response_text="Clés invalides")
+        with self.assertRaisesMessage(PayDunyaIndisponible, "Clés invalides"):
+            paydunya.confirmer("t1")
+
+    @override_settings(PAYDUNYA_MASTER_KEY="")
+    def test_cles_absentes(self, requete):
+        with self.assertRaises(PayDunyaIndisponible):
+            paydunya.confirmer("t1")
+        requete.assert_not_called()
+
+    def test_hash(self, requete):
+        self.assertTrue(paydunya.hash_valide(hashlib.sha512(b"m").hexdigest()))
+        self.assertFalse(paydunya.hash_valide("abc"))
+        self.assertFalse(paydunya.hash_valide(None))
+
+
 class EmailsInscriptionTests(TenantsBaseTestCase):
     def test_email_admins_echappe_le_nom(self):
         envoyer_email_nouvel_organisme(["saas@test.com"], "<b>Gamma</b>", "Fatou Ba", 25000)
@@ -564,3 +767,16 @@ class EmailsInscriptionTests(TenantsBaseTestCase):
         html = mail.outbox[0].alternatives[0][0]
         self.assertIn("&lt;b&gt;Gamma&lt;/b&gt;", html)
         self.assertIn("25000 FCFA", mail.outbox[0].body)
+
+
+class EmailsPaiementTests(TenantsBaseTestCase):
+    def test_lien_de_paiement(self):
+        envoyer_email_lien_paiement("fatou@test.com", "Fatou", "Gamma", "abc", 25000)
+        self.assertIn("/inscription/paiement/abc", mail.outbox[0].body)
+        self.assertIn("25000 FCFA", mail.outbox[0].body)
+
+    def test_paiement_confirme_avec_recu(self):
+        envoyer_email_paiement_confirme("fatou@test.com", "Gamma", 25000, "test_x", "https://paydunya.com/r/x", "abc")
+        self.assertEqual(mail.outbox[0].subject, "Paiement confirmé : abonnement EduHub de Gamma")
+        self.assertIn("test_x", mail.outbox[0].body)
+        self.assertIn("https://paydunya.com/r/x", mail.outbox[0].body)

@@ -8,6 +8,9 @@ ORGANISME_SUSPENDU_MESSAGE = "Cet organisme est suspendu."
 MEMBRE_SUSPENDU_CODE = "membre_suspendu"
 MEMBRE_SUSPENDU_MESSAGE = "Votre accès à cet organisme a été suspendu."
 
+ABONNEMENT_EXPIRE_CODE = "abonnement_expire"
+ABONNEMENT_EXPIRE_MESSAGE = "L'abonnement de cet organisme a expiré."
+
 
 class OrganismeSuspendu(APIException):
     """

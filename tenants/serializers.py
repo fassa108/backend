@@ -292,37 +292,42 @@ class InscriptionAPayerSerializer(serializers.ModelSerializer):
     """Page de paiement (publique, accessible par la référence secrète)."""
 
     montant = serializers.SerializerMethodField()
+    mode_test = serializers.SerializerMethodField()
+    # Reçu du paiement réussi (le responsable qui revient vérifier le voit)
+    paiement = serializers.SerializerMethodField()
 
     class Meta:
         model = DemandeInscription
-        fields = ["nom_organisme", "email", "statut", "montant"]
+        fields = ["nom_organisme", "email", "statut", "montant", "mode_test", "paiement"]
         read_only_fields = fields
 
+    def get_paiement(self, obj):
+        paiement = obj.paiement_reussi
+        return PaiementSerializer(paiement).data if paiement else None
+
     def get_montant(self, obj):
-        return obj.paiement.montant if obj.statut == DemandeInscription.Statut.PAYEE else settings.PRIX_ABONNEMENT_FCFA
+        paiement = obj.paiement_reussi
+        return paiement.montant if paiement else settings.PRIX_ABONNEMENT_FCFA
+
+    def get_mode_test(self, obj):
+        return settings.PAYDUNYA_MODE != "live"
 
 
 class PaiementSerializer(serializers.ModelSerializer):
-    """
-    Paiement simulé par mobile money. Le numéro doit être un mobile
-    sénégalais : 9 chiffres commençant par 70, 75, 76, 77 ou 78,
-    précédé ou non de +221 / 00221.
-    """
+    """Paiement de l'abonnement (lecture) : reçu affiché au responsable et à l'admin SaaS."""
 
+    statut_libelle = serializers.CharField(source="get_statut_display", read_only=True)
     moyen_libelle = serializers.CharField(source="get_moyen_display", read_only=True)
+    type_libelle = serializers.CharField(source="get_type_display", read_only=True)
 
     class Meta:
         model = Paiement
-        fields = ["moyen", "moyen_libelle", "telephone", "montant", "reference_transaction", "date_paiement"]
-        read_only_fields = ["montant", "reference_transaction", "date_paiement"]
-
-    def validate_telephone(self, value):
-        compact = re.sub(r"[\s.-]", "", value)
-        if not re.fullmatch(r"(\+221|00221)?7[05678]\d{7}", compact):
-            raise serializers.ValidationError(
-                "Saisissez un numéro mobile sénégalais valide, par exemple 77 123 45 67."
-            )
-        return compact
+        fields = [
+            "type", "type_libelle", "statut", "statut_libelle", "moyen", "moyen_libelle", "telephone",
+            "montant", "reference_transaction", "url_recu", "periode_debut", "periode_fin",
+            "date_paiement", "date_confirmation",
+        ]
+        read_only_fields = fields
 
 
 class DemandeInscriptionSerializer(serializers.ModelSerializer):
@@ -350,5 +355,5 @@ class DemandeInscriptionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_paiement(self, obj):
-        paiement = getattr(obj, "paiement", None)
+        paiement = obj.paiement_reussi
         return PaiementSerializer(paiement).data if paiement else None

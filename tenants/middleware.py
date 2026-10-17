@@ -5,6 +5,8 @@ from rest_framework_simplejwt.exceptions import InvalidToken, AuthenticationFail
 from accounts.models import MembreTenant
 
 from .exceptions import (
+    ABONNEMENT_EXPIRE_CODE,
+    ABONNEMENT_EXPIRE_MESSAGE,
     MEMBRE_SUSPENDU_CODE,
     MEMBRE_SUSPENDU_MESSAGE,
     ORGANISME_SUSPENDU_CODE,
@@ -40,7 +42,8 @@ class OrganismeSuspenduMiddleware:
     refusée avant d'atteindre la vue, avec un code que le frontend utilise
     pour afficher la page dédiée :
     - « organisme_suspendu » : Tenant.statut = False ;
-    - « membre_suspendu » : MembreTenant.actif = False pour cet utilisateur.
+    - « membre_suspendu » : MembreTenant.actif = False pour cet utilisateur ;
+    - « abonnement_expire » : organisme suspendu faute de paiement (abonnements.py).
 
     La fiche de l'organisme (/api/tenants/<pk>/) n'utilise pas
     « tenant_id » : elle reste accessible à l'admin SaaS, et le cas
@@ -59,7 +62,13 @@ class OrganismeSuspenduMiddleware:
         if tenant_id is None:
             return None
 
-        if Tenant.objects.filter(pk=tenant_id, statut=False).exists():
+        suspendu = Tenant.objects.filter(pk=tenant_id, statut=False).values_list(
+            "id", "abonnement__suspendu_pour_impaye"
+        ).first()
+        if suspendu is not None:
+            # Impayé : l'administrateur peut renouveler pour rétablir l'accès
+            if suspendu[1]:
+                return _refus(ABONNEMENT_EXPIRE_MESSAGE, ABONNEMENT_EXPIRE_CODE)
             return _refus(ORGANISME_SUSPENDU_MESSAGE, ORGANISME_SUSPENDU_CODE)
 
         utilisateur = _utilisateur_jwt(request)

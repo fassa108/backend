@@ -208,6 +208,8 @@ REST_FRAMEWORK = {
         "password_reset_confirm": "10/hour",
         "demande_inscription": "5/hour",
         "paiement": "10/hour",
+        # Retour de PayDunya : la page relit l'état tant qu'il est en attente
+        "confirmation_paiement": "60/hour",
         "renvoi_invitation": "5/hour",
     },
 }
@@ -252,8 +254,19 @@ ANYMAIL = {
 
 DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL")
 
-# Abonnement mensuel d'un organisme, payé (en simulation) à l'inscription.
+# Abonnement mensuel d'un organisme, payé à l'inscription (PayDunya).
 PRIX_ABONNEMENT_FCFA = int(os.getenv("PRIX_ABONNEMENT_FCFA", "25000"))
+
+# PayDunya : « test » (sandbox) ou « live » (production). Clés de
+# l'application PayDunya (espace Business), jamais dans le code.
+PAYDUNYA_MODE = os.getenv("PAYDUNYA_MODE", "test")
+PAYDUNYA_MASTER_KEY = os.getenv("PAYDUNYA_MASTER_KEY", "")
+PAYDUNYA_PRIVATE_KEY = os.getenv("PAYDUNYA_PRIVATE_KEY", "")
+PAYDUNYA_TOKEN = os.getenv("PAYDUNYA_TOKEN", "")
+
+# Adresse publique de l'API, pour le callback de PayDunya (inutile en local :
+# PayDunya ne peut pas joindre localhost, le retour du navigateur suffit).
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 # Logo des emails : une image hébergée, joignable depuis internet
 # (les messageries bloquent les images intégrées au message).
