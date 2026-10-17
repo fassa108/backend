@@ -85,9 +85,17 @@ class Utilisateur(AbstractBaseUser):
     appartenir à plusieurs organismes avec des rôles différents.
     """
 
+    class Genre(models.TextChoices):
+        FEMME = "F", "Femme"
+        HOMME = "H", "Homme"
+
     # Informations personnelles de l'utilisateur.
     nom = models.CharField(max_length=100)
     prenom = models.CharField(max_length=100)
+
+    # Facultatif (vide : non renseigné) : sert aux statistiques
+    # des rapports de promotion (répartition femmes / hommes).
+    genre = models.CharField(max_length=1, choices=Genre.choices, blank=True)
 
     # Identifiant de connexion.
     # Chaque adresse email doit être unique.

@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'revision',
     'notifications',
     'assistant',
+    'rapports',
 ]
 
 MIDDLEWARE = [
@@ -286,6 +287,9 @@ APERCU_OFFICE_ACTIF = os.getenv("APERCU_OFFICE_ACTIF", "1") == "1" and "test" no
 # appelé par Celery sur un réseau interne, avec un jeton partagé.
 IA_URL = os.getenv("IA_URL", "http://ia:8000")
 IA_SERVICE_TOKEN = os.getenv("IA_SERVICE_TOKEN", "")
+
+# Nom des fichiers téléchargés (PDF, exports) lisible par le front
+CORS_EXPOSE_HEADERS = ["Content-Disposition"]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
