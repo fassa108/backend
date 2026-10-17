@@ -296,6 +296,10 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
                 tenant=tenant,
                 role=data["role"]
             )
+            # Genre précisé à l'ajout : complète un compte qui n'en a pas
+            if data.get("genre") and not utilisateur.genre:
+                utilisateur.genre = data["genre"]
+                utilisateur.save(update_fields=["genre"])
             # Compte jamais activé : l'ancien lien a pu expirer.
             invitation_envoyee = not utilisateur.actif
             if invitation_envoyee:
@@ -306,7 +310,8 @@ class MembreTenantViewSet(viewsets.GenericViewSet):
                 prenom=data["prenom"],
                 email=data["email"],
                 tenant=tenant,
-                role=data["role"]
+                role=data["role"],
+                genre=data.get("genre", ""),
             )
             invitation_envoyee = True
 

@@ -180,6 +180,10 @@ class MembreTenantSerializer(serializers.ModelSerializer):
     utilisateur_prenom = serializers.CharField(source="utilisateur.prenom", read_only=True)
     utilisateur_email = serializers.EmailField(source="utilisateur.email", read_only=True)
     utilisateur_actif = serializers.BooleanField(source="utilisateur.actif", read_only=True)
+    # Modifiable par l'admin (fiche de l'apprenant) : enregistré sur le compte
+    utilisateur_genre = serializers.ChoiceField(
+        source="utilisateur.genre", choices=Utilisateur.Genre.choices, required=False, allow_blank=True,
+    )
     promotions_en_cours = serializers.SerializerMethodField()
 
     class Meta:
@@ -191,6 +195,7 @@ class MembreTenantSerializer(serializers.ModelSerializer):
             "utilisateur_prenom",
             "utilisateur_email",
             "utilisateur_actif",
+            "utilisateur_genre",
             "tenant",
             "role",
             "actif",
@@ -300,6 +305,14 @@ class MembreTenantSerializer(serializers.ModelSerializer):
 
         return attrs
 
+    def update(self, membre, validated_data):
+        # Le genre appartient au compte, pas à l'appartenance à l'organisme
+        champs_utilisateur = validated_data.pop("utilisateur", {})
+        if "genre" in champs_utilisateur:
+            membre.utilisateur.genre = champs_utilisateur["genre"]
+            membre.utilisateur.save(update_fields=["genre"])
+        return super().update(membre, validated_data)
+
 
 
 class AjouterMembreSerializer(serializers.Serializer):
@@ -316,6 +329,11 @@ class AjouterMembreSerializer(serializers.Serializer):
     )
     role = serializers.ChoiceField(
         choices=MembreTenant.Role.choices
+    )
+    genre = serializers.ChoiceField(
+        choices=Utilisateur.Genre.choices,
+        required=False,
+        allow_blank=True,
     )
 
     def validate_email(self, value):

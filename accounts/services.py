@@ -41,7 +41,8 @@ class AccountService:
         prenom,
         email,
         tenant,
-        role
+        role,
+        genre=""
     ):
         """
         Crée un compte inactif, l'associe à un organisme
@@ -58,6 +59,7 @@ class AccountService:
             email=email,
             nom=nom,
             prenom=prenom,
+            genre=genre,
         )
 
         # Le compte reste désactivé jusqu'à son activation.

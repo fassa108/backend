@@ -242,6 +242,15 @@ class AjoutMembreTests(AccountsBaseTestCase):
         self.client.force_authenticate(self.formateur)
         self.assertEqual(self.client.get(self.url_membres).status_code, status.HTTP_403_FORBIDDEN)
 
+    @patch("accounts.services.envoyer_email_activation.delay")
+    def test_genre_facultatif_a_l_ajout(self, _):
+        self.client.force_authenticate(self.admin)
+        r = self.client.post(self.url_membres, {"email": "awa@test.com", "nom": "N", "prenom": "Awa", "role": "APPRENANT", "genre": "F"})
+        self.assertEqual(r.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(Utilisateur.objects.get(email="awa@test.com").genre, "F")
+        r = self.client.post(self.url_membres, {"email": "sans@test.com", "nom": "N", "prenom": "P", "role": "APPRENANT"})
+        self.assertEqual(Utilisateur.objects.get(email="sans@test.com").genre, "")
+
     def test_ajout_membre_deja_present_400(self):
         self.client.force_authenticate(self.admin)
         r = self.client.post(self.url_membres, {"email": "Apprenant@Test.com", "role": "FORMATEUR"})
@@ -366,6 +375,15 @@ class ModificationMembreTests(AccountsBaseTestCase):
 
     def patch_membre(self, utilisateur, data):
         return self.client.patch(f"{self.url_membres}{self.membre(utilisateur).id}/", data)
+
+    def test_genre_modifiable_par_l_admin(self):
+        r = self.patch_membre(self.apprenant, {"utilisateur_genre": "F"})
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual(r.data["utilisateur_genre"], "F")
+        self.apprenant.refresh_from_db()
+        self.assertEqual(self.apprenant.genre, "F")
+        self.assertEqual(self.patch_membre(self.apprenant, {"utilisateur_genre": "X"}).status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self.patch_membre(self.apprenant, {"utilisateur_genre": ""}).data["utilisateur_genre"], "")
 
     def test_dernier_admin_ne_peut_pas_perdre_son_role(self):
         r = self.patch_membre(self.admin, {"role": "FORMATEUR"})
