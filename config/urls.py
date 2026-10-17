@@ -59,4 +59,8 @@ urlpatterns = [
         "api/",
         include("assistant.urls"),
     ),
+    path(
+        "api/",
+        include("rapports.urls"),
+    ),
 ]

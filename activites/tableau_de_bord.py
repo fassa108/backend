@@ -342,7 +342,7 @@ def _bilan_formations(promotions, analyse):
     )
 
 
-def _competences_moins_acquises(analyse, maintenant):
+def _competences_moins_acquises(analyse, maintenant, nb=NB_COMPETENCES_FAIBLES):
     """
     Compétences visées par des briefs échus : part des apprenants concernés
     (assignés, toujours inscrits) qui les ont validées, les plus faibles d'abord.
@@ -374,7 +374,7 @@ def _competences_moins_acquises(analyse, maintenant):
             if apprenants
         ),
         key=lambda l: (l[2], -l[1]),
-    )[:NB_COMPETENCES_FAIBLES]
+    )[:nb]
     details = CompetenceNiveau.objects.select_related("competence__module__formation", "niveau").in_bulk(
         [l[0] for l in lignes]
     )

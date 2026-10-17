@@ -1,0 +1,20 @@
+{# Graphique en anneau : « a » vient de pdf._anneau, « unite » est affichée sous le total #}
+<div class="anneau">
+  <svg width="30mm" height="30mm" viewBox="0 0 {{ a.taille }} {{ a.taille }}">
+    <circle cx="{{ a.centre }}" cy="{{ a.centre }}" r="{{ a.rayon }}" fill="none" stroke="#f1f5f9" stroke-width="{{ a.epaisseur }}"/>
+    {% for arc in a.arcs %}
+    {% if arc.cercle %}
+    <circle cx="{{ a.centre }}" cy="{{ a.centre }}" r="{{ a.rayon }}" fill="none" stroke="{{ arc.couleur }}" stroke-width="{{ a.epaisseur }}"/>
+    {% else %}
+    <path d="{{ arc.chemin }}" fill="none" stroke="{{ arc.couleur }}" stroke-width="{{ a.epaisseur }}"/>
+    {% endif %}
+    {% endfor %}
+    <text x="{{ a.centre }}" y="{{ a.centre }}" text-anchor="middle" font-size="15" font-weight="bold" fill="#0f172a" font-family="DejaVu Sans">{{ a.total }}</text>
+    <text x="{{ a.centre }}" y="{{ a.centre|add:13 }}" text-anchor="middle" font-size="8" fill="#64748b" font-family="DejaVu Sans">{{ unite }}</text>
+  </svg>
+  <div class="legende-liste">
+    {% for l in a.legende %}
+    <div><span class="pastille" style="background: {{ l.couleur }}"></span>{{ l.libelle }} : <strong>{{ l.valeur }}</strong> ({{ l.pct }} %)</div>
+    {% endfor %}
+  </div>
+</div>

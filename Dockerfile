@@ -4,6 +4,13 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+# Version utilisée par uv (sans elle, il prend la plus récente, parfois sans paquets précompilés)
+ENV UV_PYTHON=3.14
+
+# Bibliothèques système de WeasyPrint (rapports PDF) et polices
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 
 # Installation de uv
 RUN pip install --no-cache-dir uv

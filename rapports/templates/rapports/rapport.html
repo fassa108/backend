@@ -1,0 +1,310 @@
+{% load l10n %}{% localize off %}<!doctype html>
+{# localize off : les nombres décimaux (SVG, largeurs) gardent le point #}
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>{{ titre }} — {{ d.promotion }}</title>
+<style>
+  @page {
+    size: A4;
+    margin: 18mm 16mm 20mm;
+    @top-left { content: "EduHub · " string(organisme); font-family: "DejaVu Sans", sans-serif; font-size: 7.5pt; color: #94a3b8; }
+    @top-right { content: string(titre); font-family: "DejaVu Sans", sans-serif; font-size: 7.5pt; color: #94a3b8; }
+    @bottom-center { content: "Page " counter(page) " / " counter(pages); font-family: "DejaVu Sans", sans-serif; font-size: 7.5pt; color: #94a3b8; }
+  }
+  * { box-sizing: border-box; }
+  body { font-family: "DejaVu Sans", sans-serif; font-size: 9.5pt; color: #1e293b; line-height: 1.5; }
+  h1 .titre { string-set: titre content(); }
+  h1 { font-size: 19pt; margin: 0 0 2mm; color: #0f172a; }
+  h2 { font-size: 12pt; margin: 6mm 0 2mm; color: #0f172a; }
+  h3 { font-size: 10.5pt; margin: 5mm 0 2mm; color: #334155; }
+  p { margin: 0 0 2mm; }
+  ul, ol { margin: 0 0 2mm; padding-left: 5mm; }
+  li { margin-bottom: 1mm; }
+  code { font-family: "DejaVu Sans Mono", monospace; font-size: 8.5pt; background: #f1f5f9; padding: 0 1mm; }
+
+  .bandeau { border-bottom: 2px solid #4f46e5; padding-bottom: 4mm; margin-bottom: 5mm; }
+  .marque { string-set: organisme content(); color: #4f46e5; font-weight: bold; font-size: 9pt; letter-spacing: .5px; text-transform: uppercase; }
+  .sous-titre { color: #475569; font-size: 10.5pt; }
+  .meta { margin-top: 3mm; font-size: 8.5pt; color: #64748b; }
+  .meta span { margin-right: 5mm; }
+  .brouillon { display: inline-block; margin-left: 3mm; padding: .5mm 2.5mm; border-radius: 2mm;
+               background: #fef3c7; color: #92400e; font-size: 8pt; font-weight: bold; vertical-align: middle; }
+  .alerte { margin: 0 0 4mm; padding: 2.5mm 3.5mm; border-left: 3px solid #f59e0b; background: #fffbeb; font-size: 9pt; }
+
+  .chiffres { display: flex; flex-wrap: wrap; gap: 2.5mm; margin-bottom: 4mm; }
+  .chiffre { width: 31.5%; border: 1px solid #e2e8f0; border-radius: 2mm; padding: 2.5mm 3mm; }
+  .chiffre .valeur { font-size: 13pt; font-weight: bold; color: #0f172a; }
+  .chiffre .libelle { font-size: 8pt; color: #64748b; }
+
+  .courbe { border: 1px solid #e2e8f0; border-radius: 2mm; padding: 3mm; margin-bottom: 2mm; }
+  .courbe .legende { display: flex; justify-content: space-between; font-size: 7.5pt; color: #94a3b8; }
+
+  .texte { margin-top: 2mm; }
+  .texte h2 { color: #4338ca; border-bottom: 1px solid #e0e7ff; padding-bottom: 1mm; }
+
+  table { width: 100%; border-collapse: collapse; margin-bottom: 4mm; font-size: 8.5pt; }
+  thead { display: table-header-group; }
+  tr { page-break-inside: avoid; }
+  th { text-align: left; background: #f1f5f9; color: #334155; font-weight: bold; padding: 1.5mm 2mm; border-bottom: 1px solid #cbd5e1; }
+  td { padding: 1.5mm 2mm; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+  .nombre { text-align: right; white-space: nowrap; }
+  .discret { color: #64748b; font-size: 7.5pt; }
+  .barre { display: inline-block; width: 18mm; height: 2mm; background: #e2e8f0; border-radius: 1mm; vertical-align: middle; margin-right: 1.5mm; }
+  .barre i { display: block; height: 100%; background: #6366f1; border-radius: 1mm; }
+  .ok { color: #047857; font-weight: bold; }
+  .ko { color: #b91c1c; }
+  .risque { color: #b91c1c; font-weight: bold; }
+  .surveiller { color: #b45309; font-weight: bold; }
+  h2, h3 { break-after: avoid; }
+  li, .chiffre, .courbe, .graphiques, .carte { break-inside: avoid; }
+  table.fixe { table-layout: fixed; }
+
+  .graphiques { display: flex; gap: 3mm; margin-bottom: 4mm; }
+  .carte { flex: 1; border: 1px solid #e2e8f0; border-radius: 2mm; padding: 3mm; }
+  .carte h3 { margin: 0 0 2mm; font-size: 9.5pt; }
+  .anneau { display: flex; align-items: center; gap: 4mm; }
+  .anneau svg { flex-shrink: 0; }
+  .legende-liste { font-size: 8pt; color: #334155; }
+  .legende-liste div { margin-bottom: 1mm; white-space: nowrap; }
+  .pastille { display: inline-block; width: 2.5mm; height: 2.5mm; border-radius: .6mm; margin-right: 1.5mm; vertical-align: middle; }
+  .empile { display: flex; width: 100%; height: 3mm; background: #f1f5f9; border-radius: 1mm; overflow: hidden; }
+  .empile i { display: block; height: 100%; }
+  table.compact { font-size: 8pt; margin-bottom: 0; }
+  table.compact th, table.compact td { padding: 1.2mm 1.2mm; }
+  table.compact .barre { width: 11mm; }
+  .barre.f i { background: #8b5cf6; }
+  .barre.h i { background: #14b8a6; }
+  .barre.n i { background: #94a3b8; }
+  .legende-ligne { font-size: 7.5pt; color: #64748b; margin: -2mm 0 3mm; }
+  .legende-ligne span { margin-right: 3mm; }
+  dl.definitions { font-size: 8pt; margin: 0; }
+  dl.definitions dt { font-weight: bold; color: #334155; margin-top: 1.5mm; }
+  dl.definitions dd { margin: 0 0 0 0; color: #475569; }
+</style>
+</head>
+<body>
+
+<div class="bandeau">
+  <div class="marque">{{ d.organisme }}</div>
+  <h1><span class="titre">{{ titre }}</span>{% if brouillon %}<span class="brouillon">BROUILLON</span>{% endif %}</h1>
+  <div class="sous-titre">
+    {% if d.apprenant %}<strong>{{ d.apprenant.nom }}</strong> · {{ d.apprenant.email }}<br>{% endif %}
+    {{ d.formation }} · {{ d.promotion }}{% if d.cloturee %} (clôturée){% endif %}
+  </div>
+  <div class="meta">
+    <span>{{ d.periode }}</span>
+    {% if d.formateurs %}<span>Formateurs : {{ d.formateurs|join:", " }}</span>{% endif %}
+    <span>Données au {{ d.date }}</span>
+    {% if auteur %}<span>Rédigé par {{ auteur }}</span>{% endif %}
+    {% if valide_par %}<span>Validé par {{ valide_par }} le {{ date_validation }}</span>{% endif %}
+  </div>
+</div>
+
+{% if d.niveau %}
+<div class="alerte"><strong>Apprenant {{ d.niveau }}</strong> : {{ d.signaux|join:" ; " }}.</div>
+{% endif %}
+
+<h2>Chiffres clés</h2>
+<div class="chiffres">
+  {% for i in d.indicateurs %}
+  <div class="chiffre"><div class="valeur">{{ i.valeur }}</div><div class="libelle">{{ i.libelle }}</div></div>
+  {% endfor %}
+</div>
+
+{% if courbe %}
+<h3>Évolution de la progression{% if not d.apprenant %} moyenne{% endif %} ({{ courbe.dernier }} % aujourd'hui)</h3>
+<div class="courbe">
+  <svg width="100%" viewBox="0 0 {{ courbe.largeur }} {{ courbe.hauteur }}" preserveAspectRatio="none" style="height: 32mm">
+    <line x1="0" y1="{{ courbe.hauteur }}" x2="{{ courbe.largeur }}" y2="{{ courbe.hauteur }}" stroke="#e2e8f0" stroke-width="1"/>
+    <polygon points="{{ courbe.aire }}" fill="#e0e7ff"/>
+    <polyline points="{{ courbe.ligne }}" fill="none" stroke="#4f46e5" stroke-width="2.5"/>
+  </svg>
+  <div class="legende"><span>Semaine du {{ courbe.debut }}</span><span>0 à 100 % du référentiel</span><span>Semaine du {{ courbe.fin }}</span></div>
+</div>
+{% endif %}
+
+{% if anneau_etats or histogramme or d.par_module %}
+<div class="graphiques">
+  {% if anneau_etats %}
+  <div class="carte">
+    <h3>État des rendus</h3>
+    {% include "rapports/_anneau.html" with a=anneau_etats unite="rendus" %}
+  </div>
+  {% endif %}
+  {% if histogramme %}
+  <div class="carte">
+    <h3>Apprenants par niveau de progression</h3>
+    <svg width="100%" viewBox="0 0 {{ histogramme.largeur }} {{ histogramme.hauteur|add:14 }}" style="height: 30mm">
+      <line x1="0" y1="{{ histogramme.hauteur }}" x2="{{ histogramme.largeur }}" y2="{{ histogramme.hauteur }}" stroke="#e2e8f0" stroke-width="1"/>
+      {% for b in histogramme.barres %}
+      <rect x="{{ b.x }}" y="{{ b.y }}" width="{{ b.largeur }}" height="{{ b.hauteur }}" rx="2" fill="{{ b.couleur }}"/>
+      <text x="{{ b.milieu }}" y="{{ b.y_texte }}" text-anchor="middle" font-size="9" font-weight="bold" fill="#0f172a" font-family="DejaVu Sans">{{ b.nb }}</text>
+      <text x="{{ b.milieu }}" y="{{ histogramme.hauteur|add:11 }}" text-anchor="middle" font-size="8" fill="#64748b" font-family="DejaVu Sans">{{ b.tranche }}</text>
+      {% endfor %}
+    </svg>
+  </div>
+  {% endif %}
+  {% if d.par_module %}
+  <div class="carte">
+    <h3>Compétences acquises par module</h3>
+    <table>
+      <tbody>
+      {% for m in d.par_module %}
+        <tr>
+          <td>{{ m.nom }}</td>
+          <td class="nombre"><span class="barre"><i style="width: {{ m.pct }}%"></i></span>{{ m.acquises }} / {{ m.total }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
+{% if d.genre %}
+<h2>Femmes et hommes</h2>
+{% if not genre_renseigne %}
+<p class="discret">Genre non renseigné pour les {{ d.apprenants|length }} apprenants : il se complète depuis la fiche de chaque apprenant.</p>
+{% else %}
+<div class="graphiques">
+  <div class="carte" style="flex: 0 0 72mm">
+    <h3>Répartition</h3>
+    {% include "rapports/_anneau.html" with a=anneau_genre unite="apprenants" %}
+  </div>
+  <div class="carte">
+    <h3>Résultats comparés</h3>
+    <table class="compact">
+      <thead><tr><th></th><th>Progression</th><th>Taux de rendu</th><th>Taux de validation</th></tr></thead>
+      <tbody>
+      {% for g in d.genre %}
+        <tr>
+          <td><strong>{{ g.libelle }}</strong> <span class="discret">({{ g.nb }})</span></td>
+          {% with c=g.code|default:"n"|lower %}
+          <td class="nombre"><span class="barre {{ c }}"><i style="width: {{ g.progression_pct }}%"></i></span>{{ g.progression_pct }} %</td>
+          <td class="nombre"><span class="barre {{ c }}"><i style="width: {{ g.taux_rendu }}%"></i></span>{{ g.taux_rendu }} %</td>
+          <td class="nombre"><span class="barre {{ c }}"><i style="width: {{ g.taux_validation }}%"></i></span>{{ g.taux_validation }} %</td>
+          {% endwith %}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+{% endif %}
+
+{% if texte %}
+<div class="texte">{{ texte|safe }}</div>
+{% endif %}
+
+{% if d.apprenants %}
+<h2>Apprenants</h2>
+<table>
+  <thead><tr><th>Apprenant</th><th class="nombre">Progression</th><th class="nombre">Rendus</th><th class="nombre">Validés</th><th class="nombre">Retards</th><th>Dernier dépôt</th><th>Suivi</th></tr></thead>
+  <tbody>
+  {% for a in d.apprenants %}
+    <tr>
+      <td><strong>{{ a.nom }}</strong><br><span class="discret">{{ a.email }}</span></td>
+      <td class="nombre"><span class="barre"><i style="width: {{ a.progression_pct }}%"></i></span>{{ a.progression_pct }} %</td>
+      <td class="nombre">{{ a.rendus }} / {{ a.attendus }}</td>
+      <td class="nombre">{{ a.valides }}{% if a.non_valides %} <span class="ko">· {{ a.non_valides }} non</span>{% endif %}</td>
+      <td class="nombre">{{ a.retards }}</td>
+      <td>{{ a.dernier_depot|default:"—" }}</td>
+      <td>{% if a.niveau %}<span class="{% if 'risque' in a.niveau %}risque{% else %}surveiller{% endif %}">{{ a.niveau|capfirst }}</span><br><span class="discret">{{ a.signaux|join:" ; " }}</span>{% else %}—{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if bilan_briefs %}
+<h2>Bilan par brief</h2>
+<div class="legende-ligne">
+  {% for cle, libelle, couleur in legende_etats %}<span><span class="pastille" style="background: {{ couleur }}"></span>{{ libelle }}</span>{% endfor %}
+</div>
+<table>
+  <thead><tr><th style="width: 34%">Brief</th><th>Échéance</th><th style="width: 22%">Rendus</th><th class="nombre">Validés</th><th class="nombre">Non validés</th><th class="nombre">À évaluer</th><th class="nombre">En retard</th></tr></thead>
+  <tbody>
+  {% for b in bilan_briefs %}
+    <tr>
+      <td>{{ b.titre }}</td>
+      <td>{{ b.date_limite }}{% if not b.echu %} <span class="discret">(à venir)</span>{% endif %}</td>
+      <td>
+        <div class="empile">{% for s in b.segments %}<i style="width: {{ s.pct }}%; background: {{ s.couleur }}"></i>{% endfor %}</div>
+        <span class="discret">{{ b.rendus }} / {{ b.attendus }} rendus</span>
+      </td>
+      <td class="nombre ok">{{ b.valides }}</td>
+      <td class="nombre{% if b.non_valides %} ko{% endif %}">{{ b.non_valides }}</td>
+      <td class="nombre">{{ b.a_evaluer }}</td>
+      <td class="nombre">{{ b.en_retard }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if d.competences %}
+<h2>Compétences travaillées</h2>
+<p class="discret">Compétences visées par des briefs échus, de la moins acquise à la plus acquise : part des apprenants concernés qui l'ont validée.</p>
+<table>
+  <thead><tr><th>Compétence</th><th>Module</th><th class="nombre">Apprenants</th><th class="nombre">Acquise par</th></tr></thead>
+  <tbody>
+  {% for c in d.competences %}
+    <tr>
+      <td>{{ c.competence }} <span class="discret">({{ c.niveau }})</span></td>
+      <td>{{ c.module }}</td>
+      <td class="nombre">{{ c.apprenants }}</td>
+      <td class="nombre"><span class="barre"><i style="width: {{ c.pct }}%"></i></span>{{ c.pct }} %</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if d.modules %}
+<h2>Compétences du référentiel</h2>
+{% for m in d.modules %}
+<h3>{{ m.nom }}</h3>
+<table class="fixe">
+  <thead><tr><th style="width: 50%">Compétence</th><th style="width: 20%">Niveau</th><th>État</th></tr></thead>
+  <tbody>
+  {% for c in m.competences %}
+    <tr>
+      <td>{{ c.competence }}</td>
+      <td>{{ c.niveau }}</td>
+      <td>{% if c.valide %}<span class="ok">Acquise</span> <span class="discret">le {{ c.date_validation }}</span>{% else %}<span class="ko">Non acquise</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endfor %}
+{% endif %}
+
+{% if d.briefs %}
+<h2>Briefs</h2>
+<table>
+  <thead><tr><th>Brief</th><th>Échéance</th><th>Rendu le</th><th>État</th></tr></thead>
+  <tbody>
+  {% for b in d.briefs %}
+    <tr>
+      <td>{{ b.titre }}</td>
+      <td>{{ b.date_limite }}</td>
+      <td>{{ b.date_rendu|default:"—" }}{% if b.en_retard %} <span class="ko">(en retard)</span>{% endif %}</td>
+      <td>{{ b.statut }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Définitions des indicateurs</h2>
+<dl class="definitions">
+  {% for terme, definition in definitions %}
+  <dt>{{ terme }}</dt><dd>{{ definition }}</dd>
+  {% endfor %}
+</dl>
+
+</body>
+</html>{% endlocalize %}
