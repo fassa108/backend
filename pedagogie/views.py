@@ -111,6 +111,46 @@ def _verifier_promotion_ouverte(promotion):
         )
 
 
+def _inscrire(promotion, apprenant):
+    """
+    Inscrit un apprenant (ou réactive son inscription) : rôle apprenant
+    actif dans l'organisme, une seule inscription active par organisme.
+    Renvoie (inscription, créée) ; ValidationError si c'est refusé.
+    """
+    # Rôle APPRENANT actif dans le même tenant (Utilisateur.actif non vérifié)
+    tenant = promotion.formation.tenant
+    if not MembreTenant.objects.filter(
+        utilisateur=apprenant,
+        tenant=tenant,
+        role=MembreTenant.Role.APPRENANT,
+        actif=True,
+    ).exists():
+        raise ValidationError("L'utilisateur doit être un apprenant actif de cet organisme.")
+
+    active_inscription = InscriptionPromotion.objects.filter(
+        apprenant=apprenant,
+        tenant=tenant,
+        actif=True,
+    ).select_related("promotion").first()
+    if active_inscription:
+        if active_inscription.promotion_id == promotion.id:
+            raise ValidationError("L'apprenant est déjà inscrit dans cette promotion.")
+        raise ValidationError(
+            f"L'apprenant a déjà une inscription active dans la promotion "
+            f"'{active_inscription.promotion.nom}'."
+        )
+
+    # Réactivation si inscription inactive existante, sinon création
+    existing = InscriptionPromotion.objects.filter(promotion=promotion, apprenant=apprenant).first()
+    if existing:
+        existing.actif = True
+        existing.fermee_par_cloture = False
+        existing.date_desinscription = None
+        existing.save()
+        return existing, False
+    return InscriptionPromotion.objects.create(promotion=promotion, apprenant=apprenant, actif=True), True
+
+
 def _refuser_suppression_si(condition, message):
     if condition:
         raise PermissionDenied(f"{message} Désactivez-le à la place.")
@@ -243,66 +283,50 @@ class PromotionViewSet(viewsets.ModelViewSet):
             )
 
         apprenant = get_object_or_404(Utilisateur, pk=apprenant_id)
-
-        # Rôle APPRENANT actif dans le même tenant (Utilisateur.actif non vérifié)
-        tenant = promotion.formation.tenant
-        if not MembreTenant.objects.filter(
-            utilisateur=apprenant,
-            tenant=tenant,
-            role=MembreTenant.Role.APPRENANT,
-            actif=True,
-        ).exists():
-            return Response(
-                {"apprenant": "L'utilisateur doit être un apprenant actif de cet organisme."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Une seule inscription active par organisme
-        active_inscription = InscriptionPromotion.objects.filter(
-            apprenant=apprenant,
-            tenant=tenant,
-            actif=True,
-        ).select_related("promotion").first()
-
-        if active_inscription:
-            if active_inscription.promotion_id == promotion.id:
-                return Response(
-                    {"apprenant": "L'apprenant est déjà inscrit dans cette promotion."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            return Response(
-                {
-                    "apprenant": (
-                        f"L'apprenant a déjà une inscription active dans la promotion "
-                        f"'{active_inscription.promotion.nom}'."
-                    )
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Réactivation si inscription inactive existante, sinon création
-        existing = InscriptionPromotion.objects.filter(
-            promotion=promotion,
-            apprenant=apprenant,
-        ).first()
-
-        if existing:
-            existing.actif = True
-            existing.fermee_par_cloture = False
-            existing.date_desinscription = None
-            existing.save()
-            inscription = existing
-            status_code = status.HTTP_200_OK
-        else:
-            inscription = InscriptionPromotion.objects.create(
-                promotion=promotion,
-                apprenant=apprenant,
-                actif=True,
-            )
-            status_code = status.HTTP_201_CREATED
+        try:
+            inscription, creee = _inscrire(promotion, apprenant)
+        except ValidationError as erreur:
+            return Response({"apprenant": erreur.detail[0]}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = InscriptionPromotionSerializer(inscription)
-        return Response(serializer.data, status=status_code)
+        return Response(serializer.data, status=status.HTTP_201_CREATED if creee else status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="inscrire-apprenants")
+    def inscrire_apprenants(self, request, tenant_id=None, pk=None):
+        """
+        Inscription de plusieurs apprenants en une fois :
+        { "apprenant_ids": [ids] }. Chacun passe par les mêmes contrôles
+        qu'une inscription seule ; ceux qui sont refusés n'empêchent pas
+        les autres. Réponse : { "inscrits": [...], "erreurs": [{ apprenant_id, message }] }.
+        """
+        promotion = self.get_object()
+        _verifier_promotion_ouverte(promotion)
+
+        ids = request.data.get("apprenant_ids")
+        if not isinstance(ids, list) or not ids:
+            return Response(
+                {"apprenant_ids": "Choisissez au moins un apprenant."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        apprenants = {str(u.pk): u for u in Utilisateur.objects.filter(pk__in=[i for i in ids if str(i).isdigit()])}
+        inscrits, erreurs = [], []
+        for identifiant in dict.fromkeys(str(i) for i in ids):
+            apprenant = apprenants.get(identifiant)
+            if apprenant is None:
+                erreurs.append({"apprenant_id": identifiant, "message": "Apprenant introuvable."})
+                continue
+            try:
+                inscription, _ = _inscrire(promotion, apprenant)
+            except ValidationError as erreur:
+                erreurs.append({"apprenant_id": apprenant.pk, "message": erreur.detail[0]})
+            else:
+                inscrits.append(inscription)
+
+        return Response({
+            "inscrits": InscriptionPromotionSerializer(inscrits, many=True).data,
+            "erreurs": erreurs,
+        })
 
     @action(detail=True, methods=["post"], url_path="desinscrire-apprenant")
     def desinscrire_apprenant(self, request, tenant_id=None, pk=None):
