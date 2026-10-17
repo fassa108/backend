@@ -28,7 +28,7 @@ import os
 import shutil
 import tempfile
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -62,7 +62,6 @@ from .models import (
     Assignation,
     Brief,
     CategorieBrief,
-    CommentairePair,
     CompetenceValidee,
     Evaluation,
     FichierLivrable,
@@ -302,6 +301,13 @@ class BriefCreationTests(ActivitesBaseTestCase):
         res = self.client.post(self.url("brief"), self.payload_brief(), format="json")
         self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("Créer une API REST", str(res.data["competence_niveaux"]))
+
+    def test_un_seul_niveau_par_competence(self):
+        niveau_2 = Niveau.objects.create(tenant=self.tenant, nom="Adapter", ordre=2)
+        cn_2 = CompetenceNiveau.objects.create(competence=self.cn.competence, niveau=niveau_2)
+        res = self.client.post(self.url("brief"), self.payload_brief(competence_niveaux=[self.cn.id, cn_2.id]), format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Imiter, Adapter", str(res.data["competence_niveaux"]))
 
     def test_meme_competence_dans_une_autre_promotion(self):
         self.creer_brief().competence_niveaux.add(self.cn)

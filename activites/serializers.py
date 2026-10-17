@@ -329,6 +329,18 @@ class BriefSerializer(serializers.ModelSerializer):
                     )
                 })
 
+            # Un seul niveau d'une même compétence par brief
+            par_competence = {}
+            for cn in competence_niveaux:
+                par_competence.setdefault(cn.competence_id, []).append(cn)
+            doublons = [cns for cns in par_competence.values() if len(cns) > 1]
+            if doublons:
+                raise serializers.ValidationError({
+                    "competence_niveaux": "Un brief ne vise qu'un niveau par compétence : " + ", ".join(
+                        f"{cns[0].competence.nom} ({', '.join(cn.niveau.nom for cn in cns)})" for cns in doublons
+                    ) + "."
+                })
+
             # Une compétence-niveau n'est visée que par un seul brief de la promotion
             deja_visees = (
                 Brief.competence_niveaux.through.objects.filter(
